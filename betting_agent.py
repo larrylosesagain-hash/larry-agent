@@ -129,12 +129,8 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
     amount = float(decision.get("amount_usdc", ABSOLUTE_MIN_BET))
 
     try:
-        # Get the token ID for this outcome
-        resp = requests.get(
-            f"{POLYMARKET_HOST}/markets/{condition_id}",
-            timeout=10
-        )
-        market_data = resp.json()
+        # Use CLOB client to get market data (more reliable than raw HTTP)
+        market_data = client.get_market(condition_id)
 
         tokens = market_data.get("tokens", [])
         token_id = None
@@ -153,11 +149,11 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
         # Place market order
         order_args = OrderArgs(
             token_id=token_id,
-            price=price,
-            size=amount,
+            price=round(price, 4),
+            size=round(amount, 2),
         )
 
-        signed_order = client.create_market_order(order_args)
+        signed_order = client.create_order(order_args)
         resp = client.post_order(signed_order, OrderType.FOK)  # Fill or Kill
 
         if resp.get("success"):
@@ -167,6 +163,10 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
             log.error(f"❌ Order failed: {resp.get('errorMsg', resp.get('error', 'unknown error'))}")
             return False
 
+    except TypeError as te:
+        # TypeError is safe to log (no sensitive data in type errors)
+        log.error(f"TypeError placing bet: {te}")
+        return False
     except Exception as e:
         # SECURITY: log only exception type, not message (may contain wallet data)
         log.error(f"Exception placing bet: {type(e).__name__}")
