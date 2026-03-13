@@ -21,9 +21,9 @@ TWITTER_ACCESS_SECRET  = os.environ["TWITTER_ACCESS_SECRET"]
 TWITTER_BEARER_TOKEN   = os.environ["TWITTER_BEARER_TOKEN"]
 
 # ─── POLYMARKET ───────────────────────────────────────────────────────────────
-POLYMARKET_API_KEY     = os.environ["POLYMARKET_API_KEY"]     # CLOB API key
-POLYMARKET_PRIVATE_KEY = os.environ["POLYMARKET_PRIVATE_KEY"] # Polygon wallet private key
-POLYMARKET_FUNDER      = os.environ["POLYMARKET_FUNDER"]      # wallet address
+POLYMARKET_API_KEY     = os.environ.get("POLYMARKET_API_KEY", "")  # optional
+POLYMARKET_PRIVATE_KEY = os.environ["POLYMARKET_PRIVATE_KEY"]      # wallet private key (from magic.link)
+POLYMARKET_FUNDER      = os.environ["POLYMARKET_FUNDER"]            # wallet address (0x...)
 
 # ─── DATABASE ────────────────────────────────────────────────────────────────
 DB_PATH = os.environ.get("DB_PATH", "/home/larry/larry.db")

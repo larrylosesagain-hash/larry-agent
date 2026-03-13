@@ -18,7 +18,7 @@ from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.constants import POLYGON
 
 from config import (
-    POLYMARKET_API_KEY, POLYMARKET_PRIVATE_KEY, POLYMARKET_FUNDER,
+    POLYMARKET_PRIVATE_KEY, POLYMARKET_FUNDER,
     POLYMARKET_HOST, POLYMARKET_GAMMA_API,
     BET_CHECK_INTERVAL_MINUTES, MAX_OPEN_BETS,
     GRANDMA_INJECT_THRESHOLD, GRANDMA_INJECT_AMOUNT,
@@ -47,6 +47,7 @@ from twitter_agent import post_tweet
 # ─── POLYMARKET CLIENT ────────────────────────────────────────────────────────
 
 def get_clob_client() -> ClobClient:
+    # L1 auth — private key only, no API key needed
     return ClobClient(
         host=POLYMARKET_HOST,
         chain_id=POLYGON,
