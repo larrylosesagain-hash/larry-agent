@@ -38,6 +38,9 @@ log = logging.getLogger(__name__)
 # ─── REPLY RATIO: 1 reply per 4 own tweets ───────────────────────────────────
 REPLY_RATIO = 4
 
+# FIX: cache larry's user ID so we don't call get_me() every 15 minutes
+_larry_user_id = None
+
 
 # ─── TWITTER CLIENT ───────────────────────────────────────────────────────────
 
@@ -121,14 +124,23 @@ def should_reply_now() -> bool:
     return False
 
 
+def _get_larry_id(client: tweepy.Client) -> int:
+    """Get Larry's user ID, using a module-level cache to avoid repeated API calls."""
+    global _larry_user_id
+    if _larry_user_id is None:
+        me = client.get_me()
+        _larry_user_id = me.data.id
+        log.info(f"Cached Larry's user ID: {_larry_user_id}")
+    return _larry_user_id
+
+
 def fetch_mentions(since_id: str = None) -> list:
     """Fetch recent mentions of @LarryLosesAgain."""
     try:
         client = get_twitter_client()
 
-        # Get Larry's own user ID first
-        me = client.get_me()
-        larry_id = me.data.id
+        # FIX: use cached user ID instead of calling get_me() every 15 minutes
+        larry_id = _get_larry_id(client)
 
         kwargs = {
             "max_results": 10,
@@ -282,18 +294,19 @@ def check_dead_man_switch() -> bool:
 
 # ─── FRIDAY PIZZA ────────────────────────────────────────────────────────────
 
-_pizza_tweeted_this_week = False
-
+# FIX: persist pizza flag in DB instead of module-level variable,
+# which was lost on every process restart (causing duplicate Friday tweets)
 def maybe_tweet_pizza():
-    global _pizza_tweeted_this_week
     now = datetime.utcnow()
+    # Reset flag on Monday via DB
     if now.weekday() == 0:
-        _pizza_tweeted_this_week = False
-    if is_friday_pizza_time() and not _pizza_tweeted_this_week:
+        set_state("pizza_tweeted_this_week", "false")
+
+    if is_friday_pizza_time() and get_state("pizza_tweeted_this_week") != "true":
         log.info("🍕 IT'S FRIDAY PIZZA TIME!")
         tweet_data = ask_larry_for_tweet("FRIDAY")
         post_tweet(tweet_data["tweet"], tweet_type="FRIDAY")
-        _pizza_tweeted_this_week = True
+        set_state("pizza_tweeted_this_week", "true")
 
 
 # ─── WEEKLY RECAP (Sunday) ───────────────────────────────────────────────────

@@ -14,7 +14,7 @@ import logging
 import requests
 from datetime import datetime, timedelta
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType, Side  # FIX: added Side
+from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.constants import POLYGON
 
 from config import (
@@ -146,16 +146,16 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
             log.error(f"Could not find token_id for {condition_id} {outcome}")
             return False
 
-        # FIX: added side=Side.BUY — was missing, caused TypeError
+        # FIX: added side="BUY" — was missing, caused TypeError
         order_args = OrderArgs(
             token_id=token_id,
             price=round(price, 4),
             size=round(amount, 2),
-            side=Side.BUY,
+            side="BUY",
         )
 
         signed_order = client.create_order(order_args)
-        resp = client.post_order(signed_order, OrderType.FOK)  # Fill or Kill
+        resp = client.post_order(signed_order, OrderType.GTC)  # Good Till Cancelled — FOK fails silently when Gamma prices are stale
 
         if resp.get("success"):
             log.info(f"✅ BET PLACED: {outcome} on {condition_id} for ${amount}")

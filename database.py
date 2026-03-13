@@ -11,8 +11,11 @@ DB_PATH = os.environ.get("DB_PATH", "larry.db")
 
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # FIX: WAL mode prevents "database is locked" errors when betting + twitter
+    # threads access SQLite concurrently
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
@@ -99,6 +102,23 @@ def init_db():
     """)
 
     conn.commit()
+
+    # FIX: seed grandma wallet to $200 on first init so the injection mechanism
+    # can actually trigger. Previously grandma_balance started at 0.0 and the
+    # condition `grandma_balance >= GRANDMA_INJECT_AMOUNT (200)` was never met.
+    row = conn.execute(
+        "SELECT value FROM agent_state WHERE key = 'grandma_balance'"
+    ).fetchone()
+    if not row:
+        conn.execute(
+            "INSERT OR IGNORE INTO agent_state (key, value) VALUES ('grandma_balance', '200.0')"
+        )
+        conn.execute(
+            "INSERT INTO grandma_wallet (event_type, amount, balance_after, note) VALUES (?, ?, ?, ?)",
+            ("DEPOSIT", 200.0, 200.0, "Grandma's initial contribution — she believes in Larry")
+        )
+        conn.commit()
+
     conn.close()
     print("✅ Database initialized at", DB_PATH)
 
