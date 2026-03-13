@@ -22,11 +22,11 @@ from config import (
     POLYMARKET_HOST, POLYMARKET_GAMMA_API,
     BET_CHECK_INTERVAL_MINUTES, MAX_OPEN_BETS,
     GRANDMA_INJECT_THRESHOLD, GRANDMA_INJECT_AMOUNT,
-    BET_CATEGORY_MIX, ABSOLUTE_MIN_BET
+    ABSOLUTE_MIN_BET
 )
 from database import (
     get_bankroll, set_bankroll, get_pending_bets, save_bet, resolve_bet,
-    get_grandma_balance, update_grandma, get_today_tweet_count, init_db
+    get_grandma_balance, update_grandma, init_db
 )
 from larry_brain import ask_larry_to_bet, ask_larry_for_tweet
 
@@ -186,6 +186,24 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
         return False
 
 
+# ─── CATEGORY EXPOSURE CHECK ──────────────────────────────────────────────────
+
+MAX_BETS_PER_CATEGORY = 2
+
+def _count_open_bets_by_category() -> dict:
+    """Count pending bets grouped by category to avoid over-concentration."""
+    try:
+        from database import get_connection
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT category, COUNT(*) as cnt FROM bets WHERE status='PENDING' GROUP BY category"
+        ).fetchall()
+        conn.close()
+        return {r["category"]: r["cnt"] for r in rows}
+    except Exception:
+        return {}
+
+
 # ─── CHECK RESOLVED BETS ──────────────────────────────────────────────────────
 
 def check_pending_bets(client: ClobClient):
@@ -202,6 +220,7 @@ def check_pending_bets(client: ClobClient):
                 f"{POLYMARKET_HOST}/markets/{bet['polymarket_id']}",
                 timeout=10
             )
+            resp.raise_for_status()
             market = resp.json()
 
             # Check if market is resolved
@@ -305,18 +324,34 @@ def run_betting_agent():
                     decisions = ask_larry_to_bet(markets)
                     log.info(f"Larry made {len(decisions)} decisions")
 
+                    open_by_category = _count_open_bets_by_category()
+
                     for decision in decisions:
                         if decision.get("decision") != "BET":
-                            log.info(f"PASS: {decision.get('reason', 'no reason given')}")
+                            log.info(f"PASS: {decision.get('reasoning', 'no reason given')}")
                             continue
 
                         if len(get_pending_bets()) >= MAX_OPEN_BETS:
                             log.info("Reached max open bets mid-loop, stopping")
                             break
 
+                        # Resolve market_info once — reused for category check, DB save, and odds
+                        market_id = decision.get("market_id")
+                        market_info = next(
+                            (m for m in markets if m["condition_id"] == market_id),
+                            {}
+                        )
+
+                        # Category exposure check — max 2 open bets per category
+                        category = market_info.get("category", "weird")
+                        if open_by_category.get(category, 0) >= MAX_BETS_PER_CATEGORY:
+                            log.info(f"PASS (category limit): already {MAX_BETS_PER_CATEGORY} open {category} bets")
+                            continue
+                        open_by_category[category] = open_by_category.get(category, 0) + 1
+
                         # 6. Deduct bet amount from bankroll first
                         bankroll = get_bankroll()
-                        amount = float(decision["amount_usdc"])
+                        amount = float(decision.get("amount_usdc", ABSOLUTE_MIN_BET))
                         if amount > bankroll:
                             log.warning(f"Not enough bankroll (${bankroll:.2f}) for ${amount:.2f} bet")
                             continue
@@ -329,18 +364,14 @@ def run_betting_agent():
                             new_balance = bankroll - amount
                             set_bankroll(new_balance, -amount, "BET_PLACED")
 
-                            # Save to DB
-                            market_info = next(
-                                (m for m in markets if m["condition_id"] == decision["market_id"]),
-                                {}
-                            )
-                            odds = market_info.get("yes_price" if decision["outcome"] == "YES" else "no_price", 0.5)
+                            # market_info already resolved above — no duplicate lookup
+                            odds = market_info.get("yes_price" if decision.get("outcome") == "YES" else "no_price", 0.5)
                             potential_payout = amount / odds if odds > 0 else amount * 2
 
                             bet_id = save_bet(
-                                polymarket_id=decision["market_id"],
+                                polymarket_id=market_id,
                                 question=market_info.get("question", "Unknown market"),
-                                outcome=decision["outcome"],
+                                outcome=decision.get("outcome", "YES"),
                                 amount=amount,
                                 odds=odds,
                                 potential_payout=potential_payout,
