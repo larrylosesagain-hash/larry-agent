@@ -110,7 +110,11 @@ def _call_claude(max_tokens: int, messages: list) -> str:
             response = client.messages.create(
                 model=CLAUDE_MODEL,
                 max_tokens=max_tokens,
-                system=LARRY_SYSTEM_PROMPT,
+                system=[{
+                    "type": "text",
+                    "text": LARRY_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"}
+                }],
                 messages=messages
             )
             return response.content[0].text.strip()
