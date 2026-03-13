@@ -140,7 +140,8 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
         token_id = None
         price = None
         for token in tokens:
-            if token.get("outcome") == outcome:
+            # Case-insensitive: API returns "Yes"/"No", we store "YES"/"NO"
+            if token.get("outcome", "").upper() == outcome.upper():
                 token_id = token.get("token_id")
                 price = float(token.get("price", 0.5))
                 break
@@ -197,7 +198,7 @@ def check_pending_bets(client: ClobClient):
             # Find our outcome's result
             tokens = market.get("tokens", [])
             for token in tokens:
-                if token.get("outcome") == bet["outcome"]:
+                if token.get("outcome", "").upper() == bet["outcome"].upper():
                     price = float(token.get("price", 0))
                     won = price >= 0.99  # price goes to 1.0 on win
 
