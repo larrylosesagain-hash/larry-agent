@@ -176,8 +176,8 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
         log.error(f"TypeError placing bet: {te}")
         return False
     except Exception as e:
-        # TEMP: log full error to diagnose 403 — remove after fix
-        log.error(f"Exception placing bet: {type(e).__name__}: {e}")
+        # SECURITY: log only exception type, not message (may contain wallet data)
+        log.error(f"Exception placing bet: {type(e).__name__}")
         return False
 
 
