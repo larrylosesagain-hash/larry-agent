@@ -89,12 +89,17 @@ def fetch_active_markets(limit=20) -> list:
             try:
                 end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
                 if end_date.replace(tzinfo=None) <= cutoff:
+                    best_ask = float(m.get("bestAsk", 0.5))
+                    best_bid = float(m.get("bestBid", best_ask - 0.02))
+                    last_price = float(m.get("lastTradePrice") or best_ask)
                     filtered.append({
                         "condition_id": m.get("conditionId") or m.get("condition_id"),
                         "question": m.get("question"),
                         "end_date": end_date_str,
-                        "yes_price": float(m.get("bestAsk", 0.5)),  # cost to buy YES
-                        "no_price": float(1 - float(m.get("bestAsk", 0.5))),
+                        "yes_price": round(best_ask, 4),
+                        "no_price": round(1 - best_ask, 4),
+                        "spread": round(best_ask - best_bid, 4),      # narrow = liquid market
+                        "price_vs_last": round(best_ask - last_price, 4),  # positive = rising
                         "volume_24h": float(m.get("volume24hr", 0)),
                         "category": _guess_category(m.get("question", "")),
                     })

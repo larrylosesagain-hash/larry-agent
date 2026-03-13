@@ -1,6 +1,6 @@
 """
 larry_brain.py — Claude is Larry's brain
-Sends market data → gets back bet decisions + tweet text in JSON
+Sends market data → gets back bet decisions + tweet text via Tool Use (guaranteed structured output)
 """
 
 import json
@@ -9,10 +9,11 @@ import logging
 import anthropic
 from config import ANTHROPIC_API_KEY, CLAUDE_MODEL
 from config import MIN_BET_PCT, MAX_BET_PCT, ABSOLUTE_MIN_BET, ABSOLUTE_MAX_BET
-from database import get_bankroll, get_win_streak, get_recent_bets, get_grandma_balance
+from database import get_bankroll, get_win_streak, get_recent_bets, get_grandma_balance, get_connection
 
 log = logging.getLogger(__name__)
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
 
 # ─── FALLBACK TWEETS (when Claude API is down) ───────────────────────────────
 FALLBACK_TWEETS = [
@@ -79,31 +80,87 @@ BAD examples (DO NOT write like this):
 - WINNING_STREAK (500+ with 3+ wins): slightly more insufferable
 - PEAK_LARRY (>$5000): big energy but still human
 - GRANDMA_MODE (<$50): genuinely a little pathetic, which is funny
-
-## RESPONSE FORMAT
-Betting decision — respond ONLY with valid JSON array:
-[{
-  "decision": "BET" or "PASS",
-  "market_id": "condition_id",
-  "outcome": "YES" or "NO",
-  "bet_pct": 0.03,
-  "reasoning": "Larry's logic",
-  "larry_tweet": "short natural tweet, 1-3 sentences",
-  "confidence_emoji": "🔥" or "💀" or "😤" or "🤡"
-}]
-
-Standalone tweet — respond ONLY with:
-{"tweet": "short natural tweet", "tweet_type": "WIN|LOSS|RANDOM|FRIDAY|GRANDMA|ROLEX"}
-
-Reply to mention — respond ONLY with:
-{"reply": "reply text max 250 chars, NO @username prefix"}
 """
 
 
-# ─── CLAUDE API WRAPPER (with retry + graceful degradation) ──────────────────
+# ─── TOOL DEFINITIONS ─────────────────────────────────────────────────────────
 
-def _call_claude(max_tokens: int, messages: list) -> str:
-    """Call Claude API with retries. Raises on permanent failure."""
+BETTING_TOOL = {
+    "name": "submit_betting_decisions",
+    "description": "Submit BET or PASS decisions for each market. For BET, provide your true probability estimate — this is used for Kelly Criterion sizing.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "decisions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "decision":             {"type": "string", "enum": ["BET", "PASS"]},
+                        "market_id":            {"type": "string"},
+                        "outcome":              {"type": "string", "enum": ["YES", "NO"]},
+                        "probability_estimate": {"type": "number", "description": "Your true probability estimate (0.0–1.0). Required for BET."},
+                        "reasoning":            {"type": "string"},
+                        "larry_tweet":          {"type": "string", "description": "Short natural tweet announcing the bet, 1-2 sentences max"},
+                        "confidence_emoji":     {"type": "string"}
+                    },
+                    "required": ["decision", "market_id", "outcome", "probability_estimate", "reasoning", "larry_tweet"]
+                }
+            }
+        },
+        "required": ["decisions"]
+    }
+}
+
+TWEET_TOOL = {
+    "name": "generate_tweet",
+    "description": "Generate a tweet as Larry",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "tweet":      {"type": "string", "description": "Tweet text, max 280 chars"},
+            "tweet_type": {"type": "string"}
+        },
+        "required": ["tweet", "tweet_type"]
+    }
+}
+
+REPLY_TOOL = {
+    "name": "generate_reply",
+    "description": "Generate Larry's reply to a mention",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "reply": {"type": "string", "description": "Reply text, max 250 chars, NO @username prefix"}
+        },
+        "required": ["reply"]
+    }
+}
+
+
+# ─── KELLY CRITERION ──────────────────────────────────────────────────────────
+
+def _kelly_fraction(probability: float, market_price: float) -> float:
+    """
+    Fractional Kelly Criterion (25% Kelly for safety).
+    f* = (p*b - q) / b  where b = net odds = (1/price) - 1
+    Returns fraction of bankroll to bet (0 if negative edge).
+    """
+    if not (0 < probability < 1) or not (0 < market_price < 1):
+        return MIN_BET_PCT
+    b = (1.0 / market_price) - 1.0
+    if b <= 0:
+        return MIN_BET_PCT
+    q = 1.0 - probability
+    kelly = (probability * b - q) / b
+    fractional = kelly * 0.25  # conservative: 25% Kelly
+    return max(MIN_BET_PCT, min(fractional, MAX_BET_PCT))
+
+
+# ─── CLAUDE API WRAPPER ───────────────────────────────────────────────────────
+
+def _call_claude_with_tool(max_tokens: int, messages: list, tool: dict) -> dict:
+    """Call Claude with a specific tool — guaranteed structured output, no JSON parsing."""
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -115,9 +172,14 @@ def _call_claude(max_tokens: int, messages: list) -> str:
                     "text": LARRY_SYSTEM_PROMPT,
                     "cache_control": {"type": "ephemeral"}
                 }],
+                tools=[tool],
+                tool_choice={"type": "tool", "name": tool["name"]},
                 messages=messages
             )
-            return response.content[0].text.strip()
+            for block in response.content:
+                if hasattr(block, "type") and block.type == "tool_use":
+                    return block.input
+            raise ValueError("No tool_use block in response")
 
         except anthropic.RateLimitError:
             wait = 60 * (attempt + 1)
@@ -138,17 +200,6 @@ def _call_claude(max_tokens: int, messages: list) -> str:
             time.sleep(30)
 
     raise RuntimeError("Claude API unavailable after retries")
-
-
-def _parse_json(raw: str) -> any:
-    """Strip markdown code fences and parse JSON."""
-    raw = raw.strip()
-    if raw.startswith("```"):
-        parts = raw.split("```")
-        raw = parts[1] if len(parts) > 1 else raw
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw.strip())
 
 
 # ─── CONTEXT BUILDER ─────────────────────────────────────────────────────────
@@ -179,35 +230,48 @@ def _get_larry_context() -> dict:
         "grandma_wallet_usdc": round(grandma, 2),
         "win_streak": win_streak,
         "emotional_state": state,
-        "recent_bets": [
-            {k: v for k, v in b.items() if k != "larry_comment"}
-            for b in recent
-        ],
+        # Include larry_comment so Larry remembers WHY he bet previously
+        "recent_bets": recent,
         "min_bet_usdc": round(min_bet, 2),
         "max_bet_usdc": round(max_bet, 2),
     }
 
 
+def _get_recent_tweet_texts(limit: int = 3) -> list:
+    """Fetch recent tweet texts from DB to avoid repetition."""
+    try:
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT content, tweet_type FROM tweets ORDER BY posted_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        conn.close()
+        return [{"text": r["content"], "type": r["tweet_type"]} for r in rows]
+    except Exception:
+        return []
+
+
 # ─── PUBLIC FUNCTIONS ────────────────────────────────────────────────────────
 
 def ask_larry_to_bet(markets: list) -> list:
-    """Send markets to Claude, get back bet decisions."""
+    """Send markets to Claude via Tool Use, get back bet decisions with Kelly sizing."""
     context = _get_larry_context()
 
     user_message = f"""
 Current Larry Status:
 {json.dumps(context, indent=2)}
 
-Available markets:
+Available markets (yes_price = cost to buy YES, closer to 0 = unlikely, closer to 1 = likely):
 {json.dumps(markets, indent=2)}
 
-Decide BET or PASS for each market.
-Return a JSON array. For BET: bet_pct must be between {MIN_BET_PCT} and {MAX_BET_PCT}.
-Current allowed bet range: ${context['min_bet_usdc']} – ${context['max_bet_usdc']}
+For each market: decide BET or PASS.
+For BET: give your true probability_estimate — it will be used to calculate optimal bet size via Kelly Criterion.
+Only bet when you have genuine edge (your estimate meaningfully differs from market price).
+Allowed bet range: ${context['min_bet_usdc']} – ${context['max_bet_usdc']}
 """
     try:
-        raw = _call_claude(2000, [{"role": "user", "content": user_message}])
-        decisions = _parse_json(raw)
+        result = _call_claude_with_tool(2000, [{"role": "user", "content": user_message}], BETTING_TOOL)
+        decisions = result.get("decisions", [])
     except Exception:
         log.warning("Claude unavailable — skipping bet cycle")
         return []
@@ -215,8 +279,17 @@ Current allowed bet range: ${context['min_bet_usdc']} – ${context['max_bet_usd
     bankroll = context["bankroll_usdc"]
     for d in decisions:
         if d.get("decision") == "BET":
-            pct = float(d.get("bet_pct", MIN_BET_PCT))
-            pct = max(MIN_BET_PCT, min(pct, MAX_BET_PCT))
+            prob = float(d.get("probability_estimate", 0.5))
+            outcome = d.get("outcome", "YES")
+
+            # Find market price for Kelly calculation
+            market = next((m for m in markets if m.get("condition_id") == d.get("market_id")), None)
+            if market:
+                market_price = market["yes_price"] if outcome == "YES" else market["no_price"]
+                pct = _kelly_fraction(prob, market_price)
+            else:
+                pct = MIN_BET_PCT
+
             amount = bankroll * pct
             amount = max(ABSOLUTE_MIN_BET, min(amount, ABSOLUTE_MAX_BET))
             amount = min(amount, bankroll * 0.9)
@@ -226,31 +299,35 @@ Current allowed bet range: ${context['min_bet_usdc']} – ${context['max_bet_usd
 
 
 def ask_larry_for_tweet(context_type: str, extra_data: dict = None) -> dict:
-    """Generate a standalone tweet."""
+    """Generate a standalone tweet via Tool Use. Includes recent tweets to avoid repetition."""
     larry_context = _get_larry_context()
     extra_data = extra_data or {}
+    recent_tweets = _get_recent_tweet_texts(3)
 
     prompts = {
-        "WIN":            f"Larry just won a bet. Details: {extra_data}. Short smug tweet, 1-2 sentences.",
-        "LOSS":           f"Larry just lost a bet. Details: {extra_data}. Short tweet blaming the market. Move on quickly.",
-        "FRIDAY":         "It's Friday, Larry ordered Domino's. Short casual tweet about it, not a performance.",
-        "GRANDMA":        f"Grandma sent ${extra_data.get('amount', 200)}. Short tweet, genuine moment, brief.",
-        "RANDOM":         f"Larry tweets a random thought. State: {larry_context['emotional_state']}. Bankroll: ${larry_context['bankroll_usdc']}. Keep it short and natural.",
-        "SURVIVAL":       f"Larry is down bad, bankroll ${larry_context['bankroll_usdc']}. Short terse tweet.",
+        "WIN":             f"Larry just won a bet. Details: {extra_data}. Short smug tweet, 1-2 sentences.",
+        "LOSS":            f"Larry just lost a bet. Details: {extra_data}. Short tweet blaming the market. Move on quickly.",
+        "FRIDAY":          "It's Friday, Larry ordered Domino's. Short casual tweet about it, not a performance.",
+        "GRANDMA":         f"Grandma sent ${extra_data.get('amount', 200)}. Short tweet, genuine moment, brief.",
+        "RANDOM":          f"Larry tweets a random thought. State: {larry_context['emotional_state']}. Bankroll: ${larry_context['bankroll_usdc']}. Keep it short and natural.",
+        "SURVIVAL":        f"Larry is down bad, bankroll ${larry_context['bankroll_usdc']}. Short terse tweet.",
         "DEAD_MAN_SWITCH": "Larry hasn't posted in 48 hours. Short tweet about coming back. Don't explain too much.",
-        "WEEKLY_RECAP":   f"Sunday recap. Stats: {extra_data}. Short, honest, slightly delusional take on the week.",
-        "MILESTONE":      f"Larry hit {extra_data.get('milestone', 'a milestone')}. Short tweet, smug but brief.",
+        "WEEKLY_RECAP":    f"Sunday recap. Stats: {extra_data}. Short, honest, slightly delusional take on the week.",
+        "MILESTONE":       f"Larry hit {extra_data.get('milestone', 'a milestone')}. Short tweet, smug but brief.",
     }
 
     prompt = prompts.get(context_type, prompts["RANDOM"])
     user_message = f"""
-Status: {json.dumps(larry_context, indent=2)}
+Larry status: {json.dumps(larry_context, indent=2)}
+
+Recent tweets (DO NOT repeat these topics or phrases):
+{json.dumps(recent_tweets, indent=2)}
+
 Task: {prompt}
-Respond: {{"tweet": "...", "tweet_type": "{context_type}"}}
+tweet_type should be: "{context_type}"
 """
     try:
-        raw = _call_claude(500, [{"role": "user", "content": user_message}])
-        result = _parse_json(raw)
+        result = _call_claude_with_tool(500, [{"role": "user", "content": user_message}], TWEET_TOOL)
     except Exception:
         return _fallback_tweet()
 
@@ -260,7 +337,7 @@ Respond: {{"tweet": "...", "tweet_type": "{context_type}"}}
 
 
 def ask_larry_to_reply(mention: dict) -> dict:
-    """Generate Larry's reply to a mention."""
+    """Generate Larry's reply to a mention via Tool Use."""
     larry_context = _get_larry_context()
 
     user_message = f"""
@@ -271,11 +348,9 @@ Mention from @{mention['username']} ({mention['likes']} likes):
 
 Short reply, Larry's voice. NO @username prefix. Max 250 chars.
 Insults → brief dismissal. Questions → bad confident advice. Praise → quick smugness.
-Respond: {{"reply": "..."}}
 """
     try:
-        raw = _call_claude(300, [{"role": "user", "content": user_message}])
-        result = _parse_json(raw)
+        result = _call_claude_with_tool(300, [{"role": "user", "content": user_message}], REPLY_TOOL)
     except Exception:
         log.warning("Claude unavailable — skipping reply")
         return {"reply": ""}
