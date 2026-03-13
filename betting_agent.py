@@ -14,7 +14,7 @@ import logging
 import requests
 from datetime import datetime, timedelta
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import OrderArgs, OrderType, Side  # FIX: added Side
 from py_clob_client.constants import POLYGON
 
 from config import (
@@ -146,11 +146,12 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
             log.error(f"Could not find token_id for {condition_id} {outcome}")
             return False
 
-        # Place market order
+        # FIX: added side=Side.BUY — was missing, caused TypeError
         order_args = OrderArgs(
             token_id=token_id,
             price=round(price, 4),
             size=round(amount, 2),
+            side=Side.BUY,
         )
 
         signed_order = client.create_order(order_args)
