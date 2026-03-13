@@ -45,13 +45,13 @@ from twitter_agent import post_tweet
 
 def get_clob_client() -> ClobClient:
     # L1 init — needed to derive L2 credentials
-    # signature_type=0 for standard EOA wallet (Privy email login exports a standard private key)
+    # signature_type=1 for proxy wallet (funder != signer address)
     client = ClobClient(
         host=POLYMARKET_HOST,
         chain_id=POLYGON,
         key=POLYMARKET_PRIVATE_KEY,
         funder=POLYMARKET_FUNDER,
-        signature_type=0,
+        signature_type=1,
     )
     # Derive L2 creds automatically (required for placing orders)
     # create_or_derive_api_creds() is idempotent — safe to call every startup
