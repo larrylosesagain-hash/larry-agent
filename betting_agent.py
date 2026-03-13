@@ -45,11 +45,13 @@ from twitter_agent import post_tweet
 
 def get_clob_client() -> ClobClient:
     # L1 init — needed to derive L2 credentials
+    # signature_type=2 is required for Polymarket embedded wallets (email login)
     client = ClobClient(
         host=POLYMARKET_HOST,
         chain_id=POLYGON,
         key=POLYMARKET_PRIVATE_KEY,
         funder=POLYMARKET_FUNDER,
+        signature_type=2,
     )
     # Derive L2 creds automatically (required for placing orders)
     # create_or_derive_api_creds() is idempotent — safe to call every startup
