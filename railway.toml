@@ -2,5 +2,5 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "python betting_agent.py & python twitter_agent.py & wait"
+startCommand = "python main.py"
 restartPolicyType = "always"

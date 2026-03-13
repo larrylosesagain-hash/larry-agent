@@ -22,7 +22,7 @@ from config import (
     POLYMARKET_HOST, POLYMARKET_GAMMA_API,
     BET_CHECK_INTERVAL_MINUTES, MAX_OPEN_BETS,
     GRANDMA_INJECT_THRESHOLD, GRANDMA_INJECT_AMOUNT,
-    BET_CATEGORY_MIX, MIN_BET_USDC
+    BET_CATEGORY_MIX, ABSOLUTE_MIN_BET
 )
 from database import (
     get_bankroll, set_bankroll, get_pending_bets, save_bet, resolve_bet,
@@ -33,10 +33,7 @@ from larry_brain import ask_larry_to_bet, ask_larry_for_tweet
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [BETTING] %(message)s",
-    handlers=[
-        logging.FileHandler("/home/larry/logs/betting.log"),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()]  # Railway captures stdout automatically
 )
 log = logging.getLogger(__name__)
 
@@ -129,7 +126,7 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
     """
     condition_id = decision.get("market_id")
     outcome = decision.get("outcome", "YES")
-    amount = float(decision.get("amount_usdc", MIN_BET_USDC))
+    amount = float(decision.get("amount_usdc", ABSOLUTE_MIN_BET))
 
     try:
         # Get the token ID for this outcome
@@ -166,11 +163,12 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
             log.info(f"✅ BET PLACED: {outcome} on {condition_id} for ${amount}")
             return True
         else:
-            log.error(f"❌ Order failed: {resp}")
+            log.error(f"❌ Order failed: {resp.get('errorMsg', resp.get('error', 'unknown error'))}")
             return False
 
     except Exception as e:
-        log.error(f"Exception placing bet: {e}")
+        # SECURITY: log only exception type, not message (may contain wallet data)
+        log.error(f"Exception placing bet: {type(e).__name__}")
         return False
 
 
@@ -349,7 +347,8 @@ def run_betting_agent():
             log.info("👋 Betting agent stopped by user")
             break
         except Exception as e:
-            log.error(f"Unexpected error in betting loop: {e}", exc_info=True)
+            # SECURITY: no exc_info (traceback can expose env vars/keys)
+            log.error(f"Unexpected error in betting loop: {type(e).__name__}: {e}")
 
         # Wait before next cycle
         log.info(f"💤 Sleeping {BET_CHECK_INTERVAL_MINUTES} minutes...")
