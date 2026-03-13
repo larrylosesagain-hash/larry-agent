@@ -44,13 +44,18 @@ from twitter_agent import post_tweet
 # ─── POLYMARKET CLIENT ────────────────────────────────────────────────────────
 
 def get_clob_client() -> ClobClient:
-    # L1 auth — private key only, no API key needed
-    return ClobClient(
+    # L1 init — needed to derive L2 credentials
+    client = ClobClient(
         host=POLYMARKET_HOST,
         chain_id=POLYGON,
         key=POLYMARKET_PRIVATE_KEY,
         funder=POLYMARKET_FUNDER,
     )
+    # Derive L2 creds automatically (required for placing orders)
+    # create_or_derive_api_creds() is idempotent — safe to call every startup
+    creds = client.create_or_derive_api_creds()
+    client.set_api_creds(creds)
+    return client
 
 
 # ─── FETCH MARKETS ────────────────────────────────────────────────────────────
