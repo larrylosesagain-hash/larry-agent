@@ -1,75 +1,67 @@
 """
-main.py — Launch both Larry agents in parallel threads
-Railway runs this single file, which starts betting + twitter agents.
+main.py — Larry's entry point
+Starts Twitter and Betting agents in separate threads.
+SIGTERM/SIGINT are handled here (main thread only) and propagated to both agents.
 """
 
+import signal
 import threading
 import logging
-import time
-import sys
+
+from twitter_agent import run_twitter_agent, set_twitter_shutdown
+from betting_agent import run_betting_agent, set_betting_shutdown
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+    format="%(asctime)s [MAIN] %(message)s",
+    handlers=[logging.StreamHandler()]
 )
 log = logging.getLogger(__name__)
 
-RESTART_DELAY_SECONDS = 30  # wait before restarting a dead thread
+
+def _handle_sigterm(signum, frame):
+    """
+    Railway sends SIGTERM before killing the container.
+    Signal handlers MUST be registered in the main thread — that's why this
+    lives here and not inside the agent threads.
+    """
+    log.info("🛑 SIGTERM received — gracefully stopping both agents...")
+    set_twitter_shutdown()
+    set_betting_shutdown()
 
 
 def run_twitter():
-    from twitter_agent import run_twitter_agent
-    run_twitter_agent()
+    try:
+        run_twitter_agent()
+    except Exception as e:
+        log.error(f"Twitter agent crashed: {e}")
 
 
 def run_betting():
-    from betting_agent import run_betting_agent
-    run_betting_agent()
-
-
-def seed_bankroll():
-    """Seed $100 bankroll on very first startup."""
-    from database import init_db, get_bankroll, set_bankroll, get_state, set_state
-    init_db()
-    if get_state("bankroll_seeded") != "true":
-        if get_bankroll() == 0.0:
-            set_bankroll(100.0, 100.0, "INITIAL_DEPOSIT")
-            set_state("bankroll_seeded", "true")
-            log.info("💰 Bankroll seeded: $100.00 — Larry is ready to lose money!")
-        else:
-            set_state("bankroll_seeded", "true")  # bankroll already exists
+    try:
+        run_betting_agent()
+    except Exception as e:
+        log.error(f"Betting agent crashed: {e}")
 
 
 if __name__ == "__main__":
     log.info("🚀 Larry is waking up...")
 
-    # Seed bankroll once before agents start
-    seed_bankroll()
+    # Register graceful shutdown — MUST happen in main thread
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    signal.signal(signal.SIGINT, _handle_sigterm)   # Ctrl+C in local dev
 
-    t_twitter = threading.Thread(target=run_twitter, name="Twitter", daemon=False)
-    t_betting = threading.Thread(target=run_betting, name="Betting", daemon=False)
+    twitter_thread = threading.Thread(target=run_twitter, name="Twitter", daemon=True)
+    betting_thread = threading.Thread(target=run_betting, name="Betting", daemon=True)
 
-    t_twitter.start()
+    twitter_thread.start()
     log.info("🐦 Twitter agent started")
 
-    t_betting.start()
+    betting_thread.start()
     log.info("🎰 Betting agent started")
 
-    # Watchdog: restart any thread that dies, with delay to avoid crash loops
-    while True:
-        time.sleep(60)
+    # Block main thread — agents run until SIGTERM sets their shutdown flags
+    twitter_thread.join()
+    betting_thread.join()
 
-        if not t_twitter.is_alive():
-            log.error(f"⚠️ Twitter agent died — restarting in {RESTART_DELAY_SECONDS}s...")
-            time.sleep(RESTART_DELAY_SECONDS)
-            t_twitter = threading.Thread(target=run_twitter, name="Twitter", daemon=False)
-            t_twitter.start()
-            log.info("🐦 Twitter agent restarted")
-
-        if not t_betting.is_alive():
-            log.error(f"⚠️ Betting agent died — restarting in {RESTART_DELAY_SECONDS}s...")
-            time.sleep(RESTART_DELAY_SECONDS)
-            t_betting = threading.Thread(target=run_betting, name="Betting", daemon=False)
-            t_betting.start()
-            log.info("🎰 Betting agent restarted")
+    log.info("✅ Larry shut down cleanly")

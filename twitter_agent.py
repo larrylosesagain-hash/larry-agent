@@ -965,11 +965,12 @@ def run_vip_stream():
 
 _twitter_shutdown = False
 
-def _handle_sigterm(signum, frame):
-    """Graceful Railway shutdown — finish current cycle, then exit cleanly."""
+
+def set_twitter_shutdown():
+    """Called by main.py SIGTERM handler (must run in main thread)."""
     global _twitter_shutdown
-    log.info("🛑 SIGTERM received — will exit after current cycle")
     _twitter_shutdown = True
+    log.info("🛑 Twitter agent shutdown requested — will exit after current cycle")
 
 
 def run_twitter_agent():
@@ -979,9 +980,6 @@ def run_twitter_agent():
     # Load persisted state from previous session
     _init_quote_blacklist()
     _load_vip_cooldowns()
-
-    # Register Railway SIGTERM so container shuts down cleanly (not mid-tweet)
-    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     # Start VIP stream in background — real-time push from Twitter, no polling
     vip_thread = threading.Thread(target=run_vip_stream, daemon=True)

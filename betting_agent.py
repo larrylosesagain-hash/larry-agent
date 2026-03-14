@@ -577,6 +577,16 @@ def check_grandma_wallet():
 
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 
+_betting_shutdown = False
+
+
+def set_betting_shutdown():
+    """Called by main.py SIGTERM handler (must run in main thread)."""
+    global _betting_shutdown
+    _betting_shutdown = True
+    log.info("🛑 Betting agent shutdown requested — will exit after current cycle")
+
+
 def run_betting_agent():
     log.info("🎰 Larry's Betting Agent starting up...")
     init_db()
@@ -585,20 +595,12 @@ def run_betting_agent():
     _load_scan_page()
     log.info(f"📖 Scan page restored: {_scan_page}/10")
 
-    # SIGTERM handler — Railway sends SIGTERM on container stop.
-    # Without this, Python doesn't raise KeyboardInterrupt on SIGTERM,
-    # so the agent is killed mid-cycle with no cleanup.
-    def _handle_sigterm(signum, frame):
-        log.info("SIGTERM received — shutting down gracefully")
-        raise SystemExit(0)
-    signal.signal(signal.SIGTERM, _handle_sigterm)
-
     client = get_clob_client()
 
     # Sync real CLOB balance at startup so Larry knows his actual bankroll
     sync_bankroll_from_clob(client)
 
-    while True:
+    while not _betting_shutdown:
         try:
             log.info("--- Betting cycle starting ---")
 
@@ -722,9 +724,14 @@ def run_betting_agent():
             # SECURITY: no exc_info (traceback can expose env vars/keys)
             log.error(f"Unexpected error in betting loop: {type(e).__name__}: {e}")
 
+        if _betting_shutdown:
+            break
+
         # Wait before next cycle
         log.info(f"💤 Sleeping {BET_CHECK_INTERVAL_MINUTES} minutes...")
         time.sleep(BET_CHECK_INTERVAL_MINUTES * 60)
+
+    log.info("✅ Betting agent exited cleanly")
 
 
 if __name__ == "__main__":
