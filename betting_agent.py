@@ -209,6 +209,8 @@ def fetch_active_markets(limit=20) -> list:
                     vol = float(m.get("volume24hr", 0))
                     cat = _guess_category(m.get("question", ""))
                     for t in tokens:
+                        if not isinstance(t, dict):
+                            continue  # Gamma API sometimes returns token IDs as strings
                         t_name = t.get("outcome") or t.get("name", "")
                         t_price = float(t.get("price", 0.5))
                         if not t_name or t_price >= 0.97 or t_price <= 0.03:
