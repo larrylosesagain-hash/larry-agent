@@ -89,8 +89,10 @@ def sync_bankroll_from_clob(client: ClobClient):
     """
     try:
         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        # AssetType.USDC was renamed to COLLATERAL in newer versions of py_clob_client
+        asset = getattr(AssetType, "COLLATERAL", None) or getattr(AssetType, "USDC", None)
         result = client.get_balance_allowance(
-            BalanceAllowanceParams(asset_type=AssetType.USDC)
+            BalanceAllowanceParams(asset_type=asset)
         )
         # balance is returned as a string of raw units (6 decimals for USDC)
         raw = result.get("balance", "0")
@@ -496,6 +498,15 @@ def run_betting_agent():
                         # so also match on outcome_name
                         market_id = decision.get("market_id")
                         decision_outcome = decision.get("outcome", "")
+
+                        # Skip if we already have an open bet on this exact market
+                        already_open = any(
+                            b.get("polymarket_id") == market_id
+                            for b in get_pending_bets()
+                        )
+                        if already_open:
+                            log.info(f"Already have open bet on {market_id[:16]}..., skipping")
+                            continue
                         market_info = next(
                             (m for m in markets if m["condition_id"] == market_id
                              and (not m.get("neg_risk") or
