@@ -295,20 +295,24 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
         # Use CLOB client to get market data (more reliable than raw HTTP)
         market_data = client.get_market(condition_id)
 
+        # Gamma API's negRisk field is unreliable — check CLOB market data directly.
+        # Neg-risk markets require a different order flow we don't support yet; skip them.
+        if market_data.get("neg_risk") or market_data.get("negRisk"):
+            log.info(f"Skipping neg-risk market {condition_id[:16]}... (not supported)")
+            return False
+
         tokens = market_data.get("tokens", [])
         token_id = None
         price = None
         for token in tokens:
             token_outcome = token.get("outcome", "")
-            # Neg-risk markets: match by exact outcome name (e.g. "Demi Moore", "Real Madrid")
-            # Binary markets: match YES/NO case-insensitively
             if token_outcome.lower() == outcome.lower():
                 token_id = token.get("token_id")
                 price = float(token.get("price", 0.5))
                 break
 
         if not token_id:
-            log.error(f"Could not find token_id for {condition_id} {outcome}")
+            log.info(f"Skipping market {condition_id[:16]}... — no '{outcome}' token (likely neg-risk)")
             return False
 
         # FIX: added side="BUY" — was missing, caused TypeError
@@ -330,12 +334,11 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
             return False
 
     except TypeError as te:
-        # TypeError is safe to log (no sensitive data in type errors)
         log.error(f"TypeError placing bet: {te}")
         return False
     except Exception as e:
-        # SECURITY: log only exception type, not message (may contain wallet data)
-        log.error(f"Exception placing bet: {type(e).__name__}")
+        # PolyApiException message is safe (HTTP error details, no wallet data)
+        log.error(f"Exception placing bet ({type(e).__name__}): {e}")
         return False
 
 
