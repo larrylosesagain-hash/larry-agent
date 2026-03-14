@@ -16,12 +16,6 @@ from database import get_bankroll, get_win_streak, get_recent_bets, get_grandma_
 log = logging.getLogger(__name__)
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# Edge thresholds by market type:
-# Efficient markets (crypto, politics) — crowd is usually right, need real edge
-MIN_EDGE_EFFICIENT = 0.05
-# Cultural/entertainment/sports — less efficient, mispricing is common
-MIN_EDGE = 0.03
-
 
 # ─── FALLBACK TWEETS (when Claude API is down) ───────────────────────────────
 FALLBACK_TWEETS = [
@@ -358,14 +352,12 @@ def ask_larry_to_bet(markets: list) -> list:
         f"Larry Status: {json.dumps(context, separators=(',',':'))}\n\n"
         f"Markets (yes_price=cost to buy YES, 'news' = current web context if available):\n"
         f"{json.dumps(markets, separators=(',',':'))}\n\n"
-        f"Decide BET or PASS. Rules:\n"
-        f"- Edge = |your_prob - market_price|. Min: crypto/politics={MIN_EDGE_EFFICIENT:.0%}, else={MIN_EDGE:.0%}\n"
-        f"- Use 'news' field when available — reason about current narrative and sentiment\n"
-        f"- CONTRARIAN: 97% on anyone = skip that, look for who's underpriced. "
-        f"Is the Academy in a 'comeback' mood? Is there a split vote risk? Is the frontrunner's film out of fashion?\n"
-        f"- YES and NO both valid — sometimes bet NO on an overpriced favorite\n"
-        f"- Entertainment/culture: lean toward betting if you have any read at all\n"
-        f"- Small gut-feel bets fine on interesting markets (min ${context['min_bet_usdc']})\n"
+        f"Decide BET or PASS. Larry's default is BET — PASS only if you genuinely have zero read.\n"
+        f"- YES and NO both valid. Sometimes the edge is betting NO on an overpriced favorite.\n"
+        f"- Use 'news' field — reason about narrative, momentum, sentiment.\n"
+        f"- CONTRARIAN welcome: who's underpriced? Split vote risk? Frontrunner losing buzz?\n"
+        f"- Gut-feel bets are fine. Larry bets on vibes too. Min bet ${context['min_bet_usdc']}.\n"
+        f"- Aim for at least 3-5 BETs this cycle. If you're passing everything, you're too scared.\n"
         f"Bet range: ${context['min_bet_usdc']}–${context['max_bet_usdc']}"
     )
     try:
@@ -384,20 +376,6 @@ def ask_larry_to_bet(markets: list) -> list:
 
             if market:
                 market_price = market["yes_price"] if outcome == "YES" else round(1 - market["yes_price"], 4)
-
-                # Category-aware edge threshold:
-                # crypto/politics = efficient, need more edge; everything else = less efficient
-                category = market.get("category", "weird")
-                threshold = MIN_EDGE_EFFICIENT if category in ("crypto", "politics") else MIN_EDGE
-
-                # Hard edge check — override Claude if edge is too small
-                edge = abs(prob - market_price)
-                if edge < threshold:
-                    log.info(f"PASS (edge {edge:.1%} < {threshold:.0%} for {category}): {d.get('market_id','')[:16]}...")
-                    d["decision"] = "PASS"
-                    d["reasoning"] = f"Edge {edge:.1%} below {threshold:.0%} threshold for {category} market"
-                    continue
-
                 pct = _kelly_fraction(prob, market_price)
             else:
                 pct = MIN_BET_PCT

@@ -232,7 +232,7 @@ def fetch_active_markets(limit=20) -> list:
         filtered.sort(key=sort_key)
 
         log.info(f"Fetched {len(filtered)} live markets (filtered from {len(markets)})")
-        return filtered[:10]  # top 10 after sorting
+        return filtered[:15]  # top 15 after sorting
 
     except Exception as e:
         log.error(f"Failed to fetch markets: {e}")
@@ -313,22 +313,6 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
         return False
 
 
-# ─── CATEGORY EXPOSURE CHECK ──────────────────────────────────────────────────
-
-MAX_BETS_PER_CATEGORY = 3
-
-def _count_open_bets_by_category() -> dict:
-    """Count pending bets grouped by category to avoid over-concentration."""
-    try:
-        from database import get_connection
-        conn = get_connection()
-        rows = conn.execute(
-            "SELECT category, COUNT(*) as cnt FROM bets WHERE status='PENDING' GROUP BY category"
-        ).fetchall()
-        conn.close()
-        return {r["category"]: r["cnt"] for r in rows}
-    except Exception:
-        return {}
 
 
 # ─── CHECK RESOLVED BETS ──────────────────────────────────────────────────────
@@ -460,8 +444,6 @@ def run_betting_agent():
                     decisions = ask_larry_to_bet(markets)
                     log.info(f"Larry made {len(decisions)} decisions")
 
-                    open_by_category = _count_open_bets_by_category()
-
                     for decision in decisions:
                         if decision.get("decision") != "BET":
                             log.info(f"PASS: {decision.get('reasoning', 'no reason given')}")
@@ -471,19 +453,12 @@ def run_betting_agent():
                             log.info("Reached max open bets mid-loop, stopping")
                             break
 
-                        # Resolve market_info once — reused for category check, DB save, and odds
+                        # Resolve market_info once — reused for DB save and odds
                         market_id = decision.get("market_id")
                         market_info = next(
                             (m for m in markets if m["condition_id"] == market_id),
                             {}
                         )
-
-                        # Category exposure check — max 2 open bets per category
-                        category = market_info.get("category", "weird")
-                        if open_by_category.get(category, 0) >= MAX_BETS_PER_CATEGORY:
-                            log.info(f"PASS (category limit): already {MAX_BETS_PER_CATEGORY} open {category} bets")
-                            continue
-                        open_by_category[category] = open_by_category.get(category, 0) + 1
 
                         # 6. Deduct bet amount from bankroll first
                         bankroll = get_bankroll()
