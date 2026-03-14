@@ -11,7 +11,7 @@ import anthropic
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import ANTHROPIC_API_KEY, CLAUDE_MODEL
 from config import MIN_BET_PCT, MAX_BET_PCT, ABSOLUTE_MIN_BET, ABSOLUTE_MAX_BET
-from database import get_bankroll, get_win_streak, get_recent_bets, get_grandma_balance, get_connection
+from database import get_bankroll, get_win_streak, get_recent_bets, get_pending_bets, get_grandma_balance, get_connection
 
 log = logging.getLogger(__name__)
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -249,10 +249,21 @@ def _get_tweet_context() -> dict:
     """Lightweight context for tweet/reply generation — no full bet history needed."""
     bankroll = get_bankroll()
     win_streak = get_win_streak()
+    # Include open bets so Larry knows his real net worth, not just free cash
+    # bankroll_usdc = available cash (deducted when bets placed)
+    # in_play_usdc  = money locked in open bets (not lost, could win)
+    # total_usdc    = the number Larry should reference when talking about his balance
+    try:
+        in_play = sum(float(b.get("amount_usdc", 0)) for b in get_pending_bets())
+    except Exception:
+        in_play = 0.0
+    total = bankroll + in_play
     return {
         "bankroll_usdc": round(bankroll, 2),
+        "in_play_usdc": round(in_play, 2),
+        "total_usdc": round(total, 2),
         "win_streak": win_streak,
-        "emotional_state": _get_emotional_state(bankroll, win_streak),
+        "emotional_state": _get_emotional_state(total, win_streak),
     }
 
 
