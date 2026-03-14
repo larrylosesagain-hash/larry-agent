@@ -79,6 +79,49 @@ def _is_token_blacklisted(condition_id: str) -> bool:
         return False
     return True
 
+# PASS cache: markets Claude already decided to skip this session.
+# Re-sends the market only if something meaningful changed:
+#   - price moved >5% (new information)
+#   - <4 hours left (urgency spike)
+#   - 6h TTL expired (market may have evolved)
+# Saves ~30-40% of Claude tokens by not re-analyzing identical markets every cycle.
+_pass_cache: dict = {}  # condition_id → {"passed_at": datetime, "price": float, "hours_to_end": int}
+
+
+def _cache_pass(condition_id: str, yes_price: float, hours_to_end: int):
+    _pass_cache[condition_id] = {
+        "passed_at": datetime.utcnow(),
+        "price": yes_price,
+        "hours_to_end": hours_to_end,
+    }
+
+
+def _is_pass_cached(market: dict) -> bool:
+    """Return True if Claude already passed on this market and nothing meaningful changed."""
+    cid = market["condition_id"]
+    entry = _pass_cache.get(cid)
+    if not entry:
+        return False
+
+    # TTL expired — allow retry
+    if datetime.utcnow() - entry["passed_at"] > timedelta(hours=6):
+        del _pass_cache[cid]
+        return False
+
+    # Price moved >5% — new information, worth re-analysing
+    current_price = market.get("yes_price", 0.5)
+    if abs(current_price - entry["price"]) > 0.05:
+        del _pass_cache[cid]
+        return False
+
+    # Market became urgent since last PASS — re-examine
+    if market.get("hours_to_end", 24) <= 4 and entry["hours_to_end"] > 4:
+        del _pass_cache[cid]
+        return False
+
+    return True  # nothing changed — skip
+
+
 # Rotating page counter — persisted in DB so restarts continue where they left off
 # (otherwise Larry always restarts at page 0 and misses pages 1-9)
 _scan_page: int = 0
@@ -622,16 +665,18 @@ def run_betting_agent():
                 markets = fetch_active_markets()
 
                 if markets:
-                    # Filter out markets Larry already has open bets on — no point sending to Claude
+                    # Filter out markets Larry already has open bets on, token-blacklisted,
+                    # or already passed on this cycle (price/urgency unchanged)
                     open_bet_ids = {b.get("polymarket_id") for b in get_pending_bets()}
                     fresh_markets = [
                         m for m in markets
                         if m["condition_id"] not in open_bet_ids
                         and not _is_token_blacklisted(m["condition_id"])
+                        and not _is_pass_cached(m)
                     ]
                     skipped = len(markets) - len(fresh_markets)
                     if skipped:
-                        log.info(f"Skipped {skipped} markets (open bets or no-token blacklist) — sending {len(fresh_markets)} fresh to Claude")
+                        log.info(f"Skipped {skipped} markets (open bets / no-token / already passed) — sending {len(fresh_markets)} fresh to Claude")
                     markets = fresh_markets
 
                 if markets:
@@ -642,6 +687,12 @@ def run_betting_agent():
                     for decision in decisions:
                         if decision.get("decision") != "BET":
                             log.info(f"PASS: {decision.get('reasoning', 'no reason given')}")
+                            # Cache PASS so we don't re-send same market next cycle
+                            mid = decision.get("market_id")
+                            if mid:
+                                m_info = next((m for m in markets if m["condition_id"] == mid), None)
+                                if m_info:
+                                    _cache_pass(mid, m_info.get("yes_price", 0.5), m_info.get("hours_to_end", 24))
                             continue
 
                         pending_now = get_pending_bets()
