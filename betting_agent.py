@@ -40,7 +40,7 @@ _CTF_ABI = [{
 from config import (
     POLYMARKET_PRIVATE_KEY, POLYMARKET_FUNDER,
     POLYMARKET_HOST, POLYMARKET_GAMMA_API,
-    BET_CHECK_INTERVAL_MINUTES, MAX_OPEN_BETS,
+    BET_CHECK_INTERVAL_MINUTES,
     GRANDMA_INJECT_THRESHOLD, GRANDMA_INJECT_AMOUNT,
     ABSOLUTE_MIN_BET
 )
@@ -103,7 +103,7 @@ def sync_bankroll_from_clob(client: ClobClient):
             else:
                 log.info(f"💰 Balance OK: DB=${db_balance:.2f}, CLOB=${real_balance:.2f}")
     except Exception as e:
-        log.warning(f"Balance sync failed ({type(e).__name__}) — using DB balance")
+        log.warning(f"Balance sync failed ({type(e).__name__}: {e}) — using DB balance")
 
 
 # ─── AUTO-CLAIM WINNINGS ──────────────────────────────────────────────────────
@@ -465,10 +465,13 @@ def run_betting_agent():
             # 2. Check if Grandma needs to intervene
             check_grandma_wallet()
 
-            # 3. Check how many open bets we have
+            # 3. Check bankroll exposure — stop placing new bets if 80%+ is already in play
             open_bets = get_pending_bets()
-            if len(open_bets) >= MAX_OPEN_BETS:
-                log.info(f"Max open bets reached ({MAX_OPEN_BETS}), skipping new bets")
+            bankroll = get_bankroll()
+            open_exposure = sum(float(b.get("amount_usdc", 0)) for b in open_bets)
+            max_exposure = bankroll * 0.80
+            if open_exposure >= max_exposure:
+                log.info(f"Exposure limit reached: ${open_exposure:.2f} of ${bankroll:.2f} in play ({open_exposure/bankroll*100:.0f}%), skipping new bets")
             else:
                 # 4. Fetch markets
                 markets = fetch_active_markets(limit=100)
@@ -483,8 +486,9 @@ def run_betting_agent():
                             log.info(f"PASS: {decision.get('reasoning', 'no reason given')}")
                             continue
 
-                        if len(get_pending_bets()) >= MAX_OPEN_BETS:
-                            log.info("Reached max open bets mid-loop, stopping")
+                        current_exposure = sum(float(b.get("amount_usdc", 0)) for b in get_pending_bets())
+                        if current_exposure >= max_exposure:
+                            log.info(f"Reached exposure limit mid-loop (${current_exposure:.2f}), stopping")
                             break
 
                         # Resolve market_info once — reused for DB save and odds
