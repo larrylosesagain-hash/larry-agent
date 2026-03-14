@@ -11,6 +11,10 @@ import anthropic
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import ANTHROPIC_API_KEY, CLAUDE_MODEL
 from config import MIN_BET_PCT, MAX_BET_PCT, ABSOLUTE_MIN_BET, ABSOLUTE_MAX_BET
+
+# Haiku for tweets/replies — fast, cheap, handles short creative text perfectly
+# Sonnet (CLAUDE_MODEL) stays for betting decisions — needs real reasoning
+TWEET_MODEL = "claude-haiku-4-5-20251001"
 from database import get_bankroll, get_win_streak, get_recent_bets, get_pending_bets, get_grandma_balance, get_connection
 
 log = logging.getLogger(__name__)
@@ -160,15 +164,16 @@ def _kelly_fraction(probability: float, market_price: float) -> float:
 
 # ─── CLAUDE API WRAPPER ───────────────────────────────────────────────────────
 
-def _call_claude_with_tool(max_tokens: int, messages: list, tool: dict) -> dict:
+def _call_claude_with_tool(max_tokens: int, messages: list, tool: dict, model: str = None) -> dict:
     """Call Claude with a specific tool — guaranteed structured output, no JSON parsing."""
     # Cache both system prompt and tool definition to save tokens
     cached_tool = {**tool, "cache_control": {"type": "ephemeral"}}
+    use_model = model or CLAUDE_MODEL
     max_retries = 3
     for attempt in range(max_retries):
         try:
             response = client.messages.create(
-                model=CLAUDE_MODEL,
+                model=use_model,
                 max_tokens=max_tokens,
                 system=[{
                     "type": "text",
@@ -430,7 +435,7 @@ def ask_larry_for_tweet(context_type: str, extra_data: dict = None) -> dict:
         f"tweet_type: \"{context_type}\""
     )
     try:
-        result = _call_claude_with_tool(500, [{"role": "user", "content": user_message}], TWEET_TOOL)
+        result = _call_claude_with_tool(500, [{"role": "user", "content": user_message}], TWEET_TOOL, model=TWEET_MODEL)
     except Exception:
         return _fallback_tweet()
 
@@ -452,7 +457,7 @@ def ask_larry_to_reply(mention: dict) -> dict:
         f"Insults → brief dismissal. Questions → bad confident advice. Praise → quick smugness."
     )
     try:
-        result = _call_claude_with_tool(300, [{"role": "user", "content": user_message}], REPLY_TOOL)
+        result = _call_claude_with_tool(300, [{"role": "user", "content": user_message}], REPLY_TOOL, model=TWEET_MODEL)
     except Exception:
         log.warning("Claude unavailable — skipping reply")
         return {"reply": ""}
