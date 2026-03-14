@@ -201,12 +201,35 @@ def fetch_active_markets(limit=20) -> list:
                 if end_date_naive > cutoff:
                     continue  # too far in the future
 
+                # Neg-risk = multi-outcome market (Oscars, championships etc)
+                # Expand each outcome into its own entry so Larry can bet on individual outcomes
+                if m.get("negRisk") or m.get("neg_risk"):
+                    tokens = m.get("tokens") or m.get("outcomes") or []
+                    cond_id = m.get("conditionId") or m.get("condition_id")
+                    vol = float(m.get("volume24hr", 0))
+                    cat = _guess_category(m.get("question", ""))
+                    for t in tokens:
+                        t_name = t.get("outcome") or t.get("name", "")
+                        t_price = float(t.get("price", 0.5))
+                        if not t_name or t_price >= 0.97 or t_price <= 0.03:
+                            continue
+                        filtered.append({
+                            "condition_id": cond_id,
+                            "question": m.get("question"),
+                            "end_date": end_date_str,
+                            "yes_price": round(t_price, 4),
+                            "outcome_name": t_name,   # actual outcome to bet on
+                            "neg_risk": True,
+                            "volume_24h": vol,
+                            "category": cat,
+                        })
+                    continue  # skip normal binary processing below
+
                 best_ask = float(m.get("bestAsk", 0.5))
                 best_bid = float(m.get("bestBid", best_ask - 0.02))
                 last_price = float(m.get("lastTradePrice") or best_ask)
 
-                # FIX: skip near-resolved markets (price at floor/ceiling = effectively resolved)
-                # These were flooding Claude with obvious PASSes every cycle, wasting tokens
+                # skip near-resolved markets (price at floor/ceiling = effectively resolved)
                 if best_ask >= 0.97 or best_ask <= 0.03:
                     continue
 
@@ -215,7 +238,6 @@ def fetch_active_markets(limit=20) -> list:
                     "question": m.get("question"),
                     "end_date": end_date_str,
                     "yes_price": round(best_ask, 4),
-                    # no_price omitted — Claude derives it as 1 - yes_price
                     "spread": round(best_ask - best_bid, 4),
                     "price_vs_last": round(best_ask - last_price, 4),
                     "volume_24h": float(m.get("volume24hr", 0)),
@@ -275,8 +297,10 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
         token_id = None
         price = None
         for token in tokens:
-            # Case-insensitive: API returns "Yes"/"No", we store "YES"/"NO"
-            if token.get("outcome", "").upper() == outcome.upper():
+            token_outcome = token.get("outcome", "")
+            # Neg-risk markets: match by exact outcome name (e.g. "Demi Moore", "Real Madrid")
+            # Binary markets: match YES/NO case-insensitively
+            if token_outcome.lower() == outcome.lower():
                 token_id = token.get("token_id")
                 price = float(token.get("price", 0.5))
                 break
@@ -454,9 +478,14 @@ def run_betting_agent():
                             break
 
                         # Resolve market_info once — reused for DB save and odds
+                        # For neg-risk markets multiple entries share condition_id,
+                        # so also match on outcome_name
                         market_id = decision.get("market_id")
+                        decision_outcome = decision.get("outcome", "")
                         market_info = next(
-                            (m for m in markets if m["condition_id"] == market_id),
+                            (m for m in markets if m["condition_id"] == market_id
+                             and (not m.get("neg_risk") or
+                                  m.get("outcome_name", "").lower() == decision_outcome.lower())),
                             {}
                         )
 

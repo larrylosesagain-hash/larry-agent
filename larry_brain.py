@@ -100,7 +100,7 @@ BETTING_TOOL = {
                     "properties": {
                         "decision":             {"type": "string", "enum": ["BET", "PASS"]},
                         "market_id":            {"type": "string"},
-                        "outcome":              {"type": "string", "enum": ["YES", "NO"]},
+                        "outcome":              {"type": "string", "description": "For binary markets: YES or NO. For multi-outcome markets: exact outcome_name from the market (e.g. 'Demi Moore', 'Real Madrid')."},
                         "probability_estimate": {"type": "number", "description": "Your true probability estimate (0.0-1.0). Required for BET."},
                         "reasoning":            {"type": "string"},
                         "larry_tweet":          {"type": "string", "description": "Short natural tweet announcing the bet, 1-2 sentences max. BET decisions only — skip for PASS."},
@@ -375,7 +375,11 @@ def ask_larry_to_bet(markets: list) -> list:
             market = next((m for m in markets if m.get("condition_id") == d.get("market_id")), None)
 
             if market:
-                market_price = market["yes_price"] if outcome == "YES" else round(1 - market["yes_price"], 4)
+                if market.get("neg_risk"):
+                    # neg-risk: yes_price IS the price of this specific outcome
+                    market_price = market["yes_price"]
+                else:
+                    market_price = market["yes_price"] if outcome == "YES" else round(1 - market["yes_price"], 4)
                 pct = _kelly_fraction(prob, market_price)
             else:
                 pct = MIN_BET_PCT
