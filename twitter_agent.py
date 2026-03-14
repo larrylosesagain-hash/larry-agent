@@ -38,6 +38,35 @@ log = logging.getLogger(__name__)
 # ─── REPLY RATIO: 1 reply per 4 own tweets ───────────────────────────────────
 REPLY_RATIO = 4
 
+# ─── CONTENT SAFETY FILTER ───────────────────────────────────────────────────
+# Two-layer filter: fast keyword blacklist — never engage with this content
+_SCAM_KEYWORDS = [
+    "airdrop", "presale", "whitelist", "mint now", "free nft", "send eth",
+    "send bnb", "send usdt", "send sol", "dm for", "guaranteed profit",
+    "100x", "1000x", "get rich", "passive income", "copy trade", "signal group",
+    "pump incoming", "giveaway", "retweet to win", "follow to win",
+    "click link in bio", "limited offer", "buy now before", "next 100x",
+    "join our group", "free crypto", "earn daily",
+]
+_HARMFUL_KEYWORDS = [
+    "kill yourself", "kys", "how to make bomb", "suicide method",
+]
+
+def _is_safe_to_engage(text: str) -> bool:
+    """
+    Fast safety check — returns False if content looks like scam or harmful.
+    No Claude call needed — pure keyword matching.
+    """
+    text_lower = text.lower()
+    for kw in _SCAM_KEYWORDS + _HARMFUL_KEYWORDS:
+        if kw in text_lower:
+            return False
+    # Spam signals
+    if text.count("#") > 4:       return False  # hashtag spam
+    if text.count("@") > 3:       return False  # mention spam
+    if text.lower().count("http") > 2: return False  # link spam
+    return True
+
 # FIX: cache larry's user ID so we don't call get_me() every 15 minutes
 _larry_user_id = None
 
@@ -242,6 +271,7 @@ def check_and_reply_to_mentions():
 
             post_tweet(full_reply, tweet_type="REPLY", reply_to_id=best["tweet_id"])
             log.info(f"✅ Replied to @{best['username']}")
+            like_tweet(best["tweet_id"])  # like the mention we're replying to
 
     except Exception as e:
         log.error(f"Failed to generate/post reply: {e}")
@@ -380,6 +410,314 @@ def check_milestones():
             break  # only one milestone per cycle
 
 
+# ─── LIKES ───────────────────────────────────────────────────────────────────
+
+def like_tweet(tweet_id: str):
+    """Larry likes a tweet. Silent fail — likes are nice-to-have."""
+    try:
+        client = get_twitter_client()
+        larry_id = _get_larry_id(client)
+        client.like(larry_id, tweet_id)
+        log.info(f"❤️ Liked tweet {tweet_id}")
+    except Exception as e:
+        log.debug(f"Like failed: {type(e).__name__}")
+
+
+# ─── QUOTE TWEETS ─────────────────────────────────────────────────────────────
+
+# Keywords to search — related to what Larry bets on
+# Whitelist of accounts Larry can quote tweet — high engagement, relevant to betting/markets/politics
+_QUOTE_ACCOUNTS = [
+    "polymarket",       # prediction markets — Larry's home turf
+    "elonmusk",         # Elon — Larry has opinions on everything he says
+    "realDonaldTrump",  # Trump — Larry bets on politics
+    "NateSilver538",    # forecasting legend — Larry thinks he's better than Nate
+    "unusual_whales",   # tracks market activity — relevant
+    "KobeissiLetter",   # macro commentary — Larry will have a take
+    "Kalshi",           # Polymarket competitor — prediction market context
+    "saylor",           # Bitcoin maximalist — Larry bets on BTC
+    "cz_binance",       # crypto, massive following
+]
+
+def _find_quote_tweet_candidate() -> dict | None:
+    """
+    Search Twitter for a recent tweet from whitelisted accounts worth Larry commenting on.
+    Returns the best candidate or None if nothing safe/interesting found.
+    NOTE: requires Twitter Basic API ($100/month). Silently returns None on free tier.
+    """
+    try:
+        client = get_twitter_client()
+
+        # Pick a random subset of accounts and search their recent tweets
+        accounts = random.sample(_QUOTE_ACCOUNTS, min(5, len(_QUOTE_ACCOUNTS)))
+        from_query = " OR ".join(f"from:{a}" for a in accounts)
+        query = f"({from_query}) -is:retweet -is:reply lang:en"
+
+        response = client.search_recent_tweets(
+            query=query,
+            max_results=20,
+            tweet_fields=["author_id", "text", "public_metrics"],
+            expansions=["author_id"],
+            user_fields=["username", "public_metrics"],
+        )
+        if not response.data:
+            return None
+
+        users = {}
+        if response.includes and "users" in response.includes:
+            for u in response.includes["users"]:
+                followers = (u.public_metrics or {}).get("followers_count", 0)
+                users[u.id] = {"username": u.username, "followers": followers}
+
+        candidates = []
+        for tweet in response.data:
+            text = tweet.text
+            if not _is_safe_to_engage(text):
+                continue
+            user = users.get(tweet.author_id, {})
+            metrics = tweet.public_metrics or {}
+            # Whitelisted accounts — no follower minimum needed, we already trust them
+            score = (
+                metrics.get("like_count", 0) * 2 +
+                metrics.get("retweet_count", 0) * 3 +
+                min(user.get("followers", 0), 500000) / 50000
+            )
+            candidates.append({
+                "tweet_id": str(tweet.id),
+                "text": text,
+                "username": user.get("username", ""),
+                "score": score,
+            })
+
+        if not candidates:
+            return None
+        return max(candidates, key=lambda x: x["score"])
+
+    except Exception as e:
+        log.debug(f"Quote tweet search unavailable: {type(e).__name__}")
+        return None
+
+
+def maybe_quote_tweet():
+    """
+    Larry quote-tweets whitelisted accounts with his take.
+    Throttled: min 3 hours between quote tweets. 50% chance per check when eligible.
+    Gives ~3-5 quote tweets per day — active but not spammy.
+    """
+    now = datetime.utcnow()
+    if now.hour < 8 or now.hour >= 23:
+        return  # only active hours
+
+    # Throttle: min 3 hours between quote tweets
+    last_qt = get_state("last_quote_tweet_time")
+    if last_qt:
+        try:
+            last_dt = datetime.fromisoformat(last_qt)
+            if (now - last_dt).total_seconds() < 3 * 3600:
+                return
+        except Exception:
+            pass
+
+    if random.random() > 0.50:
+        return  # 50% chance when eligible — natural variation
+
+    candidate = _find_quote_tweet_candidate()
+    if not candidate:
+        return
+
+    try:
+        from larry_brain import ask_larry_for_tweet
+        tweet_data = ask_larry_for_tweet(
+            "QUOTE_TWEET",
+            extra_data={
+                "original_tweet": candidate["text"][:200],
+                "username": candidate["username"],
+            }
+        )
+        comment = tweet_data.get("tweet", "")
+        if not comment:
+            return
+
+        client = get_twitter_client()
+        response = client.create_tweet(
+            text=comment,
+            quote_tweet_id=candidate["tweet_id"]
+        )
+        qt_id = str(response.data["id"])
+        save_tweet(tweet_id=qt_id, content=comment, tweet_type="QUOTE_TWEET")
+        log.info(f"✅ Quote-tweeted @{candidate['username']}: {comment[:60]}...")
+        set_state("last_quote_tweet_time", now.isoformat())
+
+        # Like the original too
+        like_tweet(candidate["tweet_id"])
+
+    except Exception as e:
+        log.error(f"Quote tweet failed: {type(e).__name__}: {e}")
+
+
+# ─── RETWEETS ─────────────────────────────────────────────────────────────────
+
+def maybe_retweet():
+    """
+    Larry retweets something from a whitelisted account.
+    No text needed — pure retweet. ~2-3 per day.
+    Throttled: min 6 hours between retweets. 50% chance when eligible.
+    """
+    now = datetime.utcnow()
+    if now.hour < 8 or now.hour >= 23:
+        return
+
+    last_rt = get_state("last_retweet_time")
+    if last_rt:
+        try:
+            if (now - datetime.fromisoformat(last_rt)).total_seconds() < 6 * 3600:
+                return
+        except Exception:
+            pass
+
+    if random.random() > 0.50:
+        return
+
+    candidate = _find_quote_tweet_candidate()
+    if not candidate:
+        return
+
+    try:
+        client = get_twitter_client()
+        larry_id = _get_larry_id(client)
+        client.retweet(larry_id, candidate["tweet_id"])
+        save_tweet(tweet_id=candidate["tweet_id"], content=f"RT @{candidate['username']}: {candidate['text'][:100]}", tweet_type="RETWEET")
+        log.info(f"🔁 Retweeted @{candidate['username']}: {candidate['text'][:60]}...")
+        set_state("last_retweet_time", now.isoformat())
+    except Exception as e:
+        log.debug(f"Retweet failed: {type(e).__name__}: {e}")
+
+
+# ─── REPLIES TO WHITELIST ──────────────────────────────────────────────────────
+
+def maybe_reply_to_whitelist():
+    """
+    Larry drops a comment under a tweet from a whitelisted account.
+    Different from quote tweet — appears as a reply thread under their post.
+    ~2 per day. Throttled: min 8 hours. 40% chance when eligible.
+    """
+    now = datetime.utcnow()
+    if now.hour < 9 or now.hour >= 22:
+        return
+
+    last_wr = get_state("last_whitelist_reply_time")
+    if last_wr:
+        try:
+            if (now - datetime.fromisoformat(last_wr)).total_seconds() < 8 * 3600:
+                return
+        except Exception:
+            pass
+
+    if random.random() > 0.40:
+        return
+
+    candidate = _find_quote_tweet_candidate()
+    if not candidate:
+        return
+
+    try:
+        from larry_brain import ask_larry_for_tweet
+        tweet_data = ask_larry_for_tweet(
+            "WHITELIST_REPLY",
+            extra_data={
+                "original_tweet": candidate["text"][:200],
+                "username": candidate["username"],
+            }
+        )
+        reply_text = tweet_data.get("tweet", "")
+        if not reply_text:
+            return
+
+        client = get_twitter_client()
+        response = client.create_tweet(
+            text=reply_text,
+            in_reply_to_tweet_id=candidate["tweet_id"]
+        )
+        reply_id = str(response.data["id"])
+        save_tweet(tweet_id=reply_id, content=reply_text, tweet_type="WHITELIST_REPLY")
+        log.info(f"💬 Replied to @{candidate['username']}: {reply_text[:60]}...")
+        set_state("last_whitelist_reply_time", now.isoformat())
+        like_tweet(candidate["tweet_id"])
+    except Exception as e:
+        log.debug(f"Whitelist reply failed: {type(e).__name__}: {e}")
+
+
+# ─── PRICE MOVE REACTIONS ─────────────────────────────────────────────────────
+
+def maybe_react_to_price_moves():
+    """
+    If a market where Larry has an open bet moved >5% since he bet,
+    he tweets about it — panic, smugness, or confusion depending on direction.
+    Max once per 6 hours.
+    """
+    last_react = get_state("last_price_react_time")
+    if last_react:
+        try:
+            if (datetime.utcnow() - datetime.fromisoformat(last_react)).total_seconds() < 6 * 3600:
+                return
+        except Exception:
+            pass
+
+    try:
+        from database import get_pending_bets, get_connection
+        from larry_brain import ask_larry_for_tweet
+        import requests as req
+        from config import POLYMARKET_GAMMA_API
+
+        pending = get_pending_bets()
+        if not pending:
+            return
+
+        # Check one random open bet for price movement
+        bet = random.choice(pending)
+        market_id = bet.get("polymarket_id", "")
+        if not market_id:
+            return
+
+        resp = req.get(f"{POLYMARKET_GAMMA_API}/markets/{market_id}", timeout=5)
+        if resp.status_code != 200:
+            return
+        market = resp.json()
+
+        current_price = float(market.get("bestAsk") or market.get("lastTradePrice") or 0.5)
+        original_odds = float(bet.get("odds", current_price))
+        outcome = bet.get("outcome", "YES")
+
+        # For NO bets, we care about YES price going down (good for us)
+        if outcome == "NO":
+            move = original_odds - current_price  # positive = price fell = good for NO
+        else:
+            move = current_price - original_odds  # positive = price rose = good for YES
+
+        if abs(move) < 0.05:
+            return  # less than 5% move — not interesting
+
+        direction = "winning" if move > 0 else "losing"
+        tweet_data = ask_larry_for_tweet(
+            "PRICE_MOVE",
+            extra_data={
+                "question": bet.get("question", "")[:80],
+                "outcome": outcome,
+                "move_pct": round(abs(move) * 100),
+                "direction": direction,
+                "original_price": round(original_odds, 2),
+                "current_price": round(current_price, 2),
+            }
+        )
+        comment = tweet_data.get("tweet", "")
+        if comment:
+            post_tweet(comment, tweet_type="PRICE_MOVE")
+            set_state("last_price_react_time", datetime.utcnow().isoformat())
+
+    except Exception as e:
+        log.debug(f"Price move react failed: {type(e).__name__}")
+
+
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 
 def run_twitter_agent():
@@ -407,10 +745,22 @@ def run_twitter_agent():
             # 4. Check mentions and maybe reply (1 reply per 4 own tweets)
             check_and_reply_to_mentions()
 
-            # 5. Weekly recap (Sundays)
+            # 5. Quote tweet something relevant
+            maybe_quote_tweet()
+
+            # 6. Retweet something from whitelist
+            maybe_retweet()
+
+            # 7. Reply under a whitelist account's tweet
+            maybe_reply_to_whitelist()
+
+            # 8. React to price moves on open bets (throttled, only big moves)
+            maybe_react_to_price_moves()
+
+            # 9. Weekly recap (Sundays)
             maybe_tweet_weekly_recap()
 
-            # 6. Milestone tweets
+            # 10. Milestone tweets
             check_milestones()
 
         except KeyboardInterrupt:
