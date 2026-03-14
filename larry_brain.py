@@ -428,7 +428,7 @@ def ask_larry_for_tweet(context_type: str, extra_data: dict = None, model: str =
     open_bets_text = ""
     if ctx.get("open_bets"):
         bets_list = ", ".join(
-            f"{b['side']} on \"{b['q']}\" at {round(b['odds']*100)}¢"
+            f"{b['side']} on \"{b['q']}\" at {round((b['odds'] or 0)*100)}¢"
             for b in ctx["open_bets"]
         )
         open_bets_text = f" Open bets: {bets_list}."
