@@ -10,23 +10,26 @@ Runs on a loop every 15 minutes:
 
 import time
 import json
+import signal
 import random
 import logging
 import threading
+import requests
 import tweepy
 from datetime import datetime, timedelta
-
 from config import (
     TWITTER_API_KEY, TWITTER_API_SECRET,
     TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET,
     TWITTER_BEARER_TOKEN,
     MIN_TWEETS_PER_DAY, MAX_TWEETS_PER_DAY,
     MIN_MINUTES_BETWEEN_TWEETS, DEAD_MAN_SWITCH_HOURS,
-    LARRY_TWITTER_HANDLE
+    LARRY_TWITTER_HANDLE, POLYMARKET_GAMMA_API,
+    CLAUDE_MODEL,
 )
 from database import (
     save_tweet, get_last_tweet_time, get_today_tweet_count,
-    get_bankroll, get_state, set_state, init_db
+    get_bankroll, get_state, set_state, init_db, get_connection,
+    get_pending_bets,
 )
 from larry_brain import ask_larry_for_tweet, ask_larry_to_reply
 
@@ -69,21 +72,27 @@ def _is_safe_to_engage(text: str) -> bool:
     if text.lower().count("http") > 2: return False  # link spam
     return True
 
-# FIX: cache larry's user ID so we don't call get_me() every 15 minutes
+# Cached Larry's user ID — avoid get_me() every 15 minutes
 _larry_user_id = None
 
-
-# ─── TWITTER CLIENT ───────────────────────────────────────────────────────────
+# ─── TWITTER CLIENT SINGLETON ─────────────────────────────────────────────────
+# Creating a new tweepy.Client per call = new HTTP session + SSL handshake every time.
+# With 8-10 Twitter actions per cycle, that's 8-10 unnecessary handshakes.
+# Singleton is safe — tweepy.Client is stateless (no persistent connection to close).
+_twitter_client: tweepy.Client | None = None
 
 def get_twitter_client() -> tweepy.Client:
-    return tweepy.Client(
-        bearer_token=TWITTER_BEARER_TOKEN,
-        consumer_key=TWITTER_API_KEY,
-        consumer_secret=TWITTER_API_SECRET,
-        access_token=TWITTER_ACCESS_TOKEN,
-        access_token_secret=TWITTER_ACCESS_SECRET,
-        wait_on_rate_limit=True,
-    )
+    global _twitter_client
+    if _twitter_client is None:
+        _twitter_client = tweepy.Client(
+            bearer_token=TWITTER_BEARER_TOKEN,
+            consumer_key=TWITTER_API_KEY,
+            consumer_secret=TWITTER_API_SECRET,
+            access_token=TWITTER_ACCESS_TOKEN,
+            access_token_secret=TWITTER_ACCESS_SECRET,
+            wait_on_rate_limit=True,
+        )
+    return _twitter_client
 
 
 # ─── POST TWEET ───────────────────────────────────────────────────────────────
@@ -117,37 +126,34 @@ def post_tweet(text: str, tweet_type: str = "RANDOM", bet_id: int = None,
 
 # ─── MENTIONS & REPLIES ──────────────────────────────────────────────────────
 
-def get_today_reply_count() -> int:
-    """Count how many replies Larry sent today."""
-    from database import get_connection
+def get_today_tweet_stats() -> dict:
+    """Single DB query for all today's tweet counts — was 3 separate connections before."""
     conn = get_connection()
-    row = conn.execute("""
-        SELECT COUNT(*) as cnt FROM tweets
-        WHERE tweet_type = 'REPLY' AND DATE(posted_at) = DATE('now')
-    """).fetchone()
-    conn.close()
-    return row["cnt"] if row else 0
-
+    try:
+        row = conn.execute("""
+            SELECT
+                SUM(CASE WHEN tweet_type != 'REPLY' THEN 1 ELSE 0 END) as own_count,
+                SUM(CASE WHEN tweet_type  = 'REPLY' THEN 1 ELSE 0 END) as reply_count
+            FROM tweets
+            WHERE DATE(posted_at) = DATE('now')
+        """).fetchone()
+    finally:
+        conn.close()
+    return {
+        "own":     (row["own_count"]   or 0) if row else 0,
+        "replies": (row["reply_count"] or 0) if row else 0,
+    }
 
 def get_today_own_tweet_count() -> int:
-    """Count own tweets today (not replies)."""
-    from database import get_connection
-    conn = get_connection()
-    row = conn.execute("""
-        SELECT COUNT(*) as cnt FROM tweets
-        WHERE tweet_type != 'REPLY' AND DATE(posted_at) = DATE('now')
-    """).fetchone()
-    conn.close()
-    return row["cnt"] if row else 0
+    return get_today_tweet_stats()["own"]
 
+def get_today_reply_count() -> int:
+    return get_today_tweet_stats()["replies"]
 
 def should_reply_now() -> bool:
-    """
-    Reply only if: own_tweets_today / REPLY_RATIO > replies_today
-    i.e. 1 reply per 4 own tweets.
-    """
-    own = get_today_own_tweet_count()
-    replies = get_today_reply_count()
+    """Reply only if: own_tweets_today / REPLY_RATIO > replies_today (1 reply per 4 own tweets)."""
+    stats = get_today_tweet_stats()
+    own, replies = stats["own"], stats["replies"]
     allowed = own // REPLY_RATIO
     if replies < allowed:
         log.info(f"Reply allowed: {own} own tweets → {allowed} replies allowed, {replies} sent")
@@ -249,34 +255,35 @@ def check_and_reply_to_mentions():
     if not mentions:
         return
 
-    # Save latest mention ID
+    # FIX: don't advance last_mention_id until reply succeeds.
+    # Old: set_state first → if reply fails, mention is lost forever.
+    # New: save ID only after successful post.
     latest_id = max(m["tweet_id"] for m in mentions)
-    set_state("last_mention_id", latest_id)
 
-    # Pick the best one
     best = pick_best_mention(mentions)
     if not best:
+        set_state("last_mention_id", latest_id)  # still advance past uninteresting mentions
         return
 
     log.info(f"Replying to @{best['username']}: {best['text'][:60]}...")
 
-    # Ask Claude to generate Larry's reply
     try:
         reply_data = ask_larry_to_reply(best)
         reply_text = reply_data.get("reply", "")
 
         if reply_text:
-            # Prepend @username
             full_reply = f"@{best['username']} {reply_text}"
             if len(full_reply) > 280:
                 full_reply = full_reply[:277] + "..."
 
             post_tweet(full_reply, tweet_type="REPLY", reply_to_id=best["tweet_id"])
+            set_state("last_mention_id", latest_id)  # ← only advance AFTER success
             log.info(f"✅ Replied to @{best['username']}")
-            like_tweet(best["tweet_id"])  # like the mention we're replying to
+            like_tweet(best["tweet_id"])
 
     except Exception as e:
         log.error(f"Failed to generate/post reply: {e}")
+        # Don't advance last_mention_id — will retry this mention next cycle
 
 
 # ─── TIMING LOGIC ────────────────────────────────────────────────────────────
@@ -430,6 +437,22 @@ def like_tweet(tweet_id: str):
 # Tweet IDs where quote tweet returned 403 — session-level, avoids retrying same tweet twice
 _quote_blocked_ids: set = set()
 
+# Cycle-level candidate cache — _find_quote_tweet_candidate() is called by 3 functions per cycle.
+# Without caching: 3 Twitter search API calls per 15-min cycle = wasteful.
+# With caching: 1 search call, result shared across maybe_quote_tweet / maybe_retweet / maybe_reply_to_whitelist.
+# Cache expires after 14 minutes so next cycle gets a fresh candidate.
+_candidate_cache: dict = {"candidate": None, "expires_at": datetime.min}
+
+def _get_cycle_candidate() -> dict | None:
+    """Return cached candidate or fetch a fresh one. Shared across all engagement functions."""
+    global _candidate_cache
+    now = datetime.utcnow()
+    if now < _candidate_cache["expires_at"]:
+        return _candidate_cache["candidate"]
+    candidate = _get_cycle_candidate()
+    _candidate_cache = {"candidate": candidate, "expires_at": now + timedelta(minutes=14)}
+    return candidate
+
 # ACCOUNT-LEVEL blacklist: maps username → UTC datetime until which we skip them for quote tweets
 # Problem: Trump/Elon restrict quote tweets from accounts they haven't mentioned.
 # Tweet-level blacklist doesn't help — next cycle finds a new tweet from the same account.
@@ -564,12 +587,11 @@ def maybe_quote_tweet():
     if random.random() > 0.50:
         return  # 50% chance when eligible — natural variation
 
-    candidate = _find_quote_tweet_candidate()
+    candidate = _get_cycle_candidate()
     if not candidate:
         return
 
     try:
-        from larry_brain import ask_larry_for_tweet
         tweet_data = ask_larry_for_tweet(
             "QUOTE_TWEET",
             extra_data={
@@ -636,7 +658,7 @@ def maybe_retweet():
     if random.random() > 0.50:
         return
 
-    candidate = _find_quote_tweet_candidate()
+    candidate = _get_cycle_candidate()
     if not candidate:
         return
 
@@ -674,12 +696,11 @@ def maybe_reply_to_whitelist():
     if random.random() > 0.40:
         return
 
-    candidate = _find_quote_tweet_candidate()
+    candidate = _get_cycle_candidate()
     if not candidate:
         return
 
     try:
-        from larry_brain import ask_larry_for_tweet
         tweet_data = ask_larry_for_tweet(
             "WHITELIST_REPLY",
             extra_data={
@@ -722,11 +743,6 @@ def maybe_react_to_price_moves():
             pass
 
     try:
-        from database import get_pending_bets, get_connection
-        from larry_brain import ask_larry_for_tweet
-        import requests as req
-        from config import POLYMARKET_GAMMA_API
-
         pending = get_pending_bets()
         if not pending:
             return
@@ -737,7 +753,7 @@ def maybe_react_to_price_moves():
         if not market_id:
             return
 
-        resp = req.get(f"{POLYMARKET_GAMMA_API}/markets/{market_id}", timeout=5)
+        resp = requests.get(f"{POLYMARKET_GAMMA_API}/markets/{market_id}", timeout=5)
         if resp.status_code != 200:
             return
         market = resp.json()
@@ -786,7 +802,36 @@ def maybe_react_to_price_moves():
 _VIP_STREAM_ACCOUNTS = ["elonmusk", "realDonaldTrump", "polymarket"]
 
 # Per-account cooldown: max 1 reply per 2 hours to avoid spamming one thread
+# Persisted in DB so Railway redeploys don't reset it (was replying immediately after restart)
 _VIP_REPLIED_UNTIL: dict = {}
+
+def _load_vip_cooldowns():
+    """Load persisted VIP reply cooldowns from DB on startup."""
+    global _VIP_REPLIED_UNTIL
+    raw = get_state("vip_replied_until")
+    if not raw:
+        return
+    try:
+        data = json.loads(raw)
+        now = datetime.utcnow()
+        _VIP_REPLIED_UNTIL = {
+            k: datetime.fromisoformat(v)
+            for k, v in data.items()
+            if datetime.fromisoformat(v) > now  # only load unexpired entries
+        }
+        if _VIP_REPLIED_UNTIL:
+            log.info(f"⚡ Loaded VIP cooldowns: {list(_VIP_REPLIED_UNTIL.keys())}")
+    except Exception:
+        _VIP_REPLIED_UNTIL = {}
+
+def _save_vip_cooldowns():
+    """Persist VIP cooldowns to DB."""
+    try:
+        set_state("vip_replied_until", json.dumps(
+            {k: v.isoformat() for k, v in _VIP_REPLIED_UNTIL.items()}
+        ))
+    except Exception:
+        pass
 
 
 class LarryStreamClient(tweepy.StreamingClient):
@@ -819,8 +864,6 @@ class LarryStreamClient(tweepy.StreamingClient):
 
             log.info(f"⚡ VIP stream: new tweet from @{username} — replying...")
 
-            from larry_brain import ask_larry_for_tweet
-            from config import CLAUDE_MODEL
             # VIP tweets (Elon/Trump/Polymarket) get Sonnet — high visibility, worth the cost
             # A viral reply under Elon's tweet can get 10k impressions. $0.01 well spent.
             tweet_data = ask_larry_for_tweet(
@@ -842,6 +885,7 @@ class LarryStreamClient(tweepy.StreamingClient):
             log.info(f"⚡ VIP reply to @{username}: {reply_text[:80]}...")
 
             _VIP_REPLIED_UNTIL[username] = now + timedelta(hours=2)
+            _save_vip_cooldowns()  # persist so restarts don't reset cooldown
             like_tweet(str(tweet.id))
 
         except Exception as e:
@@ -893,9 +937,11 @@ def run_vip_stream():
             stream = LarryStreamClient(bearer_token=TWITTER_BEARER_TOKEN)
             _setup_stream_rules(stream)
 
-            # tweet_fields includes matching_rules so we know which account triggered
+            # FIX: "matching_rules" MUST be in tweet_fields.
+            # on_tweet reads tweet.matching_rules[0].tag to identify which VIP account tweeted.
+            # Without it, matching_rules is None → username = None → every VIP tweet silently dropped.
             stream.filter(
-                tweet_fields=["id", "text", "author_id"],
+                tweet_fields=["id", "text", "author_id", "matching_rules"],
                 expansions=["author_id"],
                 threaded=False,  # blocking — runs in this thread
             )
@@ -917,18 +963,31 @@ def run_vip_stream():
 
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 
+_twitter_shutdown = False
+
+def _handle_sigterm(signum, frame):
+    """Graceful Railway shutdown — finish current cycle, then exit cleanly."""
+    global _twitter_shutdown
+    log.info("🛑 SIGTERM received — will exit after current cycle")
+    _twitter_shutdown = True
+
+
 def run_twitter_agent():
     log.info(f"🐦 Larry's Twitter Agent starting up as {LARRY_TWITTER_HANDLE}...")
     init_db()
 
-    # Load persisted account-level quote tweet blacklist from previous session
+    # Load persisted state from previous session
     _init_quote_blacklist()
+    _load_vip_cooldowns()
+
+    # Register Railway SIGTERM so container shuts down cleanly (not mid-tweet)
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     # Start VIP stream in background — real-time push from Twitter, no polling
     vip_thread = threading.Thread(target=run_vip_stream, daemon=True)
     vip_thread.start()
 
-    while True:
+    while not _twitter_shutdown:
         try:
             # 1. Dead man's switch
             if check_dead_man_switch():
@@ -973,8 +1032,13 @@ def run_twitter_agent():
         except Exception as e:
             log.error(f"Error in twitter loop: {type(e).__name__}: {e}")
 
+        if _twitter_shutdown:
+            break
+
         log.info("💤 Twitter agent sleeping 15 minutes...")
         time.sleep(15 * 60)
+
+    log.info("✅ Twitter agent exited cleanly")
 
 
 if __name__ == "__main__":

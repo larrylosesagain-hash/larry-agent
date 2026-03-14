@@ -10,8 +10,11 @@ Runs on a loop every 30 minutes:
 
 import time
 import json
+import signal
+import random
 import logging
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from web3 import Web3
 from py_clob_client.client import ClobClient
@@ -46,7 +49,7 @@ from config import (
 )
 from database import (
     get_bankroll, set_bankroll, get_pending_bets, save_bet, resolve_bet,
-    get_grandma_balance, update_grandma, init_db
+    get_grandma_balance, update_grandma, init_db, get_state, set_state
 )
 from larry_brain import ask_larry_to_bet, ask_larry_for_tweet
 
@@ -57,9 +60,41 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Session-level blacklist: market IDs where token lookup failed — skip forever this session
-# Avoids Claude wasting tokens + CLOB API calls on markets that consistently have no tradeable tokens
-_token_not_found_blacklist: set = set()
+# Token-not-found blacklist: maps condition_id → expiry datetime (6h TTL)
+# Markets with no tradeable tokens are skipped until TTL expires — avoids wasting
+# Claude tokens on them, but allows retry in case tokens are added later.
+_token_not_found_blacklist: dict = {}
+_TOKEN_BLACKLIST_TTL_HOURS = 6
+
+def _blacklist_token(condition_id: str):
+    _token_not_found_blacklist[condition_id] = datetime.utcnow() + timedelta(hours=_TOKEN_BLACKLIST_TTL_HOURS)
+
+def _is_token_blacklisted(condition_id: str) -> bool:
+    expiry = _token_not_found_blacklist.get(condition_id)
+    if expiry is None:
+        return False
+    if datetime.utcnow() > expiry:
+        del _token_not_found_blacklist[condition_id]  # expired — remove and allow retry
+        return False
+    return True
+
+# Rotating page counter — persisted in DB so restarts continue where they left off
+# (otherwise Larry always restarts at page 0 and misses pages 1-9)
+_scan_page: int = 0
+
+def _load_scan_page():
+    global _scan_page
+    try:
+        val = get_state("scan_page")
+        _scan_page = int(val) if val else 0
+    except Exception:
+        _scan_page = 0
+
+def _save_scan_page():
+    try:
+        set_state("scan_page", str(_scan_page))
+    except Exception:
+        pass
 
 # Import twitter agent's post function (shared module)
 from twitter_agent import post_tweet
@@ -171,89 +206,140 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
 
 # ─── FETCH MARKETS ────────────────────────────────────────────────────────────
 
-def fetch_active_markets(limit=20) -> list:
-    """Get active markets from Polymarket Gamma API, filtered for Larry."""
+def _fetch_gamma_raw(order: str, ascending: bool, limit: int, offset: int = 0,
+                     end_min: str = None, end_max: str = None) -> list:
+    """
+    Single Gamma API call — returns raw market list or [] on failure.
+    end_min / end_max: ISO8601 strings for server-side date filtering.
+    Using these means ALL returned markets are already within the window —
+    no wasted quota on far-future markets.
+    """
     try:
-        resp = requests.get(
-            f"{POLYMARKET_GAMMA_API}/markets",
-            params={
-                "active": "true",
-                "closed": "false",
-                "limit": limit,
-                "order": "volume24hr",
-                "ascending": "false",
-            },
-            timeout=10
-        )
+        params = {
+            "active": "true",
+            "closed": "false",
+            "limit": limit,
+            "order": order,
+            "ascending": "true" if ascending else "false",
+        }
+        if offset > 0:
+            params["offset"] = offset
+        if end_min:
+            params["endDateMin"] = end_min
+        if end_max:
+            params["endDateMax"] = end_max
+        resp = requests.get(f"{POLYMARKET_GAMMA_API}/markets", params=params, timeout=10)
         resp.raise_for_status()
-        markets = resp.json()
+        return resp.json()
+    except Exception as e:
+        log.warning(f"Gamma fetch failed ({order}, asc={ascending}, offset={offset}): {e}")
+        return []
 
-        now = datetime.utcnow()
-        cutoff = now + timedelta(days=21)  # 21 days — catches Oscars, big sports events, etc.
-        filtered = []
 
-        for m in markets:
+def fetch_active_markets() -> list:
+    """
+    FULL POLYMARKET SCAN — three parallel Gamma queries every cycle:
+
+      1. ANCHOR  — top 200 by 24h volume, offset=0
+                   Always the most liquid same-day markets (sports, crypto dailies)
+
+      2. SCAN    — top 200 by volume, rotating offset (_scan_page × 200)
+                   Walks through ALL of Polymarket over ~15 cycles (7.5 hours).
+                   Cycle 0 = markets 0-200, cycle 1 = 200-400, ... cycle 14 = 2800-3000
+                   Larry sees every corner of the platform daily.
+
+      3. FRESH   — newest 100 by createdAt desc, offset=0
+                   Brand-new markets often have mispriced odds (no one's bet on them yet).
+
+    Window: ONLY markets resolving within 24 hours — same-day resolution only.
+    Claude sees: 12 anchor + 8 scan + 5 fresh = 25 markets per cycle.
+    """
+    global _scan_page
+    now = datetime.utcnow()
+    cutoff = now + timedelta(hours=24)   # TODAY only — must resolve within 24h
+    min_time = now + timedelta(minutes=30)  # skip markets resolving in under 30min (too late to fill)
+
+    scan_offset = _scan_page * 500
+    _scan_page = (_scan_page + 1) % 10   # 10 pages × 500 = 5000 markets per rotation (~5h)
+    _save_scan_page()  # persist so restarts continue from current position
+
+    # Server-side date filters — Gamma only returns markets within 24h window.
+    # This means limit=500 quota is spent entirely on relevant markets, not far-future noise.
+    end_min = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_max = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Three parallel fetches — wall time = slowest single request, not sum of all three
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_anchor = ex.submit(_fetch_gamma_raw, "volume24hr", False, 500, 0,            end_min, end_max)
+        f_scan   = ex.submit(_fetch_gamma_raw, "volume24hr", False, 500, scan_offset,  end_min, end_max)
+        f_fresh  = ex.submit(_fetch_gamma_raw, "createdAt",  False, 200, 0,            end_min, end_max)
+        raw_anchor = f_anchor.result()
+        raw_scan   = f_scan.result()
+        raw_fresh  = f_fresh.result()
+
+    def parse_strict(raw):
+        """Parse with tighter time filter: resolves within 24h AND not in the next 30min."""
+        out = []
+        for m in raw:
             end_date_str = m.get("endDate") or m.get("end_date_iso")
             if not end_date_str:
                 continue
             try:
                 end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
                 end_date_naive = end_date.replace(tzinfo=None)
-
-                # FIX: was `<= cutoff` which passed expired markets too (end_date < now)
-                # Now: only markets that haven't expired yet AND are within 7 days
-                if end_date_naive <= now:
-                    continue  # already expired — skip before wasting Claude tokens
+                if end_date_naive <= min_time:
+                    continue  # already resolved or resolves too soon
                 if end_date_naive > cutoff:
-                    continue  # too far in the future
+                    continue  # further than 24h out
 
-                # Neg-risk = multi-outcome market (Oscars, championships etc)
-                # Gamma API doesn't give per-outcome prices — fetch from CLOB instead
+                delta = end_date_naive - now
+                days_to_end  = delta.days
+                hours_to_end = int(delta.total_seconds() // 3600)  # FIX: .seconds only gives 0-86399s component
+
                 if m.get("negRisk") or m.get("neg_risk"):
                     cond_id = m.get("conditionId") or m.get("condition_id")
                     vol = float(m.get("volume24hr", 0))
                     cat = _guess_category(m.get("question", ""))
                     try:
-                        clob_resp = requests.get(
-                            f"{POLYMARKET_HOST}/markets/{cond_id}", timeout=5
-                        )
+                        clob_resp = requests.get(f"{POLYMARKET_HOST}/markets/{cond_id}", timeout=5)
                         tokens = clob_resp.json().get("tokens", [])
                         for t in tokens:
                             if not isinstance(t, dict):
                                 continue
                             t_name = t.get("outcome", "")
                             t_price = float(t.get("price", 0.5))
-                            # Skip YES/NO tokens (binary markets can appear in neg-risk groups)
                             if not t_name or t_name.lower() in ("yes", "no"):
                                 continue
                             if t_price >= 0.97 or t_price <= 0.03:
                                 continue
-                            filtered.append({
+                            out.append({
                                 "condition_id": cond_id,
                                 "question": m.get("question"),
                                 "end_date": end_date_str,
+                                "days_to_end": days_to_end,
+                                "hours_to_end": hours_to_end,
                                 "yes_price": round(t_price, 4),
-                                "outcome_name": t_name,  # Claude uses this as the outcome field
+                                "outcome_name": t_name,
                                 "neg_risk": True,
                                 "volume_24h": vol,
                                 "category": cat,
                             })
                     except Exception:
-                        pass  # if CLOB fetch fails, skip this neg-risk market silently
-                    continue  # skip normal binary processing below
+                        pass
+                    continue
 
                 best_ask = float(m.get("bestAsk", 0.5))
                 best_bid = float(m.get("bestBid", best_ask - 0.02))
                 last_price = float(m.get("lastTradePrice") or best_ask)
-
-                # skip near-resolved markets (price at floor/ceiling = effectively resolved)
                 if best_ask >= 0.97 or best_ask <= 0.03:
                     continue
 
-                filtered.append({
+                out.append({
                     "condition_id": m.get("conditionId") or m.get("condition_id"),
                     "question": m.get("question"),
                     "end_date": end_date_str,
+                    "days_to_end": days_to_end,
+                    "hours_to_end": hours_to_end,
                     "yes_price": round(best_ask, 4),
                     "spread": round(best_ask - best_bid, 4),
                     "price_vs_last": round(best_ask - last_price, 4),
@@ -262,20 +348,42 @@ def fetch_active_markets(limit=20) -> list:
                 })
             except (ValueError, TypeError):
                 continue
+        return out
 
-        # Sort: entertainment/culture first (less efficient = more opportunities),
-        # then by volume (liquid = easier to fill orders)
-        def sort_key(m):
-            cat_priority = 0 if m["category"] in ("entertainment", "sports", "weird") else 1
-            return (cat_priority, -m["volume_24h"])
-        filtered.sort(key=sort_key)
+    anchor = parse_strict(raw_anchor)
+    scan   = parse_strict(raw_scan)
+    fresh  = parse_strict(raw_fresh)
 
-        log.info(f"Fetched {len(filtered)} live markets (filtered from {len(markets)})")
-        return filtered[:25]  # top 25 after sorting
+    # Deduplicate: scan and fresh shouldn't repeat what anchor already has
+    anchor_ids = {m["condition_id"] for m in anchor}
+    scan  = [m for m in scan  if m["condition_id"] not in anchor_ids]
+    all_ids = anchor_ids | {m["condition_id"] for m in scan}
+    fresh = [m for m in fresh if m["condition_id"] not in all_ids]
 
-    except Exception as e:
-        log.error(f"Failed to fetch markets: {e}")
-        return []
+    # Anchor: sort by hours_to_end (most urgent first), then sports/entertainment, then volume
+    def sort_key(m):
+        h = m.get("hours_to_end", 24)
+        time_tier = 0 if h <= 4 else (1 if h <= 12 else 2)
+        cat_priority = 0 if m["category"] in ("entertainment", "sports", "weird") else 1
+        return (time_tier, cat_priority, -m["volume_24h"])
+    anchor.sort(key=sort_key)
+
+    # Scan + fresh: random shuffle — different obscure markets each cycle
+    random.shuffle(scan)
+    random.shuffle(fresh)
+
+    top_anchor = anchor[:12]
+    top_scan   = scan[:8]
+    top_fresh  = fresh[:5]
+    combined   = top_anchor + top_scan + top_fresh
+    random.shuffle(combined)  # mix so Claude doesn't bias by list position
+
+    log.info(
+        f"🔎 Scan page {_scan_page-1 if _scan_page > 0 else 9}/10 (offset={scan_offset}) | "
+        f"anchor={len(anchor)} scan={len(scan)} fresh={len(fresh)} → "
+        f"sending {len(combined)} to Claude ({len(top_anchor)}+{len(top_scan)}+{len(top_fresh)})"
+    )
+    return combined
 
 
 def _guess_category(question: str) -> str:
@@ -324,7 +432,7 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
 
         if not token_id:
             log.info(f"Skipping {condition_id[:16]}... — no '{outcome}' token found")
-            _token_not_found_blacklist.add(condition_id)
+            _blacklist_token(condition_id)  # 6h TTL — retried after expiry
             return False
 
         # FIX: added side="BUY" — was missing, caused TypeError
@@ -358,72 +466,88 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
 
 # ─── CHECK RESOLVED BETS ──────────────────────────────────────────────────────
 
+def _check_single_bet(bet: dict) -> dict | None:
+    """
+    Check one pending bet against CLOB. Returns resolution dict or None if still open.
+    Runs in a thread — no shared state written here, only reads.
+    """
+    try:
+        resp = requests.get(
+            f"{POLYMARKET_HOST}/markets/{bet['polymarket_id']}",
+            timeout=10
+        )
+        resp.raise_for_status()
+        market = resp.json()
+        if not market.get("closed", False):
+            return None  # still open
+
+        tokens = market.get("tokens", [])
+        for token in tokens:
+            if token.get("outcome", "").upper() == bet["outcome"].upper():
+                price = float(token.get("price", 0))
+                won = price >= 0.99
+                return {"bet": bet, "won": won, "payout": bet["potential_payout"] if won else 0.0}
+    except Exception as e:
+        log.error(f"Error checking bet {bet['polymarket_id']}: {e}")
+    return None
+
+
 def check_pending_bets(client: ClobClient):
-    """Check if any pending bets have resolved."""
+    """
+    Check all pending bets in parallel — N sequential requests → 1 parallel batch.
+    FIX: claim_winnings now runs BEFORE resolve_bet + set_bankroll to prevent
+    bankroll inflation when USDC hasn't actually been claimed yet.
+    """
     pending = get_pending_bets()
     if not pending:
         return
 
     log.info(f"Checking {len(pending)} pending bets...")
 
-    for bet in pending:
-        try:
-            resp = requests.get(
-                f"{POLYMARKET_HOST}/markets/{bet['polymarket_id']}",
-                timeout=10
+    # Parallel CLOB checks — all reads, safe to run concurrently
+    resolved = []
+    with ThreadPoolExecutor(max_workers=min(len(pending), 8)) as ex:
+        futures = {ex.submit(_check_single_bet, bet): bet for bet in pending}
+        for future in as_completed(futures, timeout=30):
+            result = future.result()
+            if result:
+                resolved.append(result)
+
+    for r in resolved:
+        bet = r["bet"]
+        won = r["won"]
+        payout = r["payout"]
+
+        if won:
+            # FIX: CLAIM FIRST — then resolve + update bankroll.
+            # Old order: resolve → update bankroll → claim
+            # Problem: if claim fails, DB says WON and bankroll shows money Larry can't spend.
+            # New order: claim → resolve → update bankroll
+            # If claim fails: still mark WON (it IS won), log prominently for manual claim.
+            claimed = claim_winnings(
+                condition_id=bet["polymarket_id"],
+                outcome=bet["outcome"],
+                payout=payout,
             )
-            resp.raise_for_status()
-            market = resp.json()
+            resolve_bet(bet["polymarket_id"], True, payout)
+            bankroll = get_bankroll()
+            new_balance = bankroll + payout
+            set_bankroll(new_balance, payout, "WIN")
+            if claimed:
+                log.info(f"🎉 WON ${payout:.2f} + auto-claimed! New bankroll: ${new_balance:.2f}")
+            else:
+                log.warning(f"🎉 WON ${payout:.2f} but auto-claim failed — claim manually on polymarket.com. Bankroll: ${new_balance:.2f}")
+        else:
+            resolve_bet(bet["polymarket_id"], False, 0.0)
+            bankroll = get_bankroll()
+            log.info(f"💀 LOST ${bet['amount_usdc']:.2f}. Bankroll: ${bankroll:.2f}")
 
-            # Check if market is resolved
-            if not market.get("closed", False):
-                continue  # still open
-
-            # Find our outcome's result
-            tokens = market.get("tokens", [])
-            for token in tokens:
-                if token.get("outcome", "").upper() == bet["outcome"].upper():
-                    price = float(token.get("price", 0))
-                    won = price >= 0.99  # price goes to 1.0 on win
-
-                    payout = bet["potential_payout"] if won else 0.0
-                    resolve_bet(bet["polymarket_id"], won, payout)
-
-                    # Update bankroll
-                    bankroll = get_bankroll()
-                    if won:
-                        new_balance = bankroll + payout
-                        set_bankroll(new_balance, payout, "WIN")
-                        log.info(f"🎉 WON ${payout:.2f}! New bankroll: ${new_balance:.2f}")
-                        # Auto-claim: call redeemPositions on Polygon CTF contract
-                        claim_winnings(
-                            condition_id=bet["polymarket_id"],
-                            outcome=bet["outcome"],
-                            payout=payout,
-                        )
-                    else:
-                        # Bet amount was already deducted when placing
-                        new_balance = bankroll
-                        log.info(f"💀 LOST ${bet['amount_usdc']:.2f}. Bankroll: ${new_balance:.2f}")
-
-                    # Ask Larry to react and tweet
-                    try:
-                        tweet_data = ask_larry_for_tweet(
-                            "WIN" if won else "LOSS",
-                            extra_data=bet
-                        )
-                        post_tweet(
-                            tweet_data["tweet"],
-                            tweet_type="WIN" if won else "LOSS",
-                            bet_id=bet["id"]
-                        )
-                    except Exception as e:
-                        log.error(f"Failed to post resolution tweet: {e}")
-
-                    break
-
+        # Tweet the result
+        try:
+            tweet_data = ask_larry_for_tweet("WIN" if won else "LOSS", extra_data=bet)
+            post_tweet(tweet_data["tweet"], tweet_type="WIN" if won else "LOSS", bet_id=bet["id"])
         except Exception as e:
-            log.error(f"Error checking bet {bet['polymarket_id']}: {e}")
+            log.error(f"Failed to post resolution tweet: {e}")
 
 
 # ─── GRANDMA WALLET CHECK ────────────────────────────────────────────────────
@@ -457,6 +581,18 @@ def run_betting_agent():
     log.info("🎰 Larry's Betting Agent starting up...")
     init_db()
 
+    # Restore scan page from DB so rotation continues across restarts
+    _load_scan_page()
+    log.info(f"📖 Scan page restored: {_scan_page}/10")
+
+    # SIGTERM handler — Railway sends SIGTERM on container stop.
+    # Without this, Python doesn't raise KeyboardInterrupt on SIGTERM,
+    # so the agent is killed mid-cycle with no cleanup.
+    def _handle_sigterm(signum, frame):
+        log.info("SIGTERM received — shutting down gracefully")
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     client = get_clob_client()
 
     # Sync real CLOB balance at startup so Larry knows his actual bankroll
@@ -482,8 +618,8 @@ def run_betting_agent():
             if open_exposure >= max_exposure:
                 log.info(f"Exposure limit reached: ${open_exposure:.2f} of ${total:.2f} total in play ({open_exposure/total*100:.0f}%), skipping new bets")
             else:
-                # 4. Fetch markets — limit=200 to survive open-bet + token-blacklist filtering
-                markets = fetch_active_markets(limit=200)
+                # 4. Fetch markets — three parallel Gamma batches, 24h window
+                markets = fetch_active_markets()
 
                 if markets:
                     # Filter out markets Larry already has open bets on — no point sending to Claude
@@ -491,7 +627,7 @@ def run_betting_agent():
                     fresh_markets = [
                         m for m in markets
                         if m["condition_id"] not in open_bet_ids
-                        and m["condition_id"] not in _token_not_found_blacklist
+                        and not _is_token_blacklisted(m["condition_id"])
                     ]
                     skipped = len(markets) - len(fresh_markets)
                     if skipped:
