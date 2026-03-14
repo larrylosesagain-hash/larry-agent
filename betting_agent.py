@@ -267,7 +267,7 @@ def fetch_active_markets(limit=20) -> list:
         filtered.sort(key=sort_key)
 
         log.info(f"Fetched {len(filtered)} live markets (filtered from {len(markets)})")
-        return filtered[:15]  # top 15 after sorting
+        return filtered[:25]  # top 25 after sorting
 
     except Exception as e:
         log.error(f"Failed to fetch markets: {e}")
@@ -467,16 +467,27 @@ def run_betting_agent():
             # 2. Check if Grandma needs to intervene
             check_grandma_wallet()
 
-            # 3. Check bankroll exposure — stop placing new bets if 80%+ is already in play
+            # 3. Check bankroll exposure — stop placing new bets if 80%+ of TOTAL is already in play
+            # total = free cash + open bets (bankroll already has placed bets deducted)
             open_bets = get_pending_bets()
             bankroll = get_bankroll()
             open_exposure = sum(float(b.get("amount_usdc", 0)) for b in open_bets)
-            max_exposure = bankroll * 0.80
+            total = bankroll + open_exposure
+            max_exposure = total * 0.80
             if open_exposure >= max_exposure:
-                log.info(f"Exposure limit reached: ${open_exposure:.2f} of ${bankroll:.2f} in play ({open_exposure/bankroll*100:.0f}%), skipping new bets")
+                log.info(f"Exposure limit reached: ${open_exposure:.2f} of ${total:.2f} total in play ({open_exposure/total*100:.0f}%), skipping new bets")
             else:
                 # 4. Fetch markets
                 markets = fetch_active_markets(limit=100)
+
+                if markets:
+                    # Filter out markets Larry already has open bets on — no point sending to Claude
+                    open_bet_ids = {b.get("polymarket_id") for b in get_pending_bets()}
+                    fresh_markets = [m for m in markets if m["condition_id"] not in open_bet_ids]
+                    skipped = len(markets) - len(fresh_markets)
+                    if skipped:
+                        log.info(f"Skipped {skipped} markets with existing open bets — sending {len(fresh_markets)} fresh to Claude")
+                    markets = fresh_markets
 
                 if markets:
                     # 5. Ask Claude / Larry which ones to bet on
@@ -488,9 +499,11 @@ def run_betting_agent():
                             log.info(f"PASS: {decision.get('reasoning', 'no reason given')}")
                             continue
 
-                        current_exposure = sum(float(b.get("amount_usdc", 0)) for b in get_pending_bets())
-                        if current_exposure >= max_exposure:
-                            log.info(f"Reached exposure limit mid-loop (${current_exposure:.2f}), stopping")
+                        pending_now = get_pending_bets()
+                        current_exposure = sum(float(b.get("amount_usdc", 0)) for b in pending_now)
+                        current_total = get_bankroll() + current_exposure
+                        if current_exposure >= current_total * 0.80:
+                            log.info(f"Reached exposure limit mid-loop (${current_exposure:.2f} of ${current_total:.2f}), stopping")
                             break
 
                         # Resolve market_info once — reused for DB save and odds

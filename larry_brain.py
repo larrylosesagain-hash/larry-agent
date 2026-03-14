@@ -418,6 +418,8 @@ def ask_larry_for_tweet(context_type: str, extra_data: dict = None) -> dict:
         "DEAD_MAN_SWITCH": "Larry hasn't posted in 48 hours. Short tweet about coming back. Don't explain too much.",
         "WEEKLY_RECAP":    f"Sunday recap. Stats: {extra_data}. Short, honest, slightly delusional take on the week.",
         "MILESTONE":       f"Larry hit {extra_data.get('milestone', 'a milestone')}. Short tweet, smug but brief.",
+        "QUOTE_TWEET":     f"Larry is quote-tweeting @{extra_data.get('username','someone')} who said: \"{extra_data.get('original_tweet','')}\" — Larry adds his take in 1-2 sentences. Could agree, disagree, mock, or add his angle. Natural, not forced.",
+        "PRICE_MOVE":      f"A market moved {extra_data.get('move_pct',5)}% — Larry's {extra_data.get('outcome','YES')} bet on \"{extra_data.get('question','')}\" is now {extra_data.get('direction','losing')} (was {extra_data.get('original_price',0.5)}, now {extra_data.get('current_price',0.5)}). Short reaction — panic if losing, smug if winning.",
     }
 
     prompt = prompts.get(context_type, prompts["RANDOM"])
