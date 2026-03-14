@@ -373,16 +373,13 @@ def fetch_active_markets() -> list:
     random.shuffle(scan)
     random.shuffle(fresh)
 
-    top_anchor = anchor[:12]
-    top_scan   = scan[:8]
-    top_fresh  = fresh[:5]
-    combined   = top_anchor + top_scan + top_fresh
+    combined = anchor + scan + fresh
     random.shuffle(combined)  # mix so Claude doesn't bias by list position
 
     log.info(
         f"🔎 Scan page {_scan_page-1 if _scan_page > 0 else 9}/10 (offset={scan_offset}) | "
         f"anchor={len(anchor)} scan={len(scan)} fresh={len(fresh)} → "
-        f"sending {len(combined)} to Claude ({len(top_anchor)}+{len(top_scan)}+{len(top_fresh)})"
+        f"sending all {len(combined)} to Claude"
     )
     return combined
 
