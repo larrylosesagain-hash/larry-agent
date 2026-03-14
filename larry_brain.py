@@ -6,13 +6,21 @@ Sends market data → gets back bet decisions + tweet text via Tool Use (guarant
 import json
 import time
 import logging
+import requests
 import anthropic
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import ANTHROPIC_API_KEY, CLAUDE_MODEL
 from config import MIN_BET_PCT, MAX_BET_PCT, ABSOLUTE_MIN_BET, ABSOLUTE_MAX_BET
 from database import get_bankroll, get_win_streak, get_recent_bets, get_grandma_balance, get_connection
 
 log = logging.getLogger(__name__)
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# Edge thresholds by market type:
+# Efficient markets (crypto, politics) — crowd is usually right, need real edge
+MIN_EDGE_EFFICIENT = 0.05
+# Cultural/entertainment/sports — less efficient, mispricing is common
+MIN_EDGE = 0.03
 
 
 # ─── FALLBACK TWEETS (when Claude API is down) ───────────────────────────────
@@ -99,12 +107,11 @@ BETTING_TOOL = {
                         "decision":             {"type": "string", "enum": ["BET", "PASS"]},
                         "market_id":            {"type": "string"},
                         "outcome":              {"type": "string", "enum": ["YES", "NO"]},
-                        "probability_estimate": {"type": "number", "description": "Your true probability estimate (0.0–1.0). Required for BET."},
+                        "probability_estimate": {"type": "number", "description": "Your true probability estimate (0.0-1.0). Required for BET."},
                         "reasoning":            {"type": "string"},
-                        "larry_tweet":          {"type": "string", "description": "Short natural tweet announcing the bet, 1-2 sentences max"},
-                        "confidence_emoji":     {"type": "string"}
+                        "larry_tweet":          {"type": "string", "description": "Short natural tweet announcing the bet, 1-2 sentences max. BET decisions only — skip for PASS."},
                     },
-                    "required": ["decision", "market_id", "outcome", "probability_estimate", "reasoning", "larry_tweet"]
+                    "required": ["decision", "market_id", "outcome", "probability_estimate", "reasoning"]
                 }
             }
         },
@@ -161,6 +168,8 @@ def _kelly_fraction(probability: float, market_price: float) -> float:
 
 def _call_claude_with_tool(max_tokens: int, messages: list, tool: dict) -> dict:
     """Call Claude with a specific tool — guaranteed structured output, no JSON parsing."""
+    # Cache both system prompt and tool definition to save tokens
+    cached_tool = {**tool, "cache_control": {"type": "ephemeral"}}
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -172,7 +181,7 @@ def _call_claude_with_tool(max_tokens: int, messages: list, tool: dict) -> dict:
                     "text": LARRY_SYSTEM_PROMPT,
                     "cache_control": {"type": "ephemeral"}
                 }],
-                tools=[tool],
+                tools=[cached_tool],
                 tool_choice={"type": "tool", "name": tool["name"]},
                 messages=messages
             )
@@ -202,43 +211,59 @@ def _call_claude_with_tool(max_tokens: int, messages: list, tool: dict) -> dict:
     raise RuntimeError("Claude API unavailable after retries")
 
 
-# ─── CONTEXT BUILDER ─────────────────────────────────────────────────────────
+# ─── CONTEXT BUILDERS ─────────────────────────────────────────────────────────
+
+def _get_emotional_state(bankroll: float, win_streak: int) -> str:
+    if bankroll < 50:   return "GRANDMA_MODE"
+    if bankroll < 80:   return "SURVIVAL"
+    if bankroll >= 5000: return "PEAK_LARRY"
+    if bankroll >= 500 and win_streak >= 3: return "WINNING_STREAK"
+    return "GRINDING"
+
 
 def _get_larry_context() -> dict:
+    """Full context for betting decisions — includes recent bet history."""
     bankroll = get_bankroll()
     win_streak = get_win_streak()
-    grandma = get_grandma_balance()
-    recent = get_recent_bets(5)
-
-    if bankroll < 50:
-        state = "GRANDMA_MODE"
-    elif bankroll < 80:
-        state = "SURVIVAL"
-    elif bankroll >= 5000:
-        state = "PEAK_LARRY"
-    elif bankroll >= 500 and win_streak >= 3:
-        state = "WINNING_STREAK"
-    else:
-        state = "GRINDING"
+    recent = get_recent_bets(3)  # 3 is enough to avoid repeats; 5 was wasting tokens
 
     min_bet = max(ABSOLUTE_MIN_BET, bankroll * MIN_BET_PCT)
-    max_bet = min(ABSOLUTE_MAX_BET, bankroll * MAX_BET_PCT)
-    max_bet = min(max_bet, bankroll * 0.9)
+    max_bet = min(ABSOLUTE_MAX_BET, bankroll * MAX_BET_PCT, bankroll * 0.9)
+
+    # Slim recent bets: only fields Larry actually needs to avoid duplicate bets
+    slim_recent = [
+        {
+            "q": r.get("question", "")[:60],   # truncated question
+            "outcome": r.get("outcome"),
+            "status": r.get("status"),
+            "amount": r.get("amount_usdc"),
+        }
+        for r in recent
+    ]
 
     return {
         "bankroll_usdc": round(bankroll, 2),
-        "grandma_wallet_usdc": round(grandma, 2),
         "win_streak": win_streak,
-        "emotional_state": state,
-        # Include larry_comment so Larry remembers WHY he bet previously
-        "recent_bets": recent,
+        "emotional_state": _get_emotional_state(bankroll, win_streak),
+        "recent_bets": slim_recent,
         "min_bet_usdc": round(min_bet, 2),
         "max_bet_usdc": round(max_bet, 2),
     }
 
 
+def _get_tweet_context() -> dict:
+    """Lightweight context for tweet/reply generation — no full bet history needed."""
+    bankroll = get_bankroll()
+    win_streak = get_win_streak()
+    return {
+        "bankroll_usdc": round(bankroll, 2),
+        "win_streak": win_streak,
+        "emotional_state": _get_emotional_state(bankroll, win_streak),
+    }
+
+
 def _get_recent_tweet_texts(limit: int = 3) -> list:
-    """Fetch recent tweet texts from DB to avoid repetition."""
+    """Fetch recent tweet texts from DB to avoid repetition. Truncated to save tokens."""
     try:
         conn = get_connection()
         rows = conn.execute(
@@ -246,9 +271,76 @@ def _get_recent_tweet_texts(limit: int = 3) -> list:
             (limit,)
         ).fetchall()
         conn.close()
-        return [{"text": r["content"], "type": r["tweet_type"]} for r in rows]
+        # Truncate to 80 chars — enough to detect repetition, not enough to waste tokens
+        return [{"text": r["content"][:80], "type": r["tweet_type"]} for r in rows]
     except Exception:
         return []
+
+
+# ─── WEB SEARCH FOR MARKET CONTEXT ───────────────────────────────────────────
+
+def _search_news(question: str) -> str:
+    """
+    Quick DuckDuckGo search for current context about a market.
+    No API key needed. Returns brief summary or empty string on failure.
+    """
+    try:
+        resp = requests.get(
+            "https://api.duckduckgo.com/",
+            params={
+                "q": question[:120],
+                "format": "json",
+                "no_html": "1",
+                "skip_disambig": "1",
+            },
+            timeout=4,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        data = resp.json()
+        # Try abstract first (Wikipedia summary), then answer, then related topics
+        text = data.get("AbstractText", "") or data.get("Answer", "")
+        if not text:
+            topics = data.get("RelatedTopics", [])
+            snippets = [t.get("Text", "") for t in topics[:2] if isinstance(t, dict)]
+            text = " | ".join(s for s in snippets if s)
+        return text[:400] if text else ""
+    except Exception:
+        return ""
+
+
+def _enrich_markets_with_news(markets: list) -> list:
+    """
+    Add real-world news context to entertainment/sports/culture markets in parallel.
+    Crypto and politics Claude already knows well — skip those to save time.
+    Falls back silently if search fails for any market.
+    """
+    cultural = {"entertainment", "sports", "weird"}
+    to_search = [(i, m) for i, m in enumerate(markets) if m.get("category") in cultural]
+    if not to_search:
+        return markets
+
+    enriched = [dict(m) for m in markets]  # shallow copy
+    try:
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(_search_news, m["question"]): i
+                for i, m in to_search
+            }
+            for future in as_completed(futures, timeout=8):
+                idx = futures[future]
+                try:
+                    news = future.result()
+                    if news:
+                        enriched[idx]["news"] = news
+                except Exception:
+                    pass
+    except Exception:
+        pass  # if parallel search fails entirely, return markets as-is
+
+    found = sum(1 for m in enriched if "news" in m)
+    if found:
+        log.info(f"🔍 Enriched {found} markets with web search context")
+    return enriched
 
 
 # ─── PUBLIC FUNCTIONS ────────────────────────────────────────────────────────
@@ -257,18 +349,25 @@ def ask_larry_to_bet(markets: list) -> list:
     """Send markets to Claude via Tool Use, get back bet decisions with Kelly sizing."""
     context = _get_larry_context()
 
-    user_message = f"""
-Current Larry Status:
-{json.dumps(context, indent=2)}
+    # Enrich cultural/entertainment markets with current web search context
+    # so Larry can reason about real-world narrative, not just price
+    markets = _enrich_markets_with_news(markets)
 
-Available markets (yes_price = cost to buy YES, closer to 0 = unlikely, closer to 1 = likely):
-{json.dumps(markets, indent=2)}
-
-For each market: decide BET or PASS.
-For BET: give your true probability_estimate — it will be used to calculate optimal bet size via Kelly Criterion.
-Only bet when you have genuine edge (your estimate meaningfully differs from market price).
-Allowed bet range: ${context['min_bet_usdc']} – ${context['max_bet_usdc']}
-"""
+    # Compact JSON (no indent) — saves ~25% tokens with no quality loss
+    user_message = (
+        f"Larry Status: {json.dumps(context, separators=(',',':'))}\n\n"
+        f"Markets (yes_price=cost to buy YES, 'news' = current web context if available):\n"
+        f"{json.dumps(markets, separators=(',',':'))}\n\n"
+        f"Decide BET or PASS. Rules:\n"
+        f"- Edge = |your_prob - market_price|. Min: crypto/politics={MIN_EDGE_EFFICIENT:.0%}, else={MIN_EDGE:.0%}\n"
+        f"- Use 'news' field when available — reason about current narrative and sentiment\n"
+        f"- CONTRARIAN: 97% on anyone = skip that, look for who's underpriced. "
+        f"Is the Academy in a 'comeback' mood? Is there a split vote risk? Is the frontrunner's film out of fashion?\n"
+        f"- YES and NO both valid — sometimes bet NO on an overpriced favorite\n"
+        f"- Entertainment/culture: lean toward betting if you have any read at all\n"
+        f"- Small gut-feel bets fine on interesting markets (min ${context['min_bet_usdc']})\n"
+        f"Bet range: ${context['min_bet_usdc']}–${context['max_bet_usdc']}"
+    )
     try:
         result = _call_claude_with_tool(2000, [{"role": "user", "content": user_message}], BETTING_TOOL)
         decisions = result.get("decisions", [])
@@ -281,26 +380,38 @@ Allowed bet range: ${context['min_bet_usdc']} – ${context['max_bet_usdc']}
         if d.get("decision") == "BET":
             prob = float(d.get("probability_estimate", 0.5))
             outcome = d.get("outcome", "YES")
-
-            # Find market price for Kelly calculation
             market = next((m for m in markets if m.get("condition_id") == d.get("market_id")), None)
+
             if market:
-                market_price = market["yes_price"] if outcome == "YES" else market["no_price"]
+                market_price = market["yes_price"] if outcome == "YES" else round(1 - market["yes_price"], 4)
+
+                # Category-aware edge threshold:
+                # crypto/politics = efficient, need more edge; everything else = less efficient
+                category = market.get("category", "weird")
+                threshold = MIN_EDGE_EFFICIENT if category in ("crypto", "politics") else MIN_EDGE
+
+                # Hard edge check — override Claude if edge is too small
+                edge = abs(prob - market_price)
+                if edge < threshold:
+                    log.info(f"PASS (edge {edge:.1%} < {threshold:.0%} for {category}): {d.get('market_id','')[:16]}...")
+                    d["decision"] = "PASS"
+                    d["reasoning"] = f"Edge {edge:.1%} below {threshold:.0%} threshold for {category} market"
+                    continue
+
                 pct = _kelly_fraction(prob, market_price)
             else:
                 pct = MIN_BET_PCT
 
             amount = bankroll * pct
-            amount = max(ABSOLUTE_MIN_BET, min(amount, ABSOLUTE_MAX_BET))
-            amount = min(amount, bankroll * 0.9)
+            amount = max(ABSOLUTE_MIN_BET, min(amount, ABSOLUTE_MAX_BET, bankroll * 0.9))
             d["amount_usdc"] = round(amount, 2)
 
     return decisions if isinstance(decisions, list) else [decisions]
 
 
 def ask_larry_for_tweet(context_type: str, extra_data: dict = None) -> dict:
-    """Generate a standalone tweet via Tool Use. Includes recent tweets to avoid repetition."""
-    larry_context = _get_larry_context()
+    """Generate a standalone tweet via Tool Use. Uses lightweight context + tweet memory."""
+    ctx = _get_tweet_context()
     extra_data = extra_data or {}
     recent_tweets = _get_recent_tweet_texts(3)
 
@@ -309,23 +420,20 @@ def ask_larry_for_tweet(context_type: str, extra_data: dict = None) -> dict:
         "LOSS":            f"Larry just lost a bet. Details: {extra_data}. Short tweet blaming the market. Move on quickly.",
         "FRIDAY":          "It's Friday, Larry ordered Domino's. Short casual tweet about it, not a performance.",
         "GRANDMA":         f"Grandma sent ${extra_data.get('amount', 200)}. Short tweet, genuine moment, brief.",
-        "RANDOM":          f"Larry tweets a random thought. State: {larry_context['emotional_state']}. Bankroll: ${larry_context['bankroll_usdc']}. Keep it short and natural.",
-        "SURVIVAL":        f"Larry is down bad, bankroll ${larry_context['bankroll_usdc']}. Short terse tweet.",
+        "RANDOM":          f"Larry tweets a random thought. State: {ctx['emotional_state']}. Bankroll: ${ctx['bankroll_usdc']}. Keep it short and natural.",
+        "SURVIVAL":        f"Larry is down bad, bankroll ${ctx['bankroll_usdc']}. Short terse tweet.",
         "DEAD_MAN_SWITCH": "Larry hasn't posted in 48 hours. Short tweet about coming back. Don't explain too much.",
         "WEEKLY_RECAP":    f"Sunday recap. Stats: {extra_data}. Short, honest, slightly delusional take on the week.",
         "MILESTONE":       f"Larry hit {extra_data.get('milestone', 'a milestone')}. Short tweet, smug but brief.",
     }
 
     prompt = prompts.get(context_type, prompts["RANDOM"])
-    user_message = f"""
-Larry status: {json.dumps(larry_context, indent=2)}
-
-Recent tweets (DO NOT repeat these topics or phrases):
-{json.dumps(recent_tweets, indent=2)}
-
-Task: {prompt}
-tweet_type should be: "{context_type}"
-"""
+    user_message = (
+        f"Larry: bankroll ${ctx['bankroll_usdc']}, state={ctx['emotional_state']}, streak={ctx['win_streak']}\n"
+        f"Recent tweets (don't repeat): {json.dumps(recent_tweets, separators=(',',':'))}\n"
+        f"Task: {prompt}\n"
+        f"tweet_type: \"{context_type}\""
+    )
     try:
         result = _call_claude_with_tool(500, [{"role": "user", "content": user_message}], TWEET_TOOL)
     except Exception:
@@ -338,17 +446,16 @@ tweet_type should be: "{context_type}"
 
 def ask_larry_to_reply(mention: dict) -> dict:
     """Generate Larry's reply to a mention via Tool Use."""
-    larry_context = _get_larry_context()
+    bankroll = get_bankroll()
+    win_streak = get_win_streak()
+    state = _get_emotional_state(bankroll, win_streak)
 
-    user_message = f"""
-Larry status: bankroll ${larry_context['bankroll_usdc']}, state: {larry_context['emotional_state']}
-
-Mention from @{mention['username']} ({mention['likes']} likes):
-"{mention['text']}"
-
-Short reply, Larry's voice. NO @username prefix. Max 250 chars.
-Insults → brief dismissal. Questions → bad confident advice. Praise → quick smugness.
-"""
+    user_message = (
+        f"Larry: bankroll ${round(bankroll,2)}, state={state}\n"
+        f"Mention from @{mention['username']} ({mention['likes']} likes): \"{mention['text']}\"\n"
+        f"Short reply, Larry's voice. NO @username prefix. Max 250 chars.\n"
+        f"Insults → brief dismissal. Questions → bad confident advice. Praise → quick smugness."
+    )
     try:
         result = _call_claude_with_tool(300, [{"role": "user", "content": user_message}], REPLY_TOOL)
     except Exception:

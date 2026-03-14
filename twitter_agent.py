@@ -252,7 +252,9 @@ def check_and_reply_to_mentions():
 def should_tweet_now() -> bool:
     """Decide if it's time for a new organic tweet."""
     now = datetime.utcnow()
-    today_count = get_today_tweet_count()
+
+    # FIX: use own-tweet count only — replies shouldn't eat into the daily limit
+    today_count = get_today_own_tweet_count()
     last_tweet = get_last_tweet_time()
 
     if today_count >= MAX_TWEETS_PER_DAY:
@@ -264,7 +266,8 @@ def should_tweet_now() -> bool:
             return False
 
     hour = now.hour
-    if hour < 7 or hour > 23:
+    # FIX: hour > 23 is always False (hours are 0–23); use >= 23 to block late-night tweets
+    if hour < 7 or hour >= 23:
         return False
 
     tweets_remaining = MAX_TWEETS_PER_DAY - today_count
@@ -323,21 +326,23 @@ def maybe_tweet_weekly_recap():
         return  # already done this Sunday
 
     # Build weekly stats from database
+    # FIX: use try/finally to guarantee connection is always closed
     from database import get_connection
     conn = get_connection()
-    week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-
-    row = conn.execute("""
-        SELECT
-            COUNT(*) as total_bets,
-            SUM(CASE WHEN status='WON' THEN 1 ELSE 0 END) as wins,
-            SUM(CASE WHEN status='LOST' THEN 1 ELSE 0 END) as losses,
-            SUM(CASE WHEN status='WON' THEN result_amount ELSE 0 END) as total_won,
-            SUM(CASE WHEN status='LOST' THEN amount_usdc ELSE 0 END) as total_lost
-        FROM bets
-        WHERE DATE(placed_at) >= ?
-    """, (week_ago,)).fetchone()
-    conn.close()
+    try:
+        week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+        row = conn.execute("""
+            SELECT
+                COUNT(*) as total_bets,
+                SUM(CASE WHEN status='WON' THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN status='LOST' THEN 1 ELSE 0 END) as losses,
+                SUM(CASE WHEN status='WON' THEN result_amount ELSE 0 END) as total_won,
+                SUM(CASE WHEN status='LOST' THEN amount_usdc ELSE 0 END) as total_lost
+            FROM bets
+            WHERE DATE(placed_at) >= ?
+        """, (week_ago,)).fetchone()
+    finally:
+        conn.close()
 
     stats = {
         "total_bets": row["total_bets"] or 0,

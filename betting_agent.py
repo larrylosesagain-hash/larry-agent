@@ -13,9 +13,29 @@ import json
 import logging
 import requests
 from datetime import datetime, timedelta
+from web3 import Web3
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.constants import POLYGON
+
+# ─── POLYGON / CTF CONSTANTS ──────────────────────────────────────────────────
+# Gnosis Conditional Token Framework contract on Polygon (same address all chains)
+_CTF_ADDRESS  = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+# USDC.e on Polygon (bridged) — what Polymarket settles in
+_USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+_POLYGON_RPC  = "https://polygon-rpc.com"
+_CTF_ABI = [{
+    "inputs": [
+        {"name": "collateralToken",    "type": "address"},
+        {"name": "parentCollectionId", "type": "bytes32"},
+        {"name": "conditionId",        "type": "bytes32"},
+        {"name": "indexSets",          "type": "uint256[]"},
+    ],
+    "name": "redeemPositions",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function",
+}]
 
 from config import (
     POLYMARKET_PRIVATE_KEY, POLYMARKET_FUNDER,
@@ -60,6 +80,89 @@ def get_clob_client() -> ClobClient:
     return client
 
 
+def sync_bankroll_from_clob(client: ClobClient):
+    """
+    Sync DB bankroll with actual USDC balance from CLOB.
+    Called at startup so Larry knows his real balance, not just what the DB thinks.
+    NOTE: This reflects trading allowance (approved for CLOB), not total wallet balance.
+    Unclaimed winnings may not appear here until claimed on polymarket.com.
+    """
+    try:
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        result = client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.USDC)
+        )
+        # balance is returned as a string of raw units (6 decimals for USDC)
+        raw = result.get("balance", "0")
+        real_balance = float(raw) / 1_000_000  # convert from microUSDC to USDC
+        if real_balance > 0:
+            db_balance = get_bankroll()
+            if abs(real_balance - db_balance) > 1.0:  # only sync if diff > $1
+                log.info(f"💰 Balance sync: DB=${db_balance:.2f} → CLOB=${real_balance:.2f}")
+                set_bankroll(real_balance, real_balance - db_balance, "SYNC")
+            else:
+                log.info(f"💰 Balance OK: DB=${db_balance:.2f}, CLOB=${real_balance:.2f}")
+    except Exception as e:
+        log.warning(f"Balance sync failed ({type(e).__name__}) — using DB balance")
+
+
+# ─── AUTO-CLAIM WINNINGS ──────────────────────────────────────────────────────
+
+def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
+    """
+    Redeem winning CTF positions on-chain via Polygon.
+    Calls redeemPositions() on the Gnosis CTF contract — this is what
+    'claiming' means on Polymarket. Works with the same private key used for trading.
+
+    indexSets encoding (binary CTF):
+      YES position = index set 1  (binary: 01)
+      NO  position = index set 2  (binary: 10)
+    """
+    try:
+        w3 = Web3(Web3.HTTPProvider(_POLYGON_RPC))
+        if not w3.is_connected():
+            log.error("Cannot connect to Polygon RPC for claim")
+            return False
+
+        account = w3.eth.account.from_key(POLYMARKET_PRIVATE_KEY)
+        ctf = w3.eth.contract(address=_CTF_ADDRESS, abi=_CTF_ABI)
+
+        # condition_id may have 0x prefix — strip it for bytes conversion
+        cid_hex = condition_id.replace("0x", "").zfill(64)
+        condition_bytes = bytes.fromhex(cid_hex)
+        parent_collection = b"\x00" * 32  # parentCollectionId = bytes32(0)
+
+        index_sets = [1] if outcome.upper() == "YES" else [2]
+
+        tx = ctf.functions.redeemPositions(
+            _USDC_ADDRESS,
+            parent_collection,
+            condition_bytes,
+            index_sets,
+        ).build_transaction({
+            "from":     account.address,
+            "nonce":    w3.eth.get_transaction_count(account.address),
+            "gas":      250_000,
+            "gasPrice": w3.eth.gas_price,
+            "chainId":  137,  # Polygon mainnet
+        })
+
+        signed   = w3.eth.account.sign_transaction(tx, POLYMARKET_PRIVATE_KEY)
+        tx_hash  = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt  = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+        if receipt.status == 1:
+            log.info(f"✅ Auto-claimed ${payout:.2f}! TX: {tx_hash.hex()}")
+            return True
+        else:
+            log.error(f"❌ Claim tx reverted. TX: {tx_hash.hex()} — claim manually on polymarket.com")
+            return False
+
+    except Exception as e:
+        log.warning(f"Auto-claim failed ({type(e).__name__}: {e}) — claim manually on polymarket.com")
+        return False
+
+
 # ─── FETCH MARKETS ────────────────────────────────────────────────────────────
 
 def fetch_active_markets(limit=20) -> list:
@@ -79,35 +182,57 @@ def fetch_active_markets(limit=20) -> list:
         resp.raise_for_status()
         markets = resp.json()
 
-        # Filter: only markets resolving within 7 days (Larry loves short-term)
+        now = datetime.utcnow()
+        cutoff = now + timedelta(days=21)  # 21 days — catches Oscars, big sports events, etc.
         filtered = []
-        cutoff = datetime.utcnow() + timedelta(days=7)
+
         for m in markets:
             end_date_str = m.get("endDate") or m.get("end_date_iso")
             if not end_date_str:
                 continue
             try:
                 end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-                if end_date.replace(tzinfo=None) <= cutoff:
-                    best_ask = float(m.get("bestAsk", 0.5))
-                    best_bid = float(m.get("bestBid", best_ask - 0.02))
-                    last_price = float(m.get("lastTradePrice") or best_ask)
-                    filtered.append({
-                        "condition_id": m.get("conditionId") or m.get("condition_id"),
-                        "question": m.get("question"),
-                        "end_date": end_date_str,
-                        "yes_price": round(best_ask, 4),
-                        "no_price": round(1 - best_ask, 4),
-                        "spread": round(best_ask - best_bid, 4),      # narrow = liquid market
-                        "price_vs_last": round(best_ask - last_price, 4),  # positive = rising
-                        "volume_24h": float(m.get("volume24hr", 0)),
-                        "category": _guess_category(m.get("question", "")),
-                    })
+                end_date_naive = end_date.replace(tzinfo=None)
+
+                # FIX: was `<= cutoff` which passed expired markets too (end_date < now)
+                # Now: only markets that haven't expired yet AND are within 7 days
+                if end_date_naive <= now:
+                    continue  # already expired — skip before wasting Claude tokens
+                if end_date_naive > cutoff:
+                    continue  # too far in the future
+
+                best_ask = float(m.get("bestAsk", 0.5))
+                best_bid = float(m.get("bestBid", best_ask - 0.02))
+                last_price = float(m.get("lastTradePrice") or best_ask)
+
+                # FIX: skip near-resolved markets (price at floor/ceiling = effectively resolved)
+                # These were flooding Claude with obvious PASSes every cycle, wasting tokens
+                if best_ask >= 0.97 or best_ask <= 0.03:
+                    continue
+
+                filtered.append({
+                    "condition_id": m.get("conditionId") or m.get("condition_id"),
+                    "question": m.get("question"),
+                    "end_date": end_date_str,
+                    "yes_price": round(best_ask, 4),
+                    # no_price omitted — Claude derives it as 1 - yes_price
+                    "spread": round(best_ask - best_bid, 4),
+                    "price_vs_last": round(best_ask - last_price, 4),
+                    "volume_24h": float(m.get("volume24hr", 0)),
+                    "category": _guess_category(m.get("question", "")),
+                })
             except (ValueError, TypeError):
                 continue
 
-        log.info(f"Fetched {len(filtered)} markets (filtered from {len(markets)})")
-        return filtered[:10]  # send max 10 to Claude at once
+        # Sort: entertainment/culture first (less efficient = more opportunities),
+        # then by volume (liquid = easier to fill orders)
+        def sort_key(m):
+            cat_priority = 0 if m["category"] in ("entertainment", "sports", "weird") else 1
+            return (cat_priority, -m["volume_24h"])
+        filtered.sort(key=sort_key)
+
+        log.info(f"Fetched {len(filtered)} live markets (filtered from {len(markets)})")
+        return filtered[:10]  # top 10 after sorting
 
     except Exception as e:
         log.error(f"Failed to fetch markets: {e}")
@@ -117,14 +242,16 @@ def fetch_active_markets(limit=20) -> list:
 def _guess_category(question: str) -> str:
     """Rough category detection from question text."""
     q = question.lower()
-    if any(w in q for w in ["bitcoin", "eth", "crypto", "btc", "sol", "token", "defi"]):
+    if any(w in q for w in ["bitcoin", "eth", "crypto", "btc", "sol", "token", "defi", "coin"]):
         return "crypto"
-    if any(w in q for w in ["trump", "election", "president", "senate", "congress", "vote", "poll"]):
+    if any(w in q for w in ["trump", "election", "president", "senate", "congress", "vote", "poll", "biden", "harris"]):
         return "politics"
-    if any(w in q for w in ["nba", "nfl", "game", "match", "championship", "league", "score"]):
+    if any(w in q for w in ["nba", "nfl", "nhl", "mlb", "game", "match", "championship", "league", "score", "cup", "tournament", "playoff", "soccer", "football", "basketball", "tennis", "ufc", "boxing"]):
         return "sports"
-    if any(w in q for w in ["ai", "openai", "apple", "google", "microsoft", "launch", "gpt"]):
+    if any(w in q for w in ["ai", "openai", "apple", "google", "microsoft", "launch", "gpt", "model", "nvidia"]):
         return "tech"
+    if any(w in q for w in ["oscar", "emmy", "grammy", "golden globe", "award", "movie", "film", "actor", "actress", "director", "box office", "celebrity", "music", "album", "song", "billboard", "spotify", "netflix", "tv show"]):
+        return "entertainment"
     return "weird"
 
 
@@ -188,7 +315,7 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
 
 # ─── CATEGORY EXPOSURE CHECK ──────────────────────────────────────────────────
 
-MAX_BETS_PER_CATEGORY = 2
+MAX_BETS_PER_CATEGORY = 3
 
 def _count_open_bets_by_category() -> dict:
     """Count pending bets grouped by category to avoid over-concentration."""
@@ -243,6 +370,12 @@ def check_pending_bets(client: ClobClient):
                         new_balance = bankroll + payout
                         set_bankroll(new_balance, payout, "WIN")
                         log.info(f"🎉 WON ${payout:.2f}! New bankroll: ${new_balance:.2f}")
+                        # Auto-claim: call redeemPositions on Polygon CTF contract
+                        claim_winnings(
+                            condition_id=bet["polymarket_id"],
+                            outcome=bet["outcome"],
+                            payout=payout,
+                        )
                     else:
                         # Bet amount was already deducted when placing
                         new_balance = bankroll
@@ -301,6 +434,9 @@ def run_betting_agent():
 
     client = get_clob_client()
 
+    # Sync real CLOB balance at startup so Larry knows his actual bankroll
+    sync_bankroll_from_clob(client)
+
     while True:
         try:
             log.info("--- Betting cycle starting ---")
@@ -317,7 +453,7 @@ def run_betting_agent():
                 log.info(f"Max open bets reached ({MAX_OPEN_BETS}), skipping new bets")
             else:
                 # 4. Fetch markets
-                markets = fetch_active_markets(limit=20)
+                markets = fetch_active_markets(limit=100)
 
                 if markets:
                     # 5. Ask Claude / Larry which ones to bet on
@@ -365,7 +501,11 @@ def run_betting_agent():
                             set_bankroll(new_balance, -amount, "BET_PLACED")
 
                             # market_info already resolved above — no duplicate lookup
-                            odds = market_info.get("yes_price" if decision.get("outcome") == "YES" else "no_price", 0.5)
+                            # no_price was removed from market dict; derive it
+                            if decision.get("outcome") == "YES":
+                                odds = market_info.get("yes_price", 0.5)
+                            else:
+                                odds = round(1 - market_info.get("yes_price", 0.5), 4)
                             potential_payout = amount / odds if odds > 0 else amount * 2
 
                             bet_id = save_bet(
