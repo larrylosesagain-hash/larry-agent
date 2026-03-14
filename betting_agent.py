@@ -482,8 +482,8 @@ def run_betting_agent():
             if open_exposure >= max_exposure:
                 log.info(f"Exposure limit reached: ${open_exposure:.2f} of ${total:.2f} total in play ({open_exposure/total*100:.0f}%), skipping new bets")
             else:
-                # 4. Fetch markets
-                markets = fetch_active_markets(limit=100)
+                # 4. Fetch markets — limit=200 to survive open-bet + token-blacklist filtering
+                markets = fetch_active_markets(limit=200)
 
                 if markets:
                     # Filter out markets Larry already has open bets on — no point sending to Claude

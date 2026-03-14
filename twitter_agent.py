@@ -9,8 +9,10 @@ Runs on a loop every 15 minutes:
 """
 
 import time
+import json
 import random
 import logging
+import threading
 import tweepy
 from datetime import datetime, timedelta
 
@@ -425,7 +427,36 @@ def like_tweet(tweet_id: str):
 
 # ─── QUOTE TWEETS ─────────────────────────────────────────────────────────────
 
-# Keywords to search — related to what Larry bets on
+# Tweet IDs where quote tweet returned 403 — session-level, avoids retrying same tweet twice
+_quote_blocked_ids: set = set()
+
+# ACCOUNT-LEVEL blacklist: maps username → UTC datetime until which we skip them for quote tweets
+# Problem: Trump/Elon restrict quote tweets from accounts they haven't mentioned.
+# Tweet-level blacklist doesn't help — next cycle finds a new tweet from the same account.
+# This account-level blacklist + DB persistence solves it across restarts.
+_quote_account_blacklist: dict = {}
+
+
+def _init_quote_blacklist():
+    """Load persisted account-level quote tweet blacklist from DB on startup."""
+    global _quote_account_blacklist
+    raw = get_state("quote_account_blacklist")
+    if not raw:
+        return
+    try:
+        data = json.loads(raw)
+        now = datetime.utcnow()
+        # Load only entries that haven't expired yet
+        _quote_account_blacklist = {
+            k: datetime.fromisoformat(v)
+            for k, v in data.items()
+            if datetime.fromisoformat(v) > now
+        }
+        if _quote_account_blacklist:
+            log.info(f"🚫 Loaded quote account blacklist: {list(_quote_account_blacklist.keys())}")
+    except Exception:
+        _quote_account_blacklist = {}
+
 # Whitelist of accounts Larry can quote tweet — high engagement, relevant to betting/markets/politics
 _QUOTE_ACCOUNTS = [
     "polymarket",       # prediction markets — Larry's home turf
@@ -448,8 +479,18 @@ def _find_quote_tweet_candidate() -> dict | None:
     try:
         client = get_twitter_client()
 
+        # Filter out accounts that have had quote tweet blocked (account-level 403)
+        now_dt = datetime.utcnow()
+        available_accounts = [
+            a for a in _QUOTE_ACCOUNTS
+            if _quote_account_blacklist.get(a, datetime.min) < now_dt
+        ]
+        if not available_accounts:
+            log.debug("All quote accounts currently blacklisted — skipping")
+            return None
+
         # Pick a random subset of accounts and search their recent tweets
-        accounts = random.sample(_QUOTE_ACCOUNTS, min(5, len(_QUOTE_ACCOUNTS)))
+        accounts = random.sample(available_accounts, min(5, len(available_accounts)))
         from_query = " OR ".join(f"from:{a}" for a in accounts)
         query = f"({from_query}) -is:retweet -is:reply lang:en"
 
@@ -472,6 +513,8 @@ def _find_quote_tweet_candidate() -> dict | None:
         candidates = []
         for tweet in response.data:
             text = tweet.text
+            if str(tweet.id) in _quote_blocked_ids:
+                continue  # this tweet has quote restrictions — skip
             if not _is_safe_to_engage(text):
                 continue
             user = users.get(tweet.author_id, {})
@@ -551,6 +594,21 @@ def maybe_quote_tweet():
         # Like the original too
         like_tweet(candidate["tweet_id"])
 
+    except tweepy.Forbidden:
+        # Account restricts quote tweets — blacklist at ACCOUNT level, not just tweet level
+        # (tweet-level blacklist doesn't help: next cycle finds a new tweet from same account)
+        username = candidate["username"]
+        _quote_blocked_ids.add(candidate["tweet_id"])
+        blocked_until = now + timedelta(hours=24)
+        _quote_account_blacklist[username] = blocked_until
+        # Persist so it survives container restarts
+        try:
+            set_state("quote_account_blacklist", json.dumps(
+                {k: v.isoformat() for k, v in _quote_account_blacklist.items()}
+            ))
+        except Exception:
+            pass
+        log.info(f"🚫 Quote tweet 403 for @{username} — account blacklisted 24h (likely restricts quoting)")
     except Exception as e:
         log.error(f"Quote tweet failed: {type(e).__name__}: {e}")
 
@@ -718,11 +776,157 @@ def maybe_react_to_price_moves():
         log.debug(f"Price move react failed: {type(e).__name__}")
 
 
+# ─── VIP STREAM (real-time engagement farming) ────────────────────────────────
+#
+# Uses Twitter Filtered Stream API — persistent connection, Twitter pushes tweets
+# in real-time the moment they're posted. No polling. Latency: ~5-10 seconds.
+# Requires Basic tier ($100/mo). Silently skips if unavailable.
+#
+# VIP accounts Larry monitors and replies to immediately:
+_VIP_STREAM_ACCOUNTS = ["elonmusk", "realDonaldTrump", "polymarket"]
+
+# Per-account cooldown: max 1 reply per 2 hours to avoid spamming one thread
+_VIP_REPLIED_UNTIL: dict = {}
+
+
+class LarryStreamClient(tweepy.StreamingClient):
+    """Tweepy v4 streaming client — receives VIP tweets in real-time."""
+
+    def on_tweet(self, tweet):
+        try:
+            now = datetime.utcnow()
+
+            # Active hours only
+            if now.hour < 8 or now.hour >= 23:
+                return
+
+            text = tweet.text or ""
+            if not text or not _is_safe_to_engage(text):
+                return
+
+            # Figure out which VIP account this is from (via matching_rules tag)
+            username = None
+            if hasattr(tweet, "matching_rules") and tweet.matching_rules:
+                tag = tweet.matching_rules[0].tag  # tag = "vip_elonmusk" etc.
+                username = tag.replace("vip_", "")
+            if not username:
+                return
+
+            # Per-account cooldown
+            cooldown_until = _VIP_REPLIED_UNTIL.get(username)
+            if cooldown_until and now < cooldown_until:
+                return
+
+            log.info(f"⚡ VIP stream: new tweet from @{username} — replying...")
+
+            from larry_brain import ask_larry_for_tweet
+            from config import CLAUDE_MODEL
+            # VIP tweets (Elon/Trump/Polymarket) get Sonnet — high visibility, worth the cost
+            # A viral reply under Elon's tweet can get 10k impressions. $0.01 well spent.
+            tweet_data = ask_larry_for_tweet(
+                "WHITELIST_REPLY",
+                extra_data={"original_tweet": text[:200], "username": username},
+                model=CLAUDE_MODEL,
+            )
+            reply_text = tweet_data.get("tweet", "")
+            if not reply_text:
+                return
+
+            client = get_twitter_client()
+            response = client.create_tweet(
+                text=reply_text,
+                in_reply_to_tweet_id=str(tweet.id),
+            )
+            reply_id = str(response.data["id"])
+            save_tweet(tweet_id=reply_id, content=reply_text, tweet_type="VIP_REPLY")
+            log.info(f"⚡ VIP reply to @{username}: {reply_text[:80]}...")
+
+            _VIP_REPLIED_UNTIL[username] = now + timedelta(hours=2)
+            like_tweet(str(tweet.id))
+
+        except Exception as e:
+            log.debug(f"VIP stream on_tweet error: {type(e).__name__}: {e}")
+
+    def on_errors(self, errors):
+        log.warning(f"VIP stream errors: {errors}")
+
+    def on_closed(self, resp):
+        log.warning("VIP stream connection closed — will reconnect")
+
+    def on_exception(self, exception):
+        log.debug(f"VIP stream exception: {exception}")
+
+
+def _setup_stream_rules(stream: LarryStreamClient):
+    """
+    Sync stream filter rules: delete old VIP rules, add fresh ones.
+    Rules are persistent on Twitter's side — need to clean up on startup.
+    """
+    try:
+        existing = stream.get_rules()
+        if existing.data:
+            ids = [r.id for r in existing.data if r.tag and r.tag.startswith("vip_")]
+            if ids:
+                stream.delete_rules(ids)
+
+        for username in _VIP_STREAM_ACCOUNTS:
+            stream.add_rules(tweepy.StreamRule(
+                value=f"from:{username} -is:retweet -is:reply lang:en",
+                tag=f"vip_{username}",
+            ))
+        log.info(f"⚡ Stream rules set for: {', '.join('@' + a for a in _VIP_STREAM_ACCOUNTS)}")
+    except Exception as e:
+        log.warning(f"Failed to set stream rules: {type(e).__name__}: {e}")
+
+
+def run_vip_stream():
+    """
+    Background thread — connects to Twitter Filtered Stream and listens forever.
+    Auto-reconnects on disconnect with exponential backoff.
+    Requires Basic API tier. Silently exits if unavailable.
+    """
+    log.info("⚡ VIP stream starting...")
+    backoff = 5
+
+    while True:
+        try:
+            stream = LarryStreamClient(bearer_token=TWITTER_BEARER_TOKEN)
+            _setup_stream_rules(stream)
+
+            # tweet_fields includes matching_rules so we know which account triggered
+            stream.filter(
+                tweet_fields=["id", "text", "author_id"],
+                expansions=["author_id"],
+                threaded=False,  # blocking — runs in this thread
+            )
+
+        except tweepy.errors.TwitterServerError:
+            log.warning(f"VIP stream server error — reconnecting in {backoff}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)  # cap at 5 min
+        except tweepy.errors.Unauthorized:
+            log.warning("VIP stream: unauthorized — Basic tier required, disabling")
+            return  # give up — not available on free tier
+        except Exception as e:
+            log.debug(f"VIP stream error: {type(e).__name__}: {e} — reconnecting in {backoff}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)
+        else:
+            backoff = 5  # reset backoff on clean disconnect
+
+
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 
 def run_twitter_agent():
     log.info(f"🐦 Larry's Twitter Agent starting up as {LARRY_TWITTER_HANDLE}...")
     init_db()
+
+    # Load persisted account-level quote tweet blacklist from previous session
+    _init_quote_blacklist()
+
+    # Start VIP stream in background — real-time push from Twitter, no polling
+    vip_thread = threading.Thread(target=run_vip_stream, daemon=True)
+    vip_thread.start()
 
     while True:
         try:

@@ -263,12 +263,23 @@ def _get_tweet_context() -> dict:
     except Exception:
         in_play = 0.0
     total = bankroll + in_play
+    # Slim open bets — Larry knows what he's waiting on (makes tweets feel personal)
+    try:
+        pending = get_pending_bets()
+        open_bets_slim = [
+            {"q": b.get("question", "")[:55], "side": b.get("outcome"), "odds": b.get("odds")}
+            for b in pending[:5]
+        ]
+    except Exception:
+        open_bets_slim = []
+
     return {
         "bankroll_usdc": round(bankroll, 2),
         "in_play_usdc": round(in_play, 2),
         "total_usdc": round(total, 2),
         "win_streak": win_streak,
         "emotional_state": _get_emotional_state(total, win_streak),
+        "open_bets": open_bets_slim,   # what Larry is currently waiting on
     }
 
 
@@ -407,19 +418,45 @@ def ask_larry_to_bet(markets: list) -> list:
     return decisions if isinstance(decisions, list) else [decisions]
 
 
-def ask_larry_for_tweet(context_type: str, extra_data: dict = None) -> dict:
+def ask_larry_for_tweet(context_type: str, extra_data: dict = None, model: str = None) -> dict:
     """Generate a standalone tweet via Tool Use. Uses lightweight context + tweet memory."""
     ctx = _get_tweet_context()
     extra_data = extra_data or {}
-    recent_tweets = _get_recent_tweet_texts(3)
+    recent_tweets = _get_recent_tweet_texts(10)  # 10 tweets ≈ 2-3 days back — enough to avoid repetition
+
+    # Format open bets for RANDOM prompt — Larry knows what he's sweating on
+    open_bets_text = ""
+    if ctx.get("open_bets"):
+        bets_list = ", ".join(
+            f"{b['side']} on \"{b['q']}\" at {round(b['odds']*100)}¢"
+            for b in ctx["open_bets"]
+        )
+        open_bets_text = f" Open bets: {bets_list}."
 
     prompts = {
-        "WIN":             f"Larry just won a bet. Details: {extra_data}. Short smug tweet, 1-2 sentences.",
-        "LOSS":            f"Larry just lost a bet. Details: {extra_data}. Short tweet blaming the market. Move on quickly.",
+        # WIN/LOSS: explicit dollar amounts so Haiku doesn't vague-out
+        "WIN":             (
+            f"Larry just won ${round(float(extra_data.get('potential_payout', extra_data.get('amount_usdc', 10))))} "
+            f"on \"{extra_data.get('question','a bet')[:60]}\". "
+            f"Bet {extra_data.get('outcome','YES')} at {round(float(extra_data.get('odds',0.5))*100)}¢, won. "
+            f"Short smug tweet. 1-2 sentences."
+        ),
+        "LOSS":            (
+            f"Larry just lost ${round(float(extra_data.get('amount_usdc', 5)))} "
+            f"on \"{extra_data.get('question','a bet')[:60]}\". "
+            f"Bet {extra_data.get('outcome','YES')}, it went the other way. "
+            f"Short tweet blaming the market/rigging. Move on quickly."
+        ),
         "FRIDAY":          "It's Friday, Larry ordered Domino's. Short casual tweet about it, not a performance.",
         "GRANDMA":         f"Grandma sent ${extra_data.get('amount', 200)}. Short tweet, genuine moment, brief.",
-        "RANDOM":          f"Larry tweets a random thought. State: {ctx['emotional_state']}. Bankroll: ${ctx['bankroll_usdc']}. Keep it short and natural.",
-        "SURVIVAL":        f"Larry is down bad, bankroll ${ctx['bankroll_usdc']}. Short terse tweet.",
+        # RANDOM: give Larry's actual portfolio context — makes tweets feel grounded
+        "RANDOM":          (
+            f"Larry tweets a random thought. State: {ctx['emotional_state']}. "
+            f"Bankroll: ${ctx['bankroll_usdc']} cash, ${ctx['in_play_usdc']} in open bets.{open_bets_text} "
+            f"Could be about: waiting on a bet, the state of his portfolio, something dumb he read, "
+            f"his analysis process, complaining about a market, anything that feels real right now. Short and natural."
+        ),
+        "SURVIVAL":        f"Larry is down bad, only ${ctx['bankroll_usdc']} cash left.{open_bets_text} Short terse tweet. Darker energy.",
         "DEAD_MAN_SWITCH": "Larry hasn't posted in 48 hours. Short tweet about coming back. Don't explain too much.",
         "WEEKLY_RECAP":    f"Sunday recap. Stats: {extra_data}. Short, honest, slightly delusional take on the week.",
         "MILESTONE":       f"Larry hit {extra_data.get('milestone', 'a milestone')}. Short tweet, smug but brief.",
@@ -435,8 +472,9 @@ def ask_larry_for_tweet(context_type: str, extra_data: dict = None) -> dict:
         f"Task: {prompt}\n"
         f"tweet_type: \"{context_type}\""
     )
+    use_model = model or TWEET_MODEL
     try:
-        result = _call_claude_with_tool(500, [{"role": "user", "content": user_message}], TWEET_TOOL, model=TWEET_MODEL)
+        result = _call_claude_with_tool(500, [{"role": "user", "content": user_message}], TWEET_TOOL, model=use_model)
     except Exception:
         return _fallback_tweet()
 
@@ -450,9 +488,11 @@ def ask_larry_to_reply(mention: dict) -> dict:
     bankroll = get_bankroll()
     win_streak = get_win_streak()
     state = _get_emotional_state(bankroll, win_streak)
+    recent_tweets = _get_recent_tweet_texts(5)  # avoid repeating same reply pattern
 
     user_message = (
         f"Larry: bankroll ${round(bankroll,2)}, state={state}\n"
+        f"Recent replies/tweets (don't repeat same tone/phrasing): {json.dumps(recent_tweets, separators=(',',':'))}\n"
         f"Mention from @{mention['username']} ({mention['likes']} likes): \"{mention['text']}\"\n"
         f"Short reply, Larry's voice. NO @username prefix. Max 250 chars.\n"
         f"Insults → brief dismissal. Questions → bad confident advice. Praise → quick smugness."
