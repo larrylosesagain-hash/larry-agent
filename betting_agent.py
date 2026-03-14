@@ -202,29 +202,38 @@ def fetch_active_markets(limit=20) -> list:
                     continue  # too far in the future
 
                 # Neg-risk = multi-outcome market (Oscars, championships etc)
-                # Expand each outcome into its own entry so Larry can bet on individual outcomes
+                # Gamma API doesn't give per-outcome prices — fetch from CLOB instead
                 if m.get("negRisk") or m.get("neg_risk"):
-                    tokens = m.get("tokens") or m.get("outcomes") or []
                     cond_id = m.get("conditionId") or m.get("condition_id")
                     vol = float(m.get("volume24hr", 0))
                     cat = _guess_category(m.get("question", ""))
-                    for t in tokens:
-                        if not isinstance(t, dict):
-                            continue  # Gamma API sometimes returns token IDs as strings
-                        t_name = t.get("outcome") or t.get("name", "")
-                        t_price = float(t.get("price", 0.5))
-                        if not t_name or t_price >= 0.97 or t_price <= 0.03:
-                            continue
-                        filtered.append({
-                            "condition_id": cond_id,
-                            "question": m.get("question"),
-                            "end_date": end_date_str,
-                            "yes_price": round(t_price, 4),
-                            "outcome_name": t_name,   # actual outcome to bet on
-                            "neg_risk": True,
-                            "volume_24h": vol,
-                            "category": cat,
-                        })
+                    try:
+                        clob_resp = requests.get(
+                            f"{POLYMARKET_HOST}/markets/{cond_id}", timeout=5
+                        )
+                        tokens = clob_resp.json().get("tokens", [])
+                        for t in tokens:
+                            if not isinstance(t, dict):
+                                continue
+                            t_name = t.get("outcome", "")
+                            t_price = float(t.get("price", 0.5))
+                            # Skip YES/NO tokens (binary markets can appear in neg-risk groups)
+                            if not t_name or t_name.lower() in ("yes", "no"):
+                                continue
+                            if t_price >= 0.97 or t_price <= 0.03:
+                                continue
+                            filtered.append({
+                                "condition_id": cond_id,
+                                "question": m.get("question"),
+                                "end_date": end_date_str,
+                                "yes_price": round(t_price, 4),
+                                "outcome_name": t_name,  # Claude uses this as the outcome field
+                                "neg_risk": True,
+                                "volume_24h": vol,
+                                "category": cat,
+                            })
+                    except Exception:
+                        pass  # if CLOB fetch fails, skip this neg-risk market silently
                     continue  # skip normal binary processing below
 
                 best_ask = float(m.get("bestAsk", 0.5))
@@ -296,24 +305,19 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
         # Use CLOB client to get market data (more reliable than raw HTTP)
         market_data = client.get_market(condition_id)
 
-        # Gamma API's negRisk field is unreliable — check CLOB market data directly.
-        # Neg-risk markets require a different order flow we don't support yet; skip them.
-        if market_data.get("neg_risk") or market_data.get("negRisk"):
-            log.info(f"Skipping neg-risk market {condition_id[:16]}... (not supported)")
-            return False
-
         tokens = market_data.get("tokens", [])
         token_id = None
         price = None
         for token in tokens:
             token_outcome = token.get("outcome", "")
+            # Works for both binary (YES/NO) and neg-risk (named outcomes like "Demi Moore")
             if token_outcome.lower() == outcome.lower():
                 token_id = token.get("token_id")
                 price = float(token.get("price", 0.5))
                 break
 
         if not token_id:
-            log.info(f"Skipping market {condition_id[:16]}... — no '{outcome}' token (likely neg-risk)")
+            log.info(f"Skipping {condition_id[:16]}... — no '{outcome}' token found")
             return False
 
         # FIX: added side="BUY" — was missing, caused TypeError
