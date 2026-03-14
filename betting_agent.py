@@ -57,6 +57,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Session-level blacklist: market IDs where token lookup failed — skip forever this session
+# Avoids Claude wasting tokens + CLOB API calls on markets that consistently have no tradeable tokens
+_token_not_found_blacklist: set = set()
+
 # Import twitter agent's post function (shared module)
 from twitter_agent import post_tweet
 
@@ -320,6 +324,7 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
 
         if not token_id:
             log.info(f"Skipping {condition_id[:16]}... — no '{outcome}' token found")
+            _token_not_found_blacklist.add(condition_id)
             return False
 
         # FIX: added side="BUY" — was missing, caused TypeError
@@ -483,10 +488,14 @@ def run_betting_agent():
                 if markets:
                     # Filter out markets Larry already has open bets on — no point sending to Claude
                     open_bet_ids = {b.get("polymarket_id") for b in get_pending_bets()}
-                    fresh_markets = [m for m in markets if m["condition_id"] not in open_bet_ids]
+                    fresh_markets = [
+                        m for m in markets
+                        if m["condition_id"] not in open_bet_ids
+                        and m["condition_id"] not in _token_not_found_blacklist
+                    ]
                     skipped = len(markets) - len(fresh_markets)
                     if skipped:
-                        log.info(f"Skipped {skipped} markets with existing open bets — sending {len(fresh_markets)} fresh to Claude")
+                        log.info(f"Skipped {skipped} markets (open bets or no-token blacklist) — sending {len(fresh_markets)} fresh to Claude")
                     markets = fresh_markets
 
                 if markets:
