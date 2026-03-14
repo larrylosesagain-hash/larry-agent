@@ -8,6 +8,7 @@ Runs on a loop every 30 minutes:
   5. Update database + trigger Twitter announcements
 """
 
+import sys
 import time
 import json
 import signal
@@ -56,7 +57,7 @@ from larry_brain import ask_larry_to_bet, ask_larry_for_tweet
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [BETTING] %(message)s",
-    handlers=[logging.StreamHandler()]  # Railway captures stdout automatically
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 log = logging.getLogger(__name__)
 

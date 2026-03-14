@@ -4,6 +4,7 @@ Starts Twitter and Betting agents in separate threads.
 SIGTERM/SIGINT are handled here (main thread only) and propagated to both agents.
 """
 
+import sys
 import signal
 import threading
 import logging

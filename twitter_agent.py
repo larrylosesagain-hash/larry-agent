@@ -8,6 +8,7 @@ Runs on a loop every 15 minutes:
   5. Friday pizza tweet scheduler
 """
 
+import sys
 import time
 import json
 import signal
@@ -36,7 +37,7 @@ from larry_brain import ask_larry_for_tweet, ask_larry_to_reply
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [TWITTER] %(message)s",
-    handlers=[logging.StreamHandler()]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 log = logging.getLogger(__name__)
 
