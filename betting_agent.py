@@ -290,6 +290,7 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
     condition_id = decision.get("market_id")
     outcome = decision.get("outcome", "YES")
     amount = float(decision.get("amount_usdc", ABSOLUTE_MIN_BET))
+    amount = max(amount, 5.0)  # Polymarket enforces $5 minimum order size
 
     try:
         # Use CLOB client to get market data (more reliable than raw HTTP)
