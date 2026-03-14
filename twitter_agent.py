@@ -449,7 +449,7 @@ def _get_cycle_candidate() -> dict | None:
     now = datetime.utcnow()
     if now < _candidate_cache["expires_at"]:
         return _candidate_cache["candidate"]
-    candidate = _get_cycle_candidate()
+    candidate = _find_quote_tweet_candidate()
     _candidate_cache = {"candidate": candidate, "expires_at": now + timedelta(minutes=14)}
     return candidate
 
@@ -937,11 +937,12 @@ def run_vip_stream():
             stream = LarryStreamClient(bearer_token=TWITTER_BEARER_TOKEN)
             _setup_stream_rules(stream)
 
-            # FIX: "matching_rules" MUST be in tweet_fields.
-            # on_tweet reads tweet.matching_rules[0].tag to identify which VIP account tweeted.
-            # Without it, matching_rules is None → username = None → every VIP tweet silently dropped.
+            # NOTE: matching_rules is automatically returned by the Twitter Filtered Stream API
+            # for every tweet — it does NOT need to be listed in tweet_fields (and Twitter
+            # will reject the request with a 400 if you do include it there).
+            # tweet.matching_rules is available on the response object without any extra fields.
             stream.filter(
-                tweet_fields=["id", "text", "author_id", "matching_rules"],
+                tweet_fields=["id", "text", "author_id"],
                 expansions=["author_id"],
                 threaded=False,  # blocking — runs in this thread
             )
