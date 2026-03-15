@@ -510,7 +510,7 @@ def _search_tweets_from_accounts(account_list: list) -> dict | None:
         response = client.search_recent_tweets(
             query=query,
             max_results=20,
-            tweet_fields=["author_id", "text", "public_metrics"],
+            tweet_fields=["author_id", "text", "public_metrics", "reply_settings"],
             expansions=["author_id"],
             user_fields=["username", "public_metrics"],
         )
@@ -529,6 +529,12 @@ def _search_tweets_from_accounts(account_list: list) -> dict | None:
             if str(tweet.id) in _quote_blocked_ids:
                 continue
             if not _is_safe_to_engage(text):
+                continue
+            # Skip tweets where replies are restricted — Larry isn't mentioned/followed
+            # by these authors so he'll always get a 403. Check BEFORE calling Claude.
+            reply_settings = getattr(tweet, "reply_settings", None)
+            if reply_settings and reply_settings != "everyone":
+                _quote_blocked_ids.add(str(tweet.id))
                 continue
             user = users.get(tweet.author_id, {})
             metrics = tweet.public_metrics or {}

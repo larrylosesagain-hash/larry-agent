@@ -201,32 +201,36 @@ def sync_bankroll_from_clob(client: ClobClient):
 
 # ─── PORTFOLIO VALUATION ──────────────────────────────────────────────────────
 
+_POLYMARKET_DATA_API = "https://data-api.polymarket.com"
+
 def get_positions_value() -> tuple[float, int]:
     """
-    Fetch current market value of all open positions from Gamma API.
+    Fetch current market value of all open positions.
     Returns (total_current_value, position_count).
 
-    Gamma /positions endpoint returns real-time mark-to-market values —
-    this is what Polymarket shows in the portfolio tab, and what we should
-    show in logs instead of the original bet cost stored in the DB.
+    Uses Polymarket Data API (data-api.polymarket.com/positions) —
+    NOT the Gamma API. Gamma is for market listings; Data API is for
+    user portfolio data. This is the same source Polymarket's UI uses.
 
-    Falls back to (0.0, 0) on any error — caller uses DB values instead.
+    Falls back to (0.0, 0) on any error — caller uses DB cost sum instead.
     """
     try:
         resp = requests.get(
-            f"{POLYMARKET_GAMMA_API}/positions",
+            f"{_POLYMARKET_DATA_API}/positions",
             params={"user": POLYMARKET_FUNDER, "sizeThreshold": "0.1"},
             timeout=10,
         )
         if not resp.ok:
+            log.warning(f"Data API positions failed: HTTP {resp.status_code}")
             return 0.0, 0
         positions = resp.json()
         if not isinstance(positions, list):
+            log.warning(f"Data API positions: unexpected response type {type(positions)}")
             return 0.0, 0
         total = sum(float(p.get("currentValue") or 0) for p in positions)
         return round(total, 2), len(positions)
     except Exception as e:
-        log.debug(f"Portfolio valuation failed: {type(e).__name__}: {e}")
+        log.warning(f"Portfolio valuation failed: {type(e).__name__}: {e}")
         return 0.0, 0
 
 
@@ -321,9 +325,9 @@ def _fetch_gamma_raw(order: str, ascending: bool, limit: int, offset: int = 0,
         if offset > 0:
             params["offset"] = offset
         if end_min:
-            params["endDateMin"] = end_min
+            params["end_date_min"] = end_min
         if end_max:
-            params["endDateMax"] = end_max
+            params["end_date_max"] = end_max
         resp = requests.get(f"{POLYMARKET_GAMMA_API}/markets", params=params, timeout=10)
         resp.raise_for_status()
         return resp.json()
