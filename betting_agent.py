@@ -450,29 +450,48 @@ def fetch_active_markets() -> list:
                         pass
                     continue
 
-                # Skip markets with no tradeable tokens in Gamma data —
-                # these will always fail at bet placement (CLOB has no token for them)
-                gamma_tokens = m.get("tokens", [])
-                if not gamma_tokens:
-                    continue
+                # Build YES/NO price map — Gamma API changed format (March 2026):
+                # OLD: tokens=[{outcome:"Yes",price:0.6},{outcome:"No",price:0.4}]
+                # NEW: tokens=None, outcomes=["Yes","No"], outcomePrices=["0.6","0.4"]
+                # Support both formats for forward-compat.
+                gamma_tokens = m.get("tokens") or []
+                token_map = {}
 
-                # Build token map from Gamma — verify BOTH yes AND no tokens exist and are liquid.
-                # This eliminates the "no YES token found" failures that were wasting 77% of
-                # Claude decisions. A market might have tokens[] but lack a standard YES/NO
-                # entry if it's a resolving neg-risk sub-market or near-settled binary.
-                token_map = {
-                    (t.get("outcome") or "").lower(): float(t.get("price", 0.5))
-                    for t in gamma_tokens if isinstance(t, dict)
-                }
+                if gamma_tokens:
+                    # Old Gamma format: list of {outcome, price} dicts
+                    token_map = {
+                        (t.get("outcome") or "").lower(): float(t.get("price", 0.5))
+                        for t in gamma_tokens if isinstance(t, dict)
+                    }
+                else:
+                    # New Gamma format: separate outcomes + outcomePrices arrays
+                    outcomes_raw = m.get("outcomes")
+                    prices_raw   = m.get("outcomePrices")
+                    if outcomes_raw and prices_raw:
+                        try:
+                            # Gamma returns these as JSON strings or already-parsed lists
+                            import json as _json
+                            outcomes_list = _json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                            prices_list   = _json.loads(prices_raw)   if isinstance(prices_raw,   str) else prices_raw
+                            token_map = {
+                                str(o).lower(): float(p)
+                                for o, p in zip(outcomes_list, prices_list)
+                            }
+                        except Exception:
+                            continue  # unparseable price data — skip
+                    else:
+                        continue  # no price data at all — skip
+
                 if "yes" not in token_map or "no" not in token_map:
-                    continue  # Non-binary or partially-settled market — CLOB bet will fail
+                    continue  # non-binary market or data missing — CLOB bet will fail
 
                 yes_price = token_map["yes"]
-                # Skip nearly-resolved markets (CLOB removes tokens when price ~1 or ~0)
+                # Skip nearly-resolved markets (CLOB removes liquidity when price ~1 or ~0)
                 if yes_price >= 0.97 or yes_price <= 0.03:
                     continue
 
-                best_bid = float(m.get("bestBid", yes_price - 0.02))
+                best_bid_raw = m.get("bestBid")
+                best_bid  = float(best_bid_raw) if best_bid_raw is not None else (yes_price - 0.02)
                 last_price = float(m.get("lastTradePrice") or yes_price)
 
                 out.append({
