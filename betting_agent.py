@@ -199,6 +199,37 @@ def sync_bankroll_from_clob(client: ClobClient):
         log.warning(f"Balance sync failed ({type(e).__name__}: {e}) — using DB balance")
 
 
+# ─── PORTFOLIO VALUATION ──────────────────────────────────────────────────────
+
+def get_positions_value() -> tuple[float, int]:
+    """
+    Fetch current market value of all open positions from Gamma API.
+    Returns (total_current_value, position_count).
+
+    Gamma /positions endpoint returns real-time mark-to-market values —
+    this is what Polymarket shows in the portfolio tab, and what we should
+    show in logs instead of the original bet cost stored in the DB.
+
+    Falls back to (0.0, 0) on any error — caller uses DB values instead.
+    """
+    try:
+        resp = requests.get(
+            f"{POLYMARKET_GAMMA_API}/positions",
+            params={"user": POLYMARKET_FUNDER, "sizeThreshold": "0.1"},
+            timeout=10,
+        )
+        if not resp.ok:
+            return 0.0, 0
+        positions = resp.json()
+        if not isinstance(positions, list):
+            return 0.0, 0
+        total = sum(float(p.get("currentValue") or 0) for p in positions)
+        return round(total, 2), len(positions)
+    except Exception as e:
+        log.debug(f"Portfolio valuation failed: {type(e).__name__}: {e}")
+        return 0.0, 0
+
+
 # ─── AUTO-CLAIM WINNINGS ──────────────────────────────────────────────────────
 
 def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
@@ -456,6 +487,23 @@ def fetch_active_markets() -> list:
     anchor = parse_strict(raw_anchor)
     scan   = parse_strict(raw_scan)
     fresh  = parse_strict(raw_fresh)
+
+    # 48h fallback — also triggers if parse_strict filtered everything out
+    # (e.g. Sunday afternoon: Gamma returned data but all markets nearly settled/resolved)
+    if not anchor and not scan and not fresh and cutoff <= now + timedelta(hours=25):
+        cutoff = now + timedelta(hours=48)
+        end_max = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+        log.info("⚠️  parse_strict returned 0 markets — expanding to 48h fallback")
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            f_anchor = ex.submit(_fetch_gamma_raw, "volume24hr", False, 500, 0,           end_min, end_max)
+            f_scan   = ex.submit(_fetch_gamma_raw, "volume24hr", False, 500, scan_offset, end_min, end_max)
+            f_fresh  = ex.submit(_fetch_gamma_raw, "createdAt",  False, 200, 0,           end_min, end_max)
+            raw_anchor = f_anchor.result()
+            raw_scan   = f_scan.result()
+            raw_fresh  = f_fresh.result()
+        anchor = parse_strict(raw_anchor)
+        scan   = parse_strict(raw_scan)
+        fresh  = parse_strict(raw_fresh)
 
     # Deduplicate: scan and fresh shouldn't repeat what anchor already has
     anchor_ids = {m["condition_id"] for m in anchor}
@@ -823,8 +871,17 @@ def run_betting_agent():
             # 2. Check free bankroll — bet until it hits zero (no exposure cap)
             open_bets = get_pending_bets()
             bankroll = get_bankroll()
-            open_exposure = sum(float(b.get("amount_usdc", 0)) for b in open_bets)
-            log.info(f"💼 Bankroll: ${bankroll:.2f} free | ${open_exposure:.2f} in {len(open_bets)} open bets")
+            positions_value, n_positions = get_positions_value()
+            if positions_value > 0:
+                total_portfolio = bankroll + positions_value
+                log.info(
+                    f"💼 Portfolio: ${total_portfolio:.2f} total "
+                    f"(${bankroll:.2f} free + ${positions_value:.2f} in {n_positions} positions)"
+                )
+            else:
+                # Gamma unavailable — fall back to DB cost sum
+                open_exposure = sum(float(b.get("amount_usdc", 0)) for b in open_bets)
+                log.info(f"💼 Bankroll: ${bankroll:.2f} free | ~${open_exposure:.2f} cost in {len(open_bets)} open bets (Gamma unavailable)")
             if bankroll <= 0:
                 log.info("No free bankroll remaining — waiting for open bets to resolve")
             else:

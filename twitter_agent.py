@@ -292,15 +292,12 @@ def check_and_reply_to_mentions():
 # ─── TIMING LOGIC ────────────────────────────────────────────────────────────
 
 def should_tweet_now() -> bool:
-    """Decide if it's time for a new organic tweet."""
+    """Decide if it's time for a new organic tweet.
+    No daily cap — only constraint is MIN_MINUTES_BETWEEN_TWEETS gap.
+    25% chance per 15-min cycle when gap has elapsed = ~4-6 tweets/day naturally.
+    """
     now = datetime.utcnow()
-
-    # FIX: use own-tweet count only — replies shouldn't eat into the daily limit
-    today_count = get_today_own_tweet_count()
     last_tweet = get_last_tweet_time()
-
-    if today_count >= MAX_TWEETS_PER_DAY:
-        return False
 
     if last_tweet:
         minutes_since = (now - last_tweet).total_seconds() / 60
@@ -308,17 +305,11 @@ def should_tweet_now() -> bool:
             return False
 
     hour = now.hour
-    # FIX: hour > 23 is always False (hours are 0–23); use >= 23 to block late-night tweets
     if hour < 7 or hour >= 23:
         return False
 
-    tweets_remaining = MAX_TWEETS_PER_DAY - today_count
-    hours_remaining = max(1, 23 - hour)
-    expected_interval_hours = hours_remaining / max(1, tweets_remaining)
-    chance_per_check = 0.25 / expected_interval_hours
-
-    if random.random() < chance_per_check:
-        log.info(f"Rolling to tweet: {today_count}/{MAX_TWEETS_PER_DAY} today")
+    if random.random() < 0.25:
+        log.info(f"Rolling to tweet (today: {get_today_own_tweet_count()})")
         return True
 
     return False
@@ -649,7 +640,10 @@ def maybe_quote_tweet():
             ))
         except Exception:
             pass
-        log.info(f"🚫 Quote tweet 403 for @{username} — account blacklisted 24h (likely restricts quoting)")
+        # FIX: advance throttle even on 403 — otherwise next cycle fires again,
+        # burns another Claude call, and blacklists another account. 3h pause.
+        set_state("last_quote_tweet_time", now.isoformat())
+        log.info(f"🚫 Quote tweet 403 for @{username} — blacklisted 24h, retrying quote tweets in 3h")
     except Exception as e:
         log.error(f"Quote tweet failed: {type(e).__name__}: {e}")
 
@@ -683,8 +677,10 @@ def maybe_retweet():
 
     try:
         client = get_twitter_client()
-        larry_id = _get_larry_id(client)
-        client.retweet(larry_id, candidate["tweet_id"])
+        # FIX: Tweepy 4.x client.retweet(tweet_id) — user_id is NOT passed,
+        # it's inferred automatically from the bearer/access token.
+        # Old call: client.retweet(larry_id, tweet_id) → TypeError: too many args
+        client.retweet(candidate["tweet_id"])
         save_tweet(tweet_id=candidate["tweet_id"], content=f"RT @{candidate['username']}: {candidate['text'][:100]}", tweet_type="RETWEET")
         log.info(f"🔁 Retweeted @{candidate['username']}: {candidate['text'][:60]}...")
         set_state("last_retweet_time", now.isoformat())
@@ -759,6 +755,14 @@ def maybe_reply_to_whitelist():
         log.info(f"💬 Replied to @{candidate['username']}: {reply_text[:60]}...")
         set_state("last_whitelist_reply_time", now.isoformat())
         like_tweet(candidate["tweet_id"])
+    except tweepy.Forbidden as e:
+        # Tweet has reply restrictions ("not mentioned or engaged by author").
+        # Blacklist this tweet_id so we never retry it.
+        # Also advance the cooldown — no point retrying other tweets this cycle,
+        # we just burned a Claude API call. Wait 2h before trying again.
+        _quote_blocked_ids.add(candidate["tweet_id"])
+        set_state("last_whitelist_reply_time", now.isoformat())
+        log.warning(f"Whitelist reply forbidden for @{candidate['username']} (tweet restricted) — skipping 2h")
     except Exception as e:
         log.warning(f"Whitelist reply failed: {type(e).__name__}: {e}")
 
