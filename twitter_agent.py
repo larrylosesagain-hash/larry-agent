@@ -957,6 +957,13 @@ def run_vip_stream():
                 threaded=False,  # blocking — runs in this thread
             )
 
+        except tweepy.errors.TooManyRequests:
+            # 429 "TooManyConnections" — Twitter still has a zombie connection from a
+            # previous deploy registered. Must wait for Twitter to kill it (~90s).
+            wait = 120
+            log.warning(f"VIP stream: too many connections (zombie from prev deploy) — waiting {wait}s for Twitter to clean up")
+            time.sleep(wait)
+            # don't escalate backoff here — this is a one-time deploy artifact
         except tweepy.errors.TwitterServerError:
             log.warning(f"VIP stream server error — reconnecting in {backoff}s")
             time.sleep(backoff)

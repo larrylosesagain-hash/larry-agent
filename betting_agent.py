@@ -213,11 +213,16 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
         w3 = None
         for rpc in _POLYGON_RPCS:
             try:
-                _w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
-                if _w3.is_connected():
-                    w3 = _w3
-                    break
-            except Exception:
+                _w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 20}))
+                # Use chain_id instead of is_connected() — is_connected() can return True
+                # without an actual working connection in some web3.py versions.
+                # chain_id makes a real eth_chainId RPC call; raises on failure.
+                _ = _w3.eth.chain_id
+                w3 = _w3
+                log.info(f"Connected to Polygon via {rpc}")
+                break
+            except Exception as rpc_err:
+                log.warning(f"Polygon RPC {rpc} unreachable: {type(rpc_err).__name__}")
                 continue
         if w3 is None:
             log.error("Cannot connect to any Polygon RPC for claim — tried all fallbacks")
@@ -456,11 +461,18 @@ def fetch_active_markets() -> list:
     combined = anchor + scan + fresh
     random.shuffle(combined)  # mix so Claude doesn't bias by list position
 
-    log.info(
-        f"🔎 Scan page {_scan_page-1 if _scan_page > 0 else 9}/10 (offset={scan_offset}) | "
-        f"anchor={len(anchor)} scan={len(scan)} fresh={len(fresh)} → "
-        f"sending all {len(combined)} to Claude"
-    )
+    if combined:
+        log.info(
+            f"🔎 Scan page {_scan_page-1 if _scan_page > 0 else 9}/10 (offset={scan_offset}) | "
+            f"anchor={len(anchor)} scan={len(scan)} fresh={len(fresh)} → "
+            f"sending all {len(combined)} to Claude"
+        )
+    else:
+        log.warning(
+            f"🔎 Scan page {_scan_page-1 if _scan_page > 0 else 9}/10 | "
+            f"anchor={len(anchor)} scan={len(scan)} fresh={len(fresh)} → "
+            f"no markets in 24h window right now (Gamma may be between market cycles)"
+        )
     return combined
 
 
