@@ -400,7 +400,10 @@ def fetch_active_markets() -> list:
         """Parse with tighter time filter: resolves within 24h AND not in the next 30min."""
         out = []
         for m in raw:
-            end_date_str = m.get("endDate") or m.get("end_date_iso")
+            # Try all known Gamma API field name variations for end date
+            end_date_str = (m.get("endDate") or m.get("end_date") or
+                            m.get("end_date_iso") or m.get("endDateIso") or
+                            m.get("end_date_utc") or m.get("endDateUtc"))
             if not end_date_str:
                 continue
             try:
@@ -488,6 +491,7 @@ def fetch_active_markets() -> list:
                 continue
         return out
 
+    log.debug(f"🌐 Raw Gamma counts: anchor={len(raw_anchor)}, scan={len(raw_scan)}, fresh={len(raw_fresh)}")
     anchor = parse_strict(raw_anchor)
     scan   = parse_strict(raw_scan)
     fresh  = parse_strict(raw_fresh)
@@ -497,7 +501,7 @@ def fetch_active_markets() -> list:
     if not anchor and not scan and not fresh and cutoff <= now + timedelta(hours=25):
         cutoff = now + timedelta(hours=48)
         end_max = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
-        log.info("⚠️  parse_strict returned 0 markets — expanding to 48h fallback")
+        log.info(f"⚠️  parse_strict returned 0 markets (raw: a={len(raw_anchor)}/s={len(raw_scan)}/f={len(raw_fresh)}) — expanding to 48h fallback")
         with ThreadPoolExecutor(max_workers=3) as ex:
             f_anchor = ex.submit(_fetch_gamma_raw, "volume24hr", False, 500, 0,           end_min, end_max)
             f_scan   = ex.submit(_fetch_gamma_raw, "volume24hr", False, 500, scan_offset, end_min, end_max)
@@ -505,9 +509,25 @@ def fetch_active_markets() -> list:
             raw_anchor = f_anchor.result()
             raw_scan   = f_scan.result()
             raw_fresh  = f_fresh.result()
+        log.debug(f"🌐 48h raw counts: anchor={len(raw_anchor)}, scan={len(raw_scan)}, fresh={len(raw_fresh)}")
         anchor = parse_strict(raw_anchor)
         scan   = parse_strict(raw_scan)
         fresh  = parse_strict(raw_fresh)
+
+    # 7-day broad fallback — if 48h still empty, fetch without any date filter
+    # and let parse_strict handle the wider window. Catches market cycles gaps.
+    if not anchor and not scan and not fresh:
+        cutoff = now + timedelta(days=7)
+        log.info(f"⚠️  48h fallback still empty (raw: a={len(raw_anchor)}/s={len(raw_scan)}/f={len(raw_fresh)}) — trying 7-day broad fetch (no server-side date filter)")
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_anchor = ex.submit(_fetch_gamma_raw, "volume24hr", False, 500, 0,   None, None)
+            f_fresh  = ex.submit(_fetch_gamma_raw, "createdAt",  False, 200, 0,   None, None)
+            raw_anchor = f_anchor.result()
+            raw_fresh  = f_fresh.result()
+        log.info(f"🌐 7-day raw counts: anchor={len(raw_anchor)}, fresh={len(raw_fresh)}")
+        anchor = parse_strict(raw_anchor)
+        fresh  = parse_strict(raw_fresh)
+        scan   = []
 
     # Deduplicate: scan and fresh shouldn't repeat what anchor already has
     anchor_ids = {m["condition_id"] for m in anchor}
@@ -706,7 +726,8 @@ def _check_single_bet(bet: dict) -> dict | None:
 
         # ── Secondary path: end_date expired 4h+ ago but CLOB not closed yet ──
         # CLOB can lag behind by hours. Gamma resolves faster.
-        end_date_str = market.get("endDate") or market.get("end_date_iso")
+        end_date_str = (market.get("endDate") or market.get("end_date") or
+                        market.get("end_date_iso") or market.get("endDateIso"))
         if end_date_str:
             try:
                 end_date = datetime.fromisoformat(
@@ -751,24 +772,26 @@ def check_pending_bets(client: ClobClient):
         payout = r["payout"]
 
         if won:
-            # FIX: CLAIM FIRST — then resolve + update bankroll.
-            # Old order: resolve → update bankroll → claim
-            # Problem: if claim fails, DB says WON and bankroll shows money Larry can't spend.
-            # New order: claim → resolve → update bankroll
-            # If claim fails: still mark WON (it IS won), log prominently for manual claim.
+            # Try on-chain claim (needs MATIC gas). If no MATIC — user claims manually on polymarket.com,
+            # which is gasless (Polymarket pays gas through their relayer).
+            # IMPORTANT: only update bankroll if claim actually succeeded.
+            # If claim fails, bankroll stays unchanged — sync_bankroll_from_clob at next
+            # startup will reconcile once user claims manually.
             claimed = claim_winnings(
                 condition_id=bet["polymarket_id"],
                 outcome=bet["outcome"],
                 payout=payout,
             )
             resolve_bet(bet["polymarket_id"], True, payout)
-            bankroll = get_bankroll()
-            new_balance = bankroll + payout
-            set_bankroll(new_balance, payout, "WIN")
             if claimed:
+                bankroll = get_bankroll()
+                new_balance = bankroll + payout
+                set_bankroll(new_balance, payout, "WIN")
                 log.info(f"🎉 WON ${payout:.2f} + auto-claimed! New bankroll: ${new_balance:.2f}")
             else:
-                log.warning(f"🎉 WON ${payout:.2f} but auto-claim failed — claim manually on polymarket.com. Bankroll: ${new_balance:.2f}")
+                # Don't inflate bankroll — CLOB doesn't have the money yet.
+                # polymarket.com → claim manually (gasless) → bankroll syncs on next restart.
+                log.info(f"🎉 WON ${payout:.2f} — claim on polymarket.com (bankroll syncs on next restart)")
         else:
             resolve_bet(bet["polymarket_id"], False, 0.0)
             bankroll = get_bankroll()
@@ -855,6 +878,14 @@ def run_betting_agent():
 
     client = get_clob_client()
 
+    # Log signer address so user knows where to send MATIC for gas
+    try:
+        from web3 import Web3 as _W3
+        _signer_addr = _W3.eth.account.from_key(POLYMARKET_PRIVATE_KEY).address
+        log.info(f"🔑 Signer wallet: {_signer_addr} — needs MATIC for auto-claim gas")
+    except Exception:
+        pass
+
     # Step 1: Clear zombie bets (resolved/phantom bets stuck in DB)
     # Must run BEFORE sync so that cleared bets don't inflate "exposure" after sync.
     # Does NOT touch bankroll — sync owns that number.
@@ -865,9 +896,18 @@ def run_betting_agent():
     # claimed ones) and any phantom bets that never actually consumed USDC.
     sync_bankroll_from_clob(client)
 
+    _cycle_count = 0  # for periodic CLOB sync
+
     while not _betting_shutdown:
         try:
             log.info("--- Betting cycle starting ---")
+
+            # Periodic CLOB sync every 4 cycles (~2h) — keeps bankroll accurate
+            # after manual claims on polymarket.com without needing a restart
+            _cycle_count += 1
+            if _cycle_count % 4 == 0:
+                log.info("🔄 Periodic balance sync with CLOB...")
+                sync_bankroll_from_clob(client)
 
             # 1. Check if pending bets resolved
             check_pending_bets(client)
