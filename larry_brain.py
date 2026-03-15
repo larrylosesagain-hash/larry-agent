@@ -15,7 +15,7 @@ from config import MIN_BET_PCT, MAX_BET_PCT, ABSOLUTE_MIN_BET, ABSOLUTE_MAX_BET
 # Haiku for tweets/replies — fast, cheap, handles short creative text perfectly
 # Sonnet (CLAUDE_MODEL) stays for betting decisions — needs real reasoning
 TWEET_MODEL = "claude-haiku-4-5-20251001"
-from database import get_bankroll, get_win_streak, get_recent_bets, get_pending_bets, get_grandma_balance, get_connection
+from database import get_bankroll, get_win_streak, get_recent_bets, get_pending_bets, get_connection
 
 log = logging.getLogger(__name__)
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -448,7 +448,6 @@ def ask_larry_for_tweet(context_type: str, extra_data: dict = None, model: str =
             f"Short tweet blaming the market/rigging. Move on quickly."
         ),
         "FRIDAY":          "It's Friday, Larry ordered Domino's. Short casual tweet about it, not a performance.",
-        "GRANDMA":         f"Grandma sent ${extra_data.get('amount', 200)}. Short tweet, genuine moment, brief.",
         # RANDOM: give Larry's actual portfolio context — makes tweets feel grounded
         "RANDOM":          (
             f"Larry tweets a random thought. State: {ctx['emotional_state']}. "

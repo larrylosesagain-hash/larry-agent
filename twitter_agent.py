@@ -133,8 +133,10 @@ def get_today_tweet_stats() -> dict:
     try:
         row = conn.execute("""
             SELECT
-                SUM(CASE WHEN tweet_type != 'REPLY' THEN 1 ELSE 0 END) as own_count,
-                SUM(CASE WHEN tweet_type  = 'REPLY' THEN 1 ELSE 0 END) as reply_count
+                SUM(CASE WHEN tweet_type NOT IN ('REPLY','WHITELIST_REPLY','VIP_REPLY','RETWEET')
+                         THEN 1 ELSE 0 END) as own_count,
+                SUM(CASE WHEN tweet_type IN ('REPLY','WHITELIST_REPLY','VIP_REPLY')
+                         THEN 1 ELSE 0 END) as reply_count
             FROM tweets
             WHERE DATE(posted_at) = DATE('now')
         """).fetchone()
@@ -405,11 +407,18 @@ def maybe_tweet_weekly_recap():
 MILESTONES = [200, 500, 1000, 2000, 5000, 10000]
 
 def check_milestones():
-    """Tweet when Larry hits a bankroll milestone for the first time."""
+    """Tweet when Larry hits a bankroll milestone for the first time.
+    Uses total net worth (free cash + in-play) — otherwise milestone never fires
+    when most money is locked in open bets."""
     bankroll = get_bankroll()
+    try:
+        in_play = sum(float(b.get("amount_usdc", 0)) for b in get_pending_bets())
+    except Exception:
+        in_play = 0.0
+    total = bankroll + in_play
     for milestone in MILESTONES:
         key = f"milestone_{milestone}_tweeted"
-        if bankroll >= milestone and get_state(key) != "true":
+        if total >= milestone and get_state(key) != "true":
             log.info(f"🏆 MILESTONE HIT: ${milestone}!")
             tweet_data = ask_larry_for_tweet(
                 "MILESTONE",
@@ -494,27 +503,16 @@ _QUOTE_ACCOUNTS = [
     "cz_binance",       # crypto, massive following
 ]
 
-def _find_quote_tweet_candidate() -> dict | None:
+def _search_tweets_from_accounts(account_list: list) -> dict | None:
     """
-    Search Twitter for a recent tweet from whitelisted accounts worth Larry commenting on.
-    Returns the best candidate or None if nothing safe/interesting found.
-    NOTE: requires Twitter Basic API ($100/month). Silently returns None on free tier.
+    Core search: find a recent tweet from the given account list.
+    Returns best candidate by engagement score, or None.
     """
+    if not account_list:
+        return None
     try:
         client = get_twitter_client()
-
-        # Filter out accounts that have had quote tweet blocked (account-level 403)
-        now_dt = datetime.utcnow()
-        available_accounts = [
-            a for a in _QUOTE_ACCOUNTS
-            if _quote_account_blacklist.get(a, datetime.min) < now_dt
-        ]
-        if not available_accounts:
-            log.debug("All quote accounts currently blacklisted — skipping")
-            return None
-
-        # Pick a random subset of accounts and search their recent tweets
-        accounts = random.sample(available_accounts, min(5, len(available_accounts)))
+        accounts = random.sample(account_list, min(5, len(account_list)))
         from_query = " OR ".join(f"from:{a}" for a in accounts)
         query = f"({from_query}) -is:retweet -is:reply lang:en"
 
@@ -538,12 +536,11 @@ def _find_quote_tweet_candidate() -> dict | None:
         for tweet in response.data:
             text = tweet.text
             if str(tweet.id) in _quote_blocked_ids:
-                continue  # this tweet has quote restrictions — skip
+                continue
             if not _is_safe_to_engage(text):
                 continue
             user = users.get(tweet.author_id, {})
             metrics = tweet.public_metrics or {}
-            # Whitelisted accounts — no follower minimum needed, we already trust them
             score = (
                 metrics.get("like_count", 0) * 2 +
                 metrics.get("retweet_count", 0) * 3 +
@@ -555,14 +552,35 @@ def _find_quote_tweet_candidate() -> dict | None:
                 "username": user.get("username", ""),
                 "score": score,
             })
-
-        if not candidates:
-            return None
-        return max(candidates, key=lambda x: x["score"])
-
-    except Exception as e:
-        log.debug(f"Quote tweet search unavailable: {type(e).__name__}")
+        return max(candidates, key=lambda x: x["score"]) if candidates else None
+    except tweepy.errors.Unauthorized:
+        log.warning("Tweet search: Unauthorized — Basic tier required")
         return None
+    except Exception as e:
+        log.warning(f"Tweet search failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _find_quote_tweet_candidate() -> dict | None:
+    """
+    Search Twitter for a recent tweet from whitelisted accounts worth Larry commenting on.
+    Returns the best candidate or None if nothing safe/interesting found.
+    NOTE: requires Twitter Basic API ($100/month). Silently returns None on free tier.
+
+    Uses ALL _QUOTE_ACCOUNTS (including VIP). For quote tweets and retweets the VIP
+    accounts are fine — it's only in maybe_reply_to_whitelist where we need to avoid them
+    (to prevent double-replying with the VIP stream).
+    """
+    now_dt = datetime.utcnow()
+    available_accounts = [
+        a for a in _QUOTE_ACCOUNTS
+        if _quote_account_blacklist.get(a, datetime.min) < now_dt
+    ]
+    if not available_accounts:
+        log.debug("All quote accounts currently blacklisted — skipping")
+        return None
+
+    return _search_tweets_from_accounts(available_accounts)
 
 
 def maybe_quote_tweet():
@@ -671,7 +689,7 @@ def maybe_retweet():
         log.info(f"🔁 Retweeted @{candidate['username']}: {candidate['text'][:60]}...")
         set_state("last_retweet_time", now.isoformat())
     except Exception as e:
-        log.debug(f"Retweet failed: {type(e).__name__}: {e}")
+        log.warning(f"Retweet failed: {type(e).__name__}: {e}")
 
 
 # ─── REPLIES TO WHITELIST ──────────────────────────────────────────────────────
@@ -680,24 +698,42 @@ def maybe_reply_to_whitelist():
     """
     Larry drops a comment under a tweet from a whitelisted account.
     Different from quote tweet — appears as a reply thread under their post.
-    ~2 per day. Throttled: min 8 hours. 40% chance when eligible.
+    ~4-5 per day. Throttled: min 2 hours. 70% chance when eligible.
+
+    IMPORTANT: searches ONLY non-VIP accounts.
+    VIP accounts (elonmusk, realDonaldTrump, polymarket) are covered by the real-time
+    VIP stream. Using _get_cycle_candidate() here was wrong — those top accounts
+    dominate the score ranking (millions of likes), so the shared candidate was always
+    a VIP account, the skip-VIP check fired, and Larry NEVER replied to anyone.
+    Fix: separate search for non-VIP accounts only.
     """
     now = datetime.utcnow()
-    if now.hour < 9 or now.hour >= 22:
+    if now.hour < 8 or now.hour >= 23:
         return
 
     last_wr = get_state("last_whitelist_reply_time")
     if last_wr:
         try:
-            if (now - datetime.fromisoformat(last_wr)).total_seconds() < 8 * 3600:
+            if (now - datetime.fromisoformat(last_wr)).total_seconds() < 2 * 3600:
                 return
         except Exception:
             pass
 
-    if random.random() > 0.40:
+    if random.random() > 0.70:
         return
 
-    candidate = _get_cycle_candidate()
+    # Search only non-VIP accounts — VIPs are handled by the real-time stream
+    vip_lower = {a.lower() for a in _VIP_STREAM_ACCOUNTS}
+    now_dt = datetime.utcnow()
+    non_vip_accounts = [
+        a for a in _QUOTE_ACCOUNTS
+        if a.lower() not in vip_lower
+        and _quote_account_blacklist.get(a, datetime.min) < now_dt
+    ]
+    if not non_vip_accounts:
+        return
+
+    candidate = _search_tweets_from_accounts(non_vip_accounts)
     if not candidate:
         return
 
@@ -724,7 +760,7 @@ def maybe_reply_to_whitelist():
         set_state("last_whitelist_reply_time", now.isoformat())
         like_tweet(candidate["tweet_id"])
     except Exception as e:
-        log.debug(f"Whitelist reply failed: {type(e).__name__}: {e}")
+        log.warning(f"Whitelist reply failed: {type(e).__name__}: {e}")
 
 
 # ─── PRICE MOVE REACTIONS ─────────────────────────────────────────────────────
@@ -754,10 +790,19 @@ def maybe_react_to_price_moves():
         if not market_id:
             return
 
-        resp = requests.get(f"{POLYMARKET_GAMMA_API}/markets/{market_id}", timeout=5)
+        # FIX: Gamma single-market lookup is /markets?conditionIds={id}, NOT /markets/{id}
+        # The path-style endpoint returns 404; query-param style returns list with one item.
+        resp = requests.get(
+            f"{POLYMARKET_GAMMA_API}/markets",
+            params={"conditionIds": market_id},
+            timeout=5,
+        )
         if resp.status_code != 200:
             return
-        market = resp.json()
+        data = resp.json()
+        market = data[0] if isinstance(data, list) and data else data
+        if not market:
+            return
 
         current_price = float(market.get("bestAsk") or market.get("lastTradePrice") or 0.5)
         original_odds = float(bet.get("odds", current_price))
@@ -790,7 +835,7 @@ def maybe_react_to_price_moves():
             set_state("last_price_react_time", datetime.utcnow().isoformat())
 
     except Exception as e:
-        log.debug(f"Price move react failed: {type(e).__name__}")
+        log.warning(f"Price move react failed: {type(e).__name__}: {e}")
 
 
 # ─── VIP STREAM (real-time engagement farming) ────────────────────────────────
@@ -799,40 +844,15 @@ def maybe_react_to_price_moves():
 # in real-time the moment they're posted. No polling. Latency: ~5-10 seconds.
 # Requires Basic tier ($100/mo). Silently skips if unavailable.
 #
-# VIP accounts Larry monitors and replies to immediately:
-_VIP_STREAM_ACCOUNTS = ["elonmusk", "realDonaldTrump", "polymarket"]
+# VIP accounts Larry monitors and replies to immediately via filtered stream.
+# Only Elon — every tweet, 24/7, no per-account cooldown.
+_VIP_STREAM_ACCOUNTS = ["elonmusk"]
 
-# Per-account cooldown: max 1 reply per 2 hours to avoid spamming one thread
-# Persisted in DB so Railway redeploys don't reset it (was replying immediately after restart)
-_VIP_REPLIED_UNTIL: dict = {}
-
-def _load_vip_cooldowns():
-    """Load persisted VIP reply cooldowns from DB on startup."""
-    global _VIP_REPLIED_UNTIL
-    raw = get_state("vip_replied_until")
-    if not raw:
-        return
-    try:
-        data = json.loads(raw)
-        now = datetime.utcnow()
-        _VIP_REPLIED_UNTIL = {
-            k: datetime.fromisoformat(v)
-            for k, v in data.items()
-            if datetime.fromisoformat(v) > now  # only load unexpired entries
-        }
-        if _VIP_REPLIED_UNTIL:
-            log.info(f"⚡ Loaded VIP cooldowns: {list(_VIP_REPLIED_UNTIL.keys())}")
-    except Exception:
-        _VIP_REPLIED_UNTIL = {}
-
-def _save_vip_cooldowns():
-    """Persist VIP cooldowns to DB."""
-    try:
-        set_state("vip_replied_until", json.dumps(
-            {k: v.isoformat() for k, v in _VIP_REPLIED_UNTIL.items()}
-        ))
-    except Exception:
-        pass
+# Anti-spam guard: minimum seconds between consecutive VIP replies.
+# Elon sometimes posts 5 tweets in 2 minutes — without this Larry would fire
+# 5 Claude calls + 5 Twitter API calls in a row, risking rate limits.
+_VIP_REPLY_MIN_GAP_SECS = 300  # 5 minutes between replies max
+_vip_last_reply_at: datetime | None = None
 
 
 class LarryStreamClient(tweepy.StreamingClient):
@@ -853,15 +873,14 @@ class LarryStreamClient(tweepy.StreamingClient):
           response.matching_rules → list of matched stream rules (WITH tags)
         """
         try:
+            global _vip_last_reply_at
             tweet = response.data
             if not tweet:
                 return
 
             now = datetime.utcnow()
 
-            # Active hours only
-            if now.hour < 8 or now.hour >= 23:
-                return
+            # No active-hours restriction — Elon tweets 24/7, Larry replies 24/7.
 
             text = tweet.text or ""
             if not text or not _is_safe_to_engage(text):
@@ -870,20 +889,23 @@ class LarryStreamClient(tweepy.StreamingClient):
             # Figure out which VIP account this is from (via matching_rules in response)
             username = None
             if response.matching_rules:
-                tag = response.matching_rules[0].tag  # tag = "vip_elonmusk" etc.
+                tag = response.matching_rules[0].tag  # tag = "vip_elonmusk"
                 username = tag.replace("vip_", "")
             if not username:
                 return
 
-            # Per-account cooldown
-            cooldown_until = _VIP_REPLIED_UNTIL.get(username)
-            if cooldown_until and now < cooldown_until:
-                return
+            # Anti-spam: if Elon posts a burst of tweets, don't fire on every one.
+            # Reply to the first, then wait _VIP_REPLY_MIN_GAP_SECS before the next.
+            if _vip_last_reply_at:
+                secs_since = (now - _vip_last_reply_at).total_seconds()
+                if secs_since < _VIP_REPLY_MIN_GAP_SECS:
+                    log.info(f"⚡ VIP: skipping @{username} tweet (replied {secs_since:.0f}s ago, gap={_VIP_REPLY_MIN_GAP_SECS}s)")
+                    return
 
             log.info(f"⚡ VIP stream: new tweet from @{username} — replying...")
 
-            # VIP tweets (Elon/Trump/Polymarket) get Sonnet — high visibility, worth the cost
-            # A viral reply under Elon's tweet can get 10k impressions. $0.01 well spent.
+            # Sonnet for Elon replies — high visibility, worth the cost.
+            # A good reply under his tweet can get 50k+ impressions.
             tweet_data = ask_larry_for_tweet(
                 "WHITELIST_REPLY",
                 extra_data={"original_tweet": text[:200], "username": username},
@@ -902,8 +924,7 @@ class LarryStreamClient(tweepy.StreamingClient):
             save_tweet(tweet_id=reply_id, content=reply_text, tweet_type="VIP_REPLY")
             log.info(f"⚡ VIP reply to @{username}: {reply_text[:80]}...")
 
-            _VIP_REPLIED_UNTIL[username] = now + timedelta(hours=2)
-            _save_vip_cooldowns()  # persist so restarts don't reset cooldown
+            _vip_last_reply_at = now
             like_tweet(str(tweet.id))
 
         except Exception as e:
@@ -1025,7 +1046,6 @@ def run_twitter_agent():
 
     # Load persisted state from previous session
     _init_quote_blacklist()
-    _load_vip_cooldowns()
 
     # Start VIP stream in background — real-time push from Twitter, no polling
     vip_thread = threading.Thread(target=run_vip_stream, daemon=True)

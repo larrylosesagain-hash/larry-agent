@@ -573,30 +573,103 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
 
 # ─── CHECK RESOLVED BETS ──────────────────────────────────────────────────────
 
-def _check_single_bet(bet: dict) -> dict | None:
+def _resolve_from_tokens(tokens: list, outcome: str, bet: dict) -> dict | None:
+    """Helper: scan tokens list for matching outcome, return resolution dict."""
+    for token in tokens:
+        if token.get("outcome", "").upper() == outcome.upper():
+            price = float(token.get("price", 0))
+            won = price >= 0.99
+            return {"bet": bet, "won": won, "payout": bet["potential_payout"] if won else 0.0}
+    return None
+
+
+def _check_gamma_for_resolution(cid: str, bet: dict) -> dict | None:
     """
-    Check one pending bet against CLOB. Returns resolution dict or None if still open.
-    Runs in a thread — no shared state written here, only reads.
+    Fallback: ask Gamma API whether this market has resolved.
+    Used when CLOB hasn't updated 'closed' flag yet or returns 404.
     """
     try:
-        resp = requests.get(
-            f"{POLYMARKET_HOST}/markets/{bet['polymarket_id']}",
-            timeout=10
+        gm_resp = requests.get(
+            f"{POLYMARKET_GAMMA_API}/markets",
+            params={"conditionIds": cid},
+            timeout=10,
         )
+        if not gm_resp.ok:
+            return None
+        gm_list = gm_resp.json()
+        if not isinstance(gm_list, list) or not gm_list:
+            return None
+        gm = gm_list[0]
+        if not gm.get("resolved"):
+            return None  # not resolved on Gamma either
+
+        # Gamma knows the winner — find our outcome's token price
+        result = _resolve_from_tokens(gm.get("tokens") or [], bet["outcome"], bet)
+        if result:
+            return result
+        # Resolved but our outcome token missing — treat as loss to clear zombie
+        log.info(f"Gamma resolved (no token match for {bet['outcome']}) on {cid[:16]}... — treating as LOST")
+        return {"bet": bet, "won": False, "payout": 0.0}
+    except Exception:
+        return None
+
+
+def _check_single_bet(bet: dict) -> dict | None:
+    """
+    Check one pending bet against CLOB + Gamma.
+    Returns resolution dict or None if still genuinely open.
+    Runs in a thread — no shared state written here, only reads.
+
+    Resolution priority:
+      1. CLOB market.closed=True  → authoritative
+      2. CLOB 404 → try Gamma (might be resolved + purged from CLOB)
+                   → if Gamma also unknown → treat as LOST (order never filled / purged)
+      3. end_date + 4h passed but CLOB still "active" → Gamma fallback
+         (CLOB sometimes lags marking markets closed by hours)
+    """
+    cid = bet["polymarket_id"]
+    try:
+        resp = requests.get(f"{POLYMARKET_HOST}/markets/{cid}", timeout=10)
+
+        # ── CLOB 404: market purged, try Gamma before giving up ───────────────
+        if resp.status_code == 404:
+            log.warning(f"Bet {cid[:16]}... returned 404 from CLOB — checking Gamma")
+            gamma_result = _check_gamma_for_resolution(cid, bet)
+            if gamma_result:
+                return gamma_result
+            # Gamma also doesn't know it — order was never filled or fully expired
+            log.warning(f"Bet {cid[:16]}... not found on CLOB or Gamma — removing as phantom")
+            return {"bet": bet, "won": False, "payout": 0.0}
+
         resp.raise_for_status()
         market = resp.json()
-        if not market.get("closed", False):
-            return None  # still open
 
-        tokens = market.get("tokens", [])
-        for token in tokens:
-            if token.get("outcome", "").upper() == bet["outcome"].upper():
-                price = float(token.get("price", 0))
-                won = price >= 0.99
-                return {"bet": bet, "won": won, "payout": bet["potential_payout"] if won else 0.0}
+        # ── Primary path: CLOB says closed ────────────────────────────────────
+        if market.get("closed", False):
+            result = _resolve_from_tokens(market.get("tokens", []), bet["outcome"], bet)
+            if result:
+                return result
+            # closed but our outcome token missing — treat as loss
+            return {"bet": bet, "won": False, "payout": 0.0}
+
+        # ── Secondary path: end_date expired 4h+ ago but CLOB not closed yet ──
+        # CLOB can lag behind by hours. Gamma resolves faster.
+        end_date_str = market.get("endDate") or market.get("end_date_iso")
+        if end_date_str:
+            try:
+                end_date = datetime.fromisoformat(
+                    end_date_str.replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+                if datetime.utcnow() > end_date + timedelta(hours=4):
+                    gamma_result = _check_gamma_for_resolution(cid, bet)
+                    if gamma_result:
+                        return gamma_result
+            except (ValueError, TypeError):
+                pass
+
     except Exception as e:
-        log.error(f"Error checking bet {bet['polymarket_id']}: {e}")
-    return None
+        log.error(f"Error checking bet {cid}: {e}")
+    return None  # still genuinely open, check again next cycle
 
 
 def check_pending_bets(client: ClobClient):
@@ -672,6 +745,54 @@ def is_betting_shutdown() -> bool:
     return _betting_shutdown
 
 
+def reconcile_pending_bets():
+    """
+    Startup reconciliation: clear DB pending bets that have already resolved.
+    Handles zombie bets from: manual claims on polymarket.com, failed check cycles,
+    CLOB lag, phantom GTC orders that never filled, 404s, etc.
+
+    IMPORTANT — does NOT adjust bankroll.
+    sync_bankroll_from_clob() runs AFTER this and sets bankroll from CLOB truth.
+    Touching bankroll here would double-count manually claimed wins:
+      - User claims win manually → money already in CLOB balance
+      - sync sets DB bankroll = CLOB balance (correct, includes that payout)
+      - If reconcile ALSO does bankroll += payout → double-counted, Larry bets too much
+    Solution: reconcile only cleans up the bets table. sync owns the bankroll number.
+    """
+    # get_pending_bets and resolve_bet are already imported at the top of this file
+    pending = get_pending_bets()
+    if not pending:
+        return
+    log.info(f"🔍 Startup reconciliation: checking {len(pending)} pending bets for stale entries...")
+    resolved_count = 0
+    with ThreadPoolExecutor(max_workers=min(len(pending), 8)) as ex:
+        futures = {ex.submit(_check_single_bet, bet): bet for bet in pending}
+        for future in as_completed(futures, timeout=60):
+            result = future.result()
+            if not result:
+                continue
+            bet    = result["bet"]
+            won    = result["won"]
+            payout = result["payout"]
+            if won:
+                # Try to claim — if already claimed manually, tx reverts harmlessly
+                claim_winnings(
+                    condition_id=bet["polymarket_id"],
+                    outcome=bet["outcome"],
+                    payout=payout,
+                )
+            # Mark resolved in DB — bankroll NOT modified here (sync_bankroll runs after)
+            resolve_bet(bet["polymarket_id"], won, payout if won else 0.0)
+            label = f"WIN +${payout:.2f}" if won else f"LOSS/PHANTOM ${bet.get('amount_usdc', 0):.2f}"
+            log.info(f"🗑️  Reconciled {label}: {bet.get('question', '?')[:50]}")
+            resolved_count += 1
+    remaining = len(get_pending_bets())
+    if resolved_count:
+        log.info(f"✅ Reconciliation: cleared {resolved_count} stale bets → {remaining} open remain")
+    else:
+        log.info(f"✅ Reconciliation: all {len(pending)} bets still genuinely open")
+
+
 def run_betting_agent():
     log.info("🎰 Larry's Betting Agent starting up...")
     init_db()
@@ -682,7 +803,14 @@ def run_betting_agent():
 
     client = get_clob_client()
 
-    # Sync real CLOB balance at startup so Larry knows his actual bankroll
+    # Step 1: Clear zombie bets (resolved/phantom bets stuck in DB)
+    # Must run BEFORE sync so that cleared bets don't inflate "exposure" after sync.
+    # Does NOT touch bankroll — sync owns that number.
+    reconcile_pending_bets()
+
+    # Step 2: Sync bankroll from CLOB AFTER reconcile.
+    # CLOB balance is ground truth: it already reflects all wins (including manually
+    # claimed ones) and any phantom bets that never actually consumed USDC.
     sync_bankroll_from_clob(client)
 
     while not _betting_shutdown:
@@ -692,16 +820,13 @@ def run_betting_agent():
             # 1. Check if pending bets resolved
             check_pending_bets(client)
 
-            # 2. Check bankroll exposure — stop placing new bets if 80%+ of TOTAL is already in play
-            # total = free cash + open bets (bankroll already has placed bets deducted)
+            # 2. Check free bankroll — bet until it hits zero (no exposure cap)
             open_bets = get_pending_bets()
             bankroll = get_bankroll()
             open_exposure = sum(float(b.get("amount_usdc", 0)) for b in open_bets)
-            total = bankroll + open_exposure
-            max_exposure = total * 0.80
-            log.info(f"💼 Bankroll: ${bankroll:.2f} free | ${open_exposure:.2f} in {len(open_bets)} open bets | ${total:.2f} total (limit: 80%)")
-            if open_exposure >= max_exposure:
-                log.info(f"Exposure limit reached: ${open_exposure:.2f} of ${total:.2f} total in play ({open_exposure/total*100:.0f}%), skipping new bets")
+            log.info(f"💼 Bankroll: ${bankroll:.2f} free | ${open_exposure:.2f} in {len(open_bets)} open bets")
+            if bankroll <= 0:
+                log.info("No free bankroll remaining — waiting for open bets to resolve")
             else:
                 # 4. Fetch markets — three parallel Gamma batches, 24h window
                 markets = fetch_active_markets()
@@ -746,11 +871,8 @@ def run_betting_agent():
                                     _cache_pass(mid, m_info.get("yes_price", 0.5), m_info.get("hours_to_end", 24))
                             continue
 
-                        pending_now = get_pending_bets()
-                        current_exposure = sum(float(b.get("amount_usdc", 0)) for b in pending_now)
-                        current_total = get_bankroll() + current_exposure
-                        if current_exposure >= current_total * 0.80:
-                            log.info(f"Reached exposure limit mid-loop (${current_exposure:.2f} of ${current_total:.2f}), stopping")
+                        if get_bankroll() <= 0:
+                            log.info("Bankroll empty — stopping mid-loop")
                             break
 
                         # Resolve market_info once — reused for DB save and odds
