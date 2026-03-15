@@ -929,11 +929,19 @@ def run_vip_stream():
     Background thread — connects to Twitter Filtered Stream and listens forever.
     Auto-reconnects on disconnect with exponential backoff.
     Requires Basic API tier. Silently exits if unavailable.
+
+    BUG FIXED: tweepy's stream.filter() catches ConnectTimeout internally, calls
+    on_connection_error(), then returns normally — no exception raised. This caused
+    the `else: backoff = 5` branch to fire on every timeout, resetting backoff and
+    spinning at ~60s intervals for hours. Fix: track how long we were actually
+    connected. If stream.filter() returns in under 30s, treat it as a failure and
+    apply backoff rather than resetting to 5.
     """
     log.info("⚡ VIP stream starting...")
     backoff = 5
 
     while True:
+        connected_at = None
         try:
             stream = LarryStreamClient(bearer_token=TWITTER_BEARER_TOKEN)
             _setup_stream_rules(stream)
@@ -942,6 +950,7 @@ def run_vip_stream():
             # for every tweet — it does NOT need to be listed in tweet_fields (and Twitter
             # will reject the request with a 400 if you do include it there).
             # tweet.matching_rules is available on the response object without any extra fields.
+            connected_at = datetime.utcnow()
             stream.filter(
                 tweet_fields=["id", "text", "author_id"],
                 expansions=["author_id"],
@@ -956,11 +965,21 @@ def run_vip_stream():
             log.warning("VIP stream: unauthorized — Basic tier required, disabling")
             return  # give up — not available on free tier
         except Exception as e:
-            log.debug(f"VIP stream error: {type(e).__name__}: {e} — reconnecting in {backoff}s")
+            log.warning(f"VIP stream error: {type(e).__name__}: {e} — reconnecting in {backoff}s")
             time.sleep(backoff)
             backoff = min(backoff * 2, 300)
         else:
-            backoff = 5  # reset backoff on clean disconnect
+            # stream.filter() returned without raising — but was it a real clean disconnect,
+            # or an immediate ConnectTimeout handled silently inside tweepy?
+            session_secs = (datetime.utcnow() - connected_at).total_seconds() if connected_at else 0
+            if session_secs >= 30:
+                backoff = 5  # genuinely connected for a while — reset backoff
+                log.info(f"VIP stream disconnected after {session_secs:.0f}s — reconnecting")
+            else:
+                # Rapid disconnect — network was likely down, apply full backoff
+                log.warning(f"VIP stream disconnected after only {session_secs:.0f}s — reconnecting in {backoff}s")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 300)
 
 
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
@@ -973,6 +992,9 @@ def set_twitter_shutdown():
     global _twitter_shutdown
     _twitter_shutdown = True
     log.info("🛑 Twitter agent shutdown requested — will exit after current cycle")
+
+def is_twitter_shutdown() -> bool:
+    return _twitter_shutdown
 
 
 def run_twitter_agent():

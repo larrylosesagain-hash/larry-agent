@@ -639,6 +639,9 @@ def set_betting_shutdown():
     _betting_shutdown = True
     log.info("🛑 Betting agent shutdown requested — will exit after current cycle")
 
+def is_betting_shutdown() -> bool:
+    return _betting_shutdown
+
 
 def run_betting_agent():
     log.info("🎰 Larry's Betting Agent starting up...")

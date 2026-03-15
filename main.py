@@ -5,12 +5,13 @@ SIGTERM/SIGINT are handled here (main thread only) and propagated to both agents
 """
 
 import sys
+import time
 import signal
 import threading
 import logging
 
-from twitter_agent import run_twitter_agent, set_twitter_shutdown
-from betting_agent import run_betting_agent, set_betting_shutdown
+from twitter_agent import run_twitter_agent, set_twitter_shutdown, is_twitter_shutdown
+from betting_agent import run_betting_agent, set_betting_shutdown, is_betting_shutdown
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,17 +33,33 @@ def _handle_sigterm(signum, frame):
 
 
 def run_twitter():
-    try:
-        run_twitter_agent()
-    except Exception as e:
-        log.error(f"Twitter agent crashed: {e}")
+    """Wraps run_twitter_agent with automatic restart on crash."""
+    while True:
+        try:
+            run_twitter_agent()
+            return  # clean exit — shutdown was requested
+        except Exception as e:
+            if is_twitter_shutdown():
+                return
+            log.error(f"Twitter agent crashed: {type(e).__name__}: {e} — restarting in 60s")
+            time.sleep(60)
 
 
 def run_betting():
-    try:
-        run_betting_agent()
-    except Exception as e:
-        log.error(f"Betting agent crashed: {e}")
+    """Wraps run_betting_agent with automatic restart on crash.
+    Railway containers start before the network is fully up — the CLOB client
+    may fail with a PolyApiException on the very first connect attempt.
+    Without this loop that crash would kill the betting thread permanently.
+    """
+    while True:
+        try:
+            run_betting_agent()
+            return  # clean exit — shutdown was requested
+        except Exception as e:
+            if is_betting_shutdown():
+                return
+            log.error(f"Betting agent crashed: {type(e).__name__}: {e} — restarting in 60s")
+            time.sleep(60)
 
 
 if __name__ == "__main__":
