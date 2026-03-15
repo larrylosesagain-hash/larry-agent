@@ -29,10 +29,12 @@ _CTF_ADDRESS  = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA047
 _USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
 # Multiple RPC fallbacks — polygon-rpc.com is unreliable, try others if it fails
 _POLYGON_RPCS = [
-    "https://polygon-rpc.com",
-    "https://rpc.ankr.com/polygon",
-    "https://polygon.llamarpc.com",
-    "https://matic-mainnet.chainstacklabs.com",
+    # Verified working free public endpoints (March 2026)
+    # Old list (polygon-rpc.com → 401, ankr → needs API key, llamarpc → DNS dead)
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://1rpc.io/matic",
+    "https://polygon.drpc.org",
+    "https://rpc-mainnet.matic.quiknode.pro",
 ]
 _CTF_ABI = [{
     "inputs": [
@@ -343,6 +345,21 @@ def fetch_active_markets() -> list:
         raw_anchor = f_anchor.result()
         raw_scan   = f_scan.result()
         raw_fresh  = f_fresh.result()
+
+    # 48h fallback — if 24h window is completely empty (Sunday morning gaps, overnight
+    # market resolution with no new day markets yet), expand to 48h so Larry still has
+    # something to bet on instead of spinning idle for hours.
+    if not raw_anchor and not raw_scan and not raw_fresh:
+        cutoff = now + timedelta(hours=48)
+        end_max = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+        log.info("⚠️  24h window returned 0 markets — expanding to 48h fallback")
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            f_anchor = ex.submit(_fetch_gamma_raw, "volume24hr", False, 500, 0,           end_min, end_max)
+            f_scan   = ex.submit(_fetch_gamma_raw, "volume24hr", False, 500, scan_offset, end_min, end_max)
+            f_fresh  = ex.submit(_fetch_gamma_raw, "createdAt",  False, 200, 0,           end_min, end_max)
+            raw_anchor = f_anchor.result()
+            raw_scan   = f_scan.result()
+            raw_fresh  = f_fresh.result()
 
     def parse_strict(raw):
         """Parse with tighter time filter: resolves within 24h AND not in the next 30min."""
@@ -682,6 +699,7 @@ def run_betting_agent():
             open_exposure = sum(float(b.get("amount_usdc", 0)) for b in open_bets)
             total = bankroll + open_exposure
             max_exposure = total * 0.80
+            log.info(f"💼 Bankroll: ${bankroll:.2f} free | ${open_exposure:.2f} in {len(open_bets)} open bets | ${total:.2f} total (limit: 80%)")
             if open_exposure >= max_exposure:
                 log.info(f"Exposure limit reached: ${open_exposure:.2f} of ${total:.2f} total in play ({open_exposure/total*100:.0f}%), skipping new bets")
             else:
@@ -701,9 +719,13 @@ def run_betting_agent():
                         and not _is_token_blacklisted(m["condition_id"])
                         and not _is_pass_cached(m)
                     ]
-                    skipped = len(markets) - len(fresh_markets)
-                    if skipped:
-                        log.info(f"Skipped {skipped} markets (open bets / no-token / already passed) — sending {len(fresh_markets)} fresh to Claude")
+                    skipped_open  = sum(1 for m in markets if m["condition_id"].lower() in open_bet_ids or m.get("question","").lower().strip() in open_questions)
+                    skipped_pass  = sum(1 for m in markets if _is_pass_cached(m))
+                    skipped_token = len(markets) - len(fresh_markets) - skipped_open - skipped_pass
+                    log.info(
+                        f"Filter: {len(markets)} total → {len(fresh_markets)} fresh "
+                        f"(open_bets={skipped_open}, pass_cache={skipped_pass} [{len(_pass_cache)} cached], blacklist/token={skipped_token})"
+                    )
                     markets = fresh_markets
 
                 if markets:

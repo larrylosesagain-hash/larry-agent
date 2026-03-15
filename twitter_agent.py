@@ -838,8 +838,25 @@ def _save_vip_cooldowns():
 class LarryStreamClient(tweepy.StreamingClient):
     """Tweepy v4 streaming client — receives VIP tweets in real-time."""
 
-    def on_tweet(self, tweet):
+    def on_response(self, response):
+        """
+        BUG FIX: Must override on_response, NOT on_tweet.
+
+        In Tweepy 4.x, on_tweet(tweet) receives only the Tweet object built from
+        data["data"]. The matching_rules field lives at the ROOT of the API response
+        (data["matching_rules"]), NOT inside data["data"] — so tweet.matching_rules
+        is ALWAYS None, username stays None, and the old handler returned silently
+        on every single tweet without ever replying.
+
+        on_response(response) receives the full StreamResponse which has:
+          response.data           → the Tweet object
+          response.matching_rules → list of matched stream rules (WITH tags)
+        """
         try:
+            tweet = response.data
+            if not tweet:
+                return
+
             now = datetime.utcnow()
 
             # Active hours only
@@ -850,10 +867,10 @@ class LarryStreamClient(tweepy.StreamingClient):
             if not text or not _is_safe_to_engage(text):
                 return
 
-            # Figure out which VIP account this is from (via matching_rules tag)
+            # Figure out which VIP account this is from (via matching_rules in response)
             username = None
-            if hasattr(tweet, "matching_rules") and tweet.matching_rules:
-                tag = tweet.matching_rules[0].tag  # tag = "vip_elonmusk" etc.
+            if response.matching_rules:
+                tag = response.matching_rules[0].tag  # tag = "vip_elonmusk" etc.
                 username = tag.replace("vip_", "")
             if not username:
                 return
@@ -877,11 +894,11 @@ class LarryStreamClient(tweepy.StreamingClient):
                 return
 
             client = get_twitter_client()
-            response = client.create_tweet(
+            reply_resp = client.create_tweet(
                 text=reply_text,
                 in_reply_to_tweet_id=str(tweet.id),
             )
-            reply_id = str(response.data["id"])
+            reply_id = str(reply_resp.data["id"])
             save_tweet(tweet_id=reply_id, content=reply_text, tweet_type="VIP_REPLY")
             log.info(f"⚡ VIP reply to @{username}: {reply_text[:80]}...")
 
@@ -890,7 +907,7 @@ class LarryStreamClient(tweepy.StreamingClient):
             like_tweet(str(tweet.id))
 
         except Exception as e:
-            log.debug(f"VIP stream on_tweet error: {type(e).__name__}: {e}")
+            log.warning(f"VIP stream on_response error: {type(e).__name__}: {e}")
 
     def on_errors(self, errors):
         log.warning(f"VIP stream errors: {errors}")
@@ -899,7 +916,7 @@ class LarryStreamClient(tweepy.StreamingClient):
         log.warning("VIP stream connection closed — will reconnect")
 
     def on_exception(self, exception):
-        log.debug(f"VIP stream exception: {exception}")
+        log.warning(f"VIP stream exception: {exception}")
 
 
 def _setup_stream_rules(stream: LarryStreamClient):
@@ -946,10 +963,8 @@ def run_vip_stream():
             stream = LarryStreamClient(bearer_token=TWITTER_BEARER_TOKEN)
             _setup_stream_rules(stream)
 
-            # NOTE: matching_rules is automatically returned by the Twitter Filtered Stream API
-            # for every tweet — it does NOT need to be listed in tweet_fields (and Twitter
-            # will reject the request with a 400 if you do include it there).
-            # tweet.matching_rules is available on the response object without any extra fields.
+            # NOTE: matching_rules is returned by Twitter at the ROOT of the stream response,
+            # not inside tweet data. We access it via on_response(response).matching_rules.
             connected_at = datetime.utcnow()
             stream.filter(
                 tweet_fields=["id", "text", "author_id"],
