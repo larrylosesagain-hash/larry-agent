@@ -27,7 +27,13 @@ from py_clob_client.constants import POLYGON
 _CTF_ADDRESS  = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
 # USDC.e on Polygon (bridged) — what Polymarket settles in
 _USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-_POLYGON_RPC  = "https://polygon-rpc.com"
+# Multiple RPC fallbacks — polygon-rpc.com is unreliable, try others if it fails
+_POLYGON_RPCS = [
+    "https://polygon-rpc.com",
+    "https://rpc.ankr.com/polygon",
+    "https://polygon.llamarpc.com",
+    "https://matic-mainnet.chainstacklabs.com",
+]
 _CTF_ABI = [{
     "inputs": [
         {"name": "collateralToken",    "type": "address"},
@@ -45,12 +51,11 @@ from config import (
     POLYMARKET_PRIVATE_KEY, POLYMARKET_FUNDER,
     POLYMARKET_HOST, POLYMARKET_GAMMA_API,
     BET_CHECK_INTERVAL_MINUTES,
-    GRANDMA_INJECT_THRESHOLD, GRANDMA_INJECT_AMOUNT,
     ABSOLUTE_MIN_BET
 )
 from database import (
     get_bankroll, set_bankroll, get_pending_bets, save_bet, resolve_bet,
-    get_grandma_balance, update_grandma, init_db, get_state, set_state
+    init_db, get_state, set_state
 )
 from larry_brain import ask_larry_to_bet, ask_larry_for_tweet
 
@@ -68,14 +73,15 @@ _token_not_found_blacklist: dict = {}
 _TOKEN_BLACKLIST_TTL_HOURS = 6
 
 def _blacklist_token(condition_id: str):
-    _token_not_found_blacklist[condition_id] = datetime.utcnow() + timedelta(hours=_TOKEN_BLACKLIST_TTL_HOURS)
+    _token_not_found_blacklist[condition_id.lower()] = datetime.utcnow() + timedelta(hours=_TOKEN_BLACKLIST_TTL_HOURS)
 
 def _is_token_blacklisted(condition_id: str) -> bool:
-    expiry = _token_not_found_blacklist.get(condition_id)
+    cid = condition_id.lower()
+    expiry = _token_not_found_blacklist.get(cid)
     if expiry is None:
         return False
     if datetime.utcnow() > expiry:
-        del _token_not_found_blacklist[condition_id]  # expired — remove and allow retry
+        del _token_not_found_blacklist[cid]  # expired — remove and allow retry
         return False
     return True
 
@@ -89,7 +95,7 @@ _pass_cache: dict = {}  # condition_id → {"passed_at": datetime, "price": floa
 
 
 def _cache_pass(condition_id: str, yes_price: float, hours_to_end: int):
-    _pass_cache[condition_id] = {
+    _pass_cache[condition_id.lower()] = {
         "passed_at": datetime.utcnow(),
         "price": yes_price,
         "hours_to_end": hours_to_end,
@@ -98,7 +104,7 @@ def _cache_pass(condition_id: str, yes_price: float, hours_to_end: int):
 
 def _is_pass_cached(market: dict) -> bool:
     """Return True if Claude already passed on this market and nothing meaningful changed."""
-    cid = market["condition_id"]
+    cid = market["condition_id"].lower()
     entry = _pass_cache.get(cid)
     if not entry:
         return False
@@ -204,9 +210,17 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
       NO  position = index set 2  (binary: 10)
     """
     try:
-        w3 = Web3(Web3.HTTPProvider(_POLYGON_RPC))
-        if not w3.is_connected():
-            log.error("Cannot connect to Polygon RPC for claim")
+        w3 = None
+        for rpc in _POLYGON_RPCS:
+            try:
+                _w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
+                if _w3.is_connected():
+                    w3 = _w3
+                    break
+            except Exception:
+                continue
+        if w3 is None:
+            log.error("Cannot connect to any Polygon RPC for claim — tried all fallbacks")
             return False
 
         account = w3.eth.account.from_key(POLYMARKET_PRIVATE_KEY)
@@ -304,6 +318,10 @@ def fetch_active_markets() -> list:
     min_time = now + timedelta(minutes=30)  # skip markets resolving in under 30min (too late to fill)
 
     scan_offset = _scan_page * 500
+    # Offset=0 duplicates anchor (which also uses offset=0) — dedup would kill all scan results.
+    # Use offset=5000 (page 10) on that cycle so we still cover extra markets instead of wasting it.
+    if scan_offset == 0:
+        scan_offset = 5000
     _scan_page = (_scan_page + 1) % 10   # 10 pages × 500 = 5000 markets per rotation (~5h)
     _save_scan_page()  # persist so restarts continue from current position
 
@@ -341,7 +359,7 @@ def fetch_active_markets() -> list:
                 hours_to_end = int(delta.total_seconds() // 3600)  # FIX: .seconds only gives 0-86399s component
 
                 if m.get("negRisk") or m.get("neg_risk"):
-                    cond_id = m.get("conditionId") or m.get("condition_id")
+                    cond_id = (m.get("conditionId") or m.get("condition_id") or "").lower()
                     vol = float(m.get("volume24hr", 0))
                     cat = _guess_category(m.get("question", ""))
                     try:
@@ -372,21 +390,40 @@ def fetch_active_markets() -> list:
                         pass
                     continue
 
-                best_ask = float(m.get("bestAsk", 0.5))
-                best_bid = float(m.get("bestBid", best_ask - 0.02))
-                last_price = float(m.get("lastTradePrice") or best_ask)
-                if best_ask >= 0.97 or best_ask <= 0.03:
+                # Skip markets with no tradeable tokens in Gamma data —
+                # these will always fail at bet placement (CLOB has no token for them)
+                gamma_tokens = m.get("tokens", [])
+                if not gamma_tokens:
                     continue
 
+                # Build token map from Gamma — verify BOTH yes AND no tokens exist and are liquid.
+                # This eliminates the "no YES token found" failures that were wasting 77% of
+                # Claude decisions. A market might have tokens[] but lack a standard YES/NO
+                # entry if it's a resolving neg-risk sub-market or near-settled binary.
+                token_map = {
+                    (t.get("outcome") or "").lower(): float(t.get("price", 0.5))
+                    for t in gamma_tokens if isinstance(t, dict)
+                }
+                if "yes" not in token_map or "no" not in token_map:
+                    continue  # Non-binary or partially-settled market — CLOB bet will fail
+
+                yes_price = token_map["yes"]
+                # Skip nearly-resolved markets (CLOB removes tokens when price ~1 or ~0)
+                if yes_price >= 0.97 or yes_price <= 0.03:
+                    continue
+
+                best_bid = float(m.get("bestBid", yes_price - 0.02))
+                last_price = float(m.get("lastTradePrice") or yes_price)
+
                 out.append({
-                    "condition_id": m.get("conditionId") or m.get("condition_id"),
+                    "condition_id": (m.get("conditionId") or m.get("condition_id") or "").lower(),
                     "question": m.get("question"),
                     "end_date": end_date_str,
                     "days_to_end": days_to_end,
                     "hours_to_end": hours_to_end,
-                    "yes_price": round(best_ask, 4),
-                    "spread": round(best_ask - best_bid, 4),
-                    "price_vs_last": round(best_ask - last_price, 4),
+                    "yes_price": round(yes_price, 4),
+                    "spread": round(yes_price - best_bid, 4),
+                    "price_vs_last": round(yes_price - last_price, 4),
                     "volume_24h": float(m.get("volume24hr", 0)),
                     "category": _guess_category(m.get("question", "")),
                 })
@@ -591,31 +628,6 @@ def check_pending_bets(client: ClobClient):
             log.error(f"Failed to post resolution tweet: {e}")
 
 
-# ─── GRANDMA WALLET CHECK ────────────────────────────────────────────────────
-
-def check_grandma_wallet():
-    """Inject from Grandma's Wallet if bankroll is critically low."""
-    bankroll = get_bankroll()
-    grandma_balance = get_grandma_balance()
-
-    if bankroll < GRANDMA_INJECT_THRESHOLD and grandma_balance >= GRANDMA_INJECT_AMOUNT:
-        log.info(f"👵 GRANDMA WALLET ACTIVATED! Bankroll ${bankroll:.2f} < ${GRANDMA_INJECT_THRESHOLD}")
-
-        inject_amount = min(GRANDMA_INJECT_AMOUNT, grandma_balance)
-        new_balance = bankroll + inject_amount
-        set_bankroll(new_balance, inject_amount, "GRANDMA")
-        update_grandma("INJECT", inject_amount, f"Bankroll was ${bankroll:.2f}")
-
-        # Tweet about it immediately
-        try:
-            tweet_data = ask_larry_for_tweet("GRANDMA", extra_data={"amount": inject_amount})
-            post_tweet(tweet_data["tweet"], tweet_type="GRANDMA")
-        except Exception as e:
-            log.error(f"Failed to post grandma tweet: {e}")
-
-        log.info(f"✅ Grandma injected ${inject_amount:.2f}. New bankroll: ${new_balance:.2f}")
-
-
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 
 _betting_shutdown = False
@@ -648,10 +660,7 @@ def run_betting_agent():
             # 1. Check if pending bets resolved
             check_pending_bets(client)
 
-            # 2. Check if Grandma needs to intervene
-            check_grandma_wallet()
-
-            # 3. Check bankroll exposure — stop placing new bets if 80%+ of TOTAL is already in play
+            # 2. Check bankroll exposure — stop placing new bets if 80%+ of TOTAL is already in play
             # total = free cash + open bets (bankroll already has placed bets deducted)
             open_bets = get_pending_bets()
             bankroll = get_bankroll()
@@ -667,10 +676,13 @@ def run_betting_agent():
                 if markets:
                     # Filter out markets Larry already has open bets on, token-blacklisted,
                     # or already passed on this cycle (price/urgency unchanged)
-                    open_bet_ids = {b.get("polymarket_id") for b in get_pending_bets()}
+                    pending_bets_now = get_pending_bets()
+                    open_bet_ids  = {(b.get("polymarket_id") or "").lower() for b in pending_bets_now}
+                    open_questions = {(b.get("question") or "").lower().strip() for b in pending_bets_now}
                     fresh_markets = [
                         m for m in markets
-                        if m["condition_id"] not in open_bet_ids
+                        if m["condition_id"].lower() not in open_bet_ids
+                        and m.get("question", "").lower().strip() not in open_questions
                         and not _is_token_blacklisted(m["condition_id"])
                         and not _is_pass_cached(m)
                     ]
@@ -682,13 +694,15 @@ def run_betting_agent():
                 if markets:
                     # 5. Ask Claude / Larry which ones to bet on
                     decisions = ask_larry_to_bet(markets)
-                    log.info(f"Larry made {len(decisions)} decisions")
+                    n_bets  = sum(1 for d in decisions if d.get("decision") == "BET")
+                    n_pass  = len(decisions) - n_bets
+                    log.info(f"Larry made {len(decisions)} decisions — {n_bets} BETs, {n_pass} PASSes")
 
                     for decision in decisions:
                         if decision.get("decision") != "BET":
                             log.info(f"PASS: {decision.get('reasoning', 'no reason given')}")
                             # Cache PASS so we don't re-send same market next cycle
-                            mid = decision.get("market_id")
+                            mid = (decision.get("market_id") or "").lower()
                             if mid:
                                 m_info = next((m for m in markets if m["condition_id"] == mid), None)
                                 if m_info:
@@ -705,16 +719,29 @@ def run_betting_agent():
                         # Resolve market_info once — reused for DB save and odds
                         # For neg-risk markets multiple entries share condition_id,
                         # so also match on outcome_name
-                        market_id = decision.get("market_id")
+                        market_id = (decision.get("market_id") or "").lower()
                         decision_outcome = decision.get("outcome", "")
 
                         # Skip if we already have an open bet on this exact market
+                        # Normalize both sides to lowercase — Claude may return different case
+                        mid_loop_bets = get_pending_bets()
                         already_open = any(
-                            b.get("polymarket_id") == market_id
-                            for b in get_pending_bets()
+                            (b.get("polymarket_id") or "").lower() == market_id
+                            for b in mid_loop_bets
                         )
+                        if not already_open:
+                            # Fallback: same question text (catches ID format mismatches)
+                            decision_question = next(
+                                (m.get("question", "") for m in markets if m["condition_id"] == market_id),
+                                ""
+                            ).lower().strip()
+                            if decision_question:
+                                already_open = any(
+                                    (b.get("question") or "").lower().strip() == decision_question
+                                    for b in mid_loop_bets
+                                )
                         if already_open:
-                            log.info(f"Already have open bet on {market_id[:16]}..., skipping")
+                            log.info(f"Already have open bet on {market_id[:20]}..., skipping")
                             continue
                         market_info = next(
                             (m for m in markets if m["condition_id"] == market_id
