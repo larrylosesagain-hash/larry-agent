@@ -142,6 +142,30 @@ REPLY_TOOL = {
     }
 }
 
+SELL_TOOL = {
+    "name": "submit_sell_decisions",
+    "description": "Decide which open positions to sell early to free up capital for new bets.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "sell_decisions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "market_id":   {"type": "string", "description": "condition_id of the market"},
+                        "action":      {"type": "string", "enum": ["SELL", "KEEP"]},
+                        "reasoning":   {"type": "string"},
+                        "larry_tweet": {"type": "string", "description": "Short 1-sentence tweet about cutting the position. SELL decisions only. Optional."},
+                    },
+                    "required": ["market_id", "action", "reasoning"]
+                }
+            }
+        },
+        "required": ["sell_decisions"]
+    }
+}
+
 
 # ─── KELLY CRITERION ──────────────────────────────────────────────────────────
 
@@ -505,3 +529,47 @@ def ask_larry_to_reply(mention: dict) -> dict:
     if len(result.get("reply", "")) > 250:
         result["reply"] = result["reply"][:247] + "..."
     return result
+
+
+def ask_larry_to_sell(open_positions: list) -> list:
+    """
+    When Larry has < $5 free cash, ask him which open positions to sell early
+    to free up capital for something more exciting today.
+
+    open_positions: list of dicts with keys:
+        market_id, question, outcome, bought_at (price paid),
+        current_price, paid (USDC), current_value (USDC), pnl_usdc,
+        end_date (ISO string, optional)
+
+    Returns list of sell_decision dicts: [{market_id, action, reasoning, larry_tweet?}, ...]
+    """
+    ctx = _get_larry_context()
+
+    user_message = (
+        f"Larry Status: {json.dumps(ctx, separators=(',',':'))}\n\n"
+        f"Larry has ${ctx['bankroll_usdc']} free cash — not enough for the $5 minimum bet.\n"
+        f"He has these open positions he could liquidate early:\n"
+        f"{json.dumps(open_positions, separators=(',',':'))}\n\n"
+        f"Larry's default personality: he'd RATHER have $5 to bet on something happening TODAY "
+        f"than wait weeks for a boring long-dated position to resolve.\n\n"
+        f"For each position, decide SELL or KEEP:\n"
+        f"- SELL if: resolves far in the future (weeks/months), the story feels dead, "
+        f"the current value is close to what he paid (not too much pain), or there's an opportunity cost.\n"
+        f"- KEEP if: resolves within days, still very strong conviction, or current price is terrible "
+        f"(e.g. bought at 0.60, now worth 0.15 — cutting losses too late, bag-hold it).\n"
+        f"- Be decisive. Larry is not a patient investor. He WANTS to act.\n"
+        f"- Pick at least 1 SELL if any long-dated/boring positions exist.\n"
+        f"For SELL decisions, write a larry_tweet: short 1-sentence tweet about rage-selling / cutting his losses. "
+        f"Larry's voice. No hashtags."
+    )
+    try:
+        result = _call_claude_with_tool(
+            800,
+            [{"role": "user", "content": user_message}],
+            SELL_TOOL,
+            model=CLAUDE_MODEL,  # Use Sonnet — this is a financial decision, not just a tweet
+        )
+        return result.get("sell_decisions", [])
+    except Exception as e:
+        log.warning(f"Claude unavailable for sell decisions: {type(e).__name__} — skipping")
+        return []

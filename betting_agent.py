@@ -80,7 +80,7 @@ from database import (
     get_bankroll, set_bankroll, get_pending_bets, save_bet, resolve_bet,
     init_db, get_state, set_state
 )
-from larry_brain import ask_larry_to_bet, ask_larry_for_tweet
+from larry_brain import ask_larry_to_bet, ask_larry_for_tweet, ask_larry_to_sell
 
 logging.basicConfig(
     level=logging.INFO,
@@ -765,6 +765,146 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
         return False
 
 
+# ─── SELL POSITIONS FOR CAPITAL ───────────────────────────────────────────────
+
+def try_sell_positions_for_capital(client: ClobClient, needed: float = 5.0) -> float:
+    """
+    When Larry has < $5 free cash, ask him which open positions to sell early
+    to free capital for new same-day bets.
+
+    Flow:
+    1. Fetch current prices for all pending bets via CLOB
+    2. Ask Claude/Larry which ones to sell (larry_brain.ask_larry_to_sell)
+    3. Place SELL orders (GTC) for chosen positions
+    4. Mark those bets as resolved in DB (they'll disappear from pending)
+    5. Sleep 3s then re-sync bankroll from CLOB — sell proceeds should appear
+
+    Returns: estimated USDC freed (sum of sell values; 0 if nothing sold).
+    """
+    pending = get_pending_bets()
+    if not pending:
+        log.info("💸 No open positions to sell")
+        return 0.0
+
+    # Build position info with current market prices
+    positions = []
+    token_lookup: dict = {}   # market_id → token_id (needed for sell order)
+    price_lookup: dict = {}   # market_id → current price
+
+    for bet in pending:
+        mid = bet.get("polymarket_id", "")
+        if not mid:
+            continue
+        try:
+            md = client.get_market(mid)
+            tokens = md.get("tokens", []) if md else []
+            current_price = None
+            token_id = None
+            for token in tokens:
+                if token.get("outcome", "").lower() == bet.get("outcome", "").lower():
+                    current_price = float(token.get("price", 0.5))
+                    token_id = token.get("token_id")
+                    break
+
+            if current_price is None or not token_id:
+                continue
+
+            shares = float(bet.get("amount_usdc", 5.0))  # same convention as place_bet
+            current_value = round(shares * current_price, 2)
+            bought_at = float(bet.get("odds", current_price))
+
+            token_lookup[mid] = token_id
+            price_lookup[mid] = current_price
+
+            positions.append({
+                "market_id":    mid,
+                "question":     bet.get("question", "?")[:80],
+                "outcome":      bet.get("outcome", "YES"),
+                "bought_at":    round(bought_at, 3),
+                "current_price": round(current_price, 3),
+                "paid":         round(shares, 2),
+                "current_value": current_value,
+                "pnl_usdc":     round(current_value - shares, 2),
+            })
+        except Exception as e:
+            log.debug(f"Could not get market data for {mid[:16]}: {type(e).__name__}")
+
+    if not positions:
+        log.info("💸 Could not fetch prices for any open position — skipping sell cycle")
+        return 0.0
+
+    log.info(f"💸 Bankroll insufficient (need ${needed:.2f}) — asking Larry which of {len(positions)} positions to sell...")
+    decisions = ask_larry_to_sell(positions)
+
+    sells = [d for d in decisions if d.get("action") == "SELL"]
+    keeps = [d for d in decisions if d.get("action") == "KEEP"]
+    log.info(f"💸 Larry decided: {len(sells)} SELL, {len(keeps)} KEEP")
+
+    if not sells:
+        return 0.0
+
+    total_freed = 0.0
+    for decision in sells:
+        mid = decision.get("market_id", "")
+        token_id = token_lookup.get(mid)
+        current_price = price_lookup.get(mid)
+
+        if not token_id or not current_price:
+            log.warning(f"💸 No token_id/price for {mid[:16]} — skipping sell")
+            continue
+
+        bet = next((b for b in pending if b.get("polymarket_id") == mid), None)
+        if not bet:
+            continue
+
+        # Sell at a slight discount to current price to ensure liquidity
+        sell_price = max(0.02, round(current_price - 0.02, 4))
+        shares = round(float(bet.get("amount_usdc", 5.0)), 2)
+
+        try:
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=sell_price,
+                size=shares,
+                side="SELL",
+            )
+            signed_order = client.create_order(order_args)
+            resp = client.post_order(signed_order, OrderType.GTC)
+
+            if resp.get("success"):
+                estimated_proceeds = round(shares * sell_price, 2)
+                total_freed += estimated_proceeds
+                log.info(
+                    f"💸 SOLD: {bet.get('outcome')} on \"{bet.get('question','?')[:50]}\" "
+                    f"— placed sell order at {sell_price:.3f}, ~${estimated_proceeds:.2f} proceeds"
+                )
+                # Remove from pending bets — DB entry replaced by SOLD status
+                # Bankroll NOT updated here — sync_bankroll_from_clob runs after and captures CLOB truth
+                resolve_bet(mid, False, 0.0)
+
+                # Tweet about the sale if Larry had something to say
+                larry_tweet = decision.get("larry_tweet", "")
+                if larry_tweet:
+                    try:
+                        from twitter_agent import post_tweet
+                        post_tweet(larry_tweet, tweet_type="SOLD_POSITION")
+                    except Exception as te:
+                        log.debug(f"Sell tweet failed: {te}")
+            else:
+                log.warning(
+                    f"💸 Sell order rejected for {mid[:16]}: "
+                    f"{resp.get('errorMsg', resp.get('error', 'unknown'))}"
+                )
+        except Exception as e:
+            log.error(f"💸 Exception selling {mid[:16]}: {type(e).__name__}: {e}")
+
+    if total_freed > 0:
+        # Wait briefly for GTC orders to fill, then re-sync bankroll from CLOB
+        log.info(f"💸 Sell orders placed — waiting 4s then syncing balance (est. ${total_freed:.2f} freed)")
+        time.sleep(4)
+        sync_bankroll_from_clob(client)
+
+    return total_freed
 
 
 # ─── CHECK RESOLVED BETS ──────────────────────────────────────────────────────
@@ -1044,6 +1184,16 @@ def run_betting_agent():
             if bankroll <= 0:
                 log.info("No free bankroll remaining — waiting for open bets to resolve")
             else:
+                # 3b. If bankroll too low to bet ($5 min), try selling boring long-dated positions
+                #     to free capital for something more interesting today.
+                if bankroll < 5.0 and open_bets:
+                    freed = try_sell_positions_for_capital(client, needed=5.0)
+                    if freed > 0:
+                        bankroll = get_bankroll()  # re-read after sync inside sell function
+                        log.info(f"💸 Capital freed via position sales — new bankroll: ${bankroll:.2f}")
+                    else:
+                        log.info(f"💸 No positions sold — still ${bankroll:.2f} free, need $5 to bet")
+
                 # 4. Fetch markets — three parallel Gamma batches, 24h window
                 markets = fetch_active_markets()
 

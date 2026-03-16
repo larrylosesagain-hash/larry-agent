@@ -76,6 +76,13 @@ def _is_safe_to_engage(text: str) -> bool:
 # Cached Larry's user ID — avoid get_me() every 15 minutes
 _larry_user_id = None
 
+# ─── ANTI-BURST TWEET THROTTLE ────────────────────────────────────────────────
+# Prevents bot-like bursts (e.g. 5 tweets in 3 seconds when 5 bets fire at once).
+# Shared by twitter_agent loop AND betting_agent (which imports post_tweet).
+# Both run in separate threads inside the same process — so this global is shared.
+_last_tweet_at: datetime | None = None
+_TWEET_MIN_GAP_SECS = 65  # ≥1 minute between any two tweets Larry posts
+
 # ─── TWITTER CLIENT SINGLETON ─────────────────────────────────────────────────
 # Creating a new tweepy.Client per call = new HTTP session + SSL handshake every time.
 # With 8-10 Twitter actions per cycle, that's 8-10 unnecessary handshakes.
@@ -100,7 +107,22 @@ def get_twitter_client() -> tweepy.Client:
 
 def post_tweet(text: str, tweet_type: str = "RANDOM", bet_id: int = None,
                reply_to_id: str = None) -> str:
-    """Post a tweet as Larry. Optionally reply to another tweet."""
+    """Post a tweet as Larry. Optionally reply to another tweet.
+
+    Anti-burst: enforces _TWEET_MIN_GAP_SECS minimum gap between tweets.
+    If called too soon after the last tweet, sleeps until the gap is met.
+    This prevents bot-obvious bursts when 5 bets fire in a single cycle.
+    """
+    global _last_tweet_at
+
+    # Anti-burst: sleep if we tweeted too recently
+    if _last_tweet_at is not None:
+        elapsed = (datetime.utcnow() - _last_tweet_at).total_seconds()
+        wait = _TWEET_MIN_GAP_SECS - elapsed
+        if wait > 0:
+            log.info(f"⏳ Tweet throttle: waiting {wait:.0f}s (anti-burst gap, last tweet {elapsed:.0f}s ago)")
+            time.sleep(wait)
+
     if len(text) > 280:
         text = text[:277] + "..."
 
@@ -117,6 +139,7 @@ def post_tweet(text: str, tweet_type: str = "RANDOM", bet_id: int = None,
 
         tweet_id = str(response.data["id"])
         save_tweet(tweet_id=tweet_id, content=text, tweet_type=tweet_type, bet_id=bet_id)
+        _last_tweet_at = datetime.utcnow()  # update AFTER success
         log.info(f"✅ Tweeted [{tweet_type}]: {text[:80]}...")
         return tweet_id
 
