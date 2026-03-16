@@ -813,6 +813,17 @@ def try_sell_positions_for_capital(client: ClobClient, needed: float = 5.0) -> f
             current_value = round(shares * current_price, 2)
             bought_at = float(bet.get("odds", current_price))
 
+            # Extract end date from CLOB market data — critical for "long-dated" detection
+            end_date_raw = (
+                md.get("endDateIso") or
+                md.get("end_date_iso") or
+                md.get("endDate") or
+                md.get("end_date") or
+                ""
+            )
+            # Trim to just the date portion (YYYY-MM-DD) to keep JSON compact
+            end_date = end_date_raw[:10] if end_date_raw else "unknown"
+
             token_lookup[mid] = token_id
             price_lookup[mid] = current_price
 
@@ -820,6 +831,8 @@ def try_sell_positions_for_capital(client: ClobClient, needed: float = 5.0) -> f
                 "market_id":    mid,
                 "question":     bet.get("question", "?")[:80],
                 "outcome":      bet.get("outcome", "YES"),
+                "end_date":     end_date,       # when this market resolves
+                "placed_at":    (bet.get("placed_at") or "")[:10],  # when Larry placed it
                 "bought_at":    round(bought_at, 3),
                 "current_price": round(current_price, 3),
                 "paid":         round(shares, 2),

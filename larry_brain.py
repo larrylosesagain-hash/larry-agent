@@ -545,31 +545,47 @@ def ask_larry_to_sell(open_positions: list) -> list:
     """
     ctx = _get_larry_context()
 
+    today = __import__("datetime").date.today().isoformat()
+
     user_message = (
         f"Larry Status: {json.dumps(ctx, separators=(',',':'))}\n\n"
-        f"Larry has ${ctx['bankroll_usdc']} free cash — not enough for the $5 minimum bet.\n"
-        f"He has these open positions he could liquidate early:\n"
+        f"Today is {today}. Larry has ${ctx['bankroll_usdc']} free cash — not enough for the $5 minimum bet.\n"
+        f"He is STUCK. He can't bet on anything new until he frees up capital.\n\n"
+        f"His open positions:\n"
         f"{json.dumps(open_positions, separators=(',',':'))}\n\n"
-        f"Larry's default personality: he'd RATHER have $5 to bet on something happening TODAY "
-        f"than wait weeks for a boring long-dated position to resolve.\n\n"
-        f"For each position, decide SELL or KEEP:\n"
-        f"- SELL if: resolves far in the future (weeks/months), the story feels dead, "
-        f"the current value is close to what he paid (not too much pain), or there's an opportunity cost.\n"
-        f"- KEEP if: resolves within days, still very strong conviction, or current price is terrible "
-        f"(e.g. bought at 0.60, now worth 0.15 — cutting losses too late, bag-hold it).\n"
-        f"- Be decisive. Larry is not a patient investor. He WANTS to act.\n"
-        f"- Pick at least 1 SELL if any long-dated/boring positions exist.\n"
-        f"For SELL decisions, write a larry_tweet: short 1-sentence tweet about rage-selling / cutting his losses. "
-        f"Larry's voice. No hashtags."
+        f"LARRY'S SITUATION: He sees markets resolving TODAY that he wants to bet on, but he's locked out because "
+        f"his money is all tied up in positions that won't resolve for WEEKS or MONTHS.\n\n"
+        f"Larry's decision process for each position:\n"
+        f"- end_date far in future (after {today} + 7 days or 'unknown') → SELL unless conviction is extremely strong\n"
+        f"- end_date in the next 1-7 days → KEEP (almost done, let it ride)\n"
+        f"- pnl_usdc near 0 (between -$1 and +$1) → ideal sell, barely any loss\n"
+        f"- current_price < 0.10 → bag-holding a loser, SELL and cut it\n"
+        f"- current_price > 0.85 → almost won, KEEP and let it finish\n\n"
+        f"YOU MUST SELL AT LEAST 1 POSITION. Larry is impatient. He always finds one boring position to dump.\n"
+        f"Every position must have an action (SELL or KEEP). Empty decisions array is not acceptable.\n\n"
+        f"For SELL decisions: write larry_tweet — a short 1-sentence tweet about ditching the position. "
+        f"Larry's voice. Examples: 'cutting my oil bet, rather bet on something that actually happens today' / "
+        f"'selling my march crypto position, boring. found something better' / 'done waiting on this one'"
     )
     try:
         result = _call_claude_with_tool(
-            800,
+            1000,
             [{"role": "user", "content": user_message}],
             SELL_TOOL,
             model=CLAUDE_MODEL,  # Use Sonnet — this is a financial decision, not just a tweet
         )
-        return result.get("sell_decisions", [])
+        decisions = result.get("sell_decisions", [])
+        # Fallback: if Claude still returned empty, force-sell the position with worst PnL
+        if not decisions and open_positions:
+            worst = min(open_positions, key=lambda p: p.get("pnl_usdc", 0))
+            log.warning(f"💸 Claude returned empty sell decisions — force-selling worst position: {worst.get('question','?')[:40]}")
+            decisions = [{
+                "market_id": worst["market_id"],
+                "action": "SELL",
+                "reasoning": "auto-selected as worst-performing position to free capital",
+                "larry_tweet": "cutting my losses. needed the capital for something better today.",
+            }]
+        return decisions
     except Exception as e:
         log.warning(f"Claude unavailable for sell decisions: {type(e).__name__} — skipping")
         return []
