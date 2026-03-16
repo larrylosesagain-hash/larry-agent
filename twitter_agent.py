@@ -515,6 +515,13 @@ _QUOTE_ACCOUNTS = [
     "Kalshi",           # Polymarket competitor — prediction market context
     "saylor",           # Bitcoin maximalist — Larry bets on BTC
     "cz_binance",       # crypto, massive following
+    # Additional accounts — tend to have open replies, active engagement
+    "APompliano",       # Anthony Pompliano — macro + crypto, open replies
+    "balajis",          # Balaji Srinivasan — loves making predictions and bets on things
+    "WatcherGuru",      # crypto news, fast posts, usually open replies
+    "coindesk",         # crypto news, usually open replies
+    "AriDavidPaul",     # Ari Paul — prediction markets OG, active
+    "CryptoBanter",     # crypto commentary, large engaged audience
 ]
 
 def _search_tweets_from_accounts(account_list: list) -> dict | None:
@@ -606,25 +613,25 @@ def _find_quote_tweet_candidate() -> dict | None:
 def maybe_quote_tweet():
     """
     Larry quote-tweets whitelisted accounts with his take.
-    Throttled: min 3 hours between quote tweets. 50% chance per check when eligible.
-    Gives ~3-5 quote tweets per day — active but not spammy.
+    Throttled: min 2 hours between quote tweets. 70% chance per check when eligible.
+    Gives ~5-7 quote tweets per day — active but not spammy.
     """
     now = datetime.utcnow()
     if now.hour < 8 or now.hour >= 23:
         return  # only active hours
 
-    # Throttle: min 3 hours between quote tweets
+    # Throttle: min 2 hours between quote tweets
     last_qt = get_state("last_quote_tweet_time")
     if last_qt:
         try:
             last_dt = datetime.fromisoformat(last_qt)
-            if (now - last_dt).total_seconds() < 3 * 3600:
+            if (now - last_dt).total_seconds() < 2 * 3600:
                 return
         except Exception:
             pass
 
-    if random.random() > 0.50:
-        return  # 50% chance when eligible — natural variation
+    if random.random() > 0.70:
+        return  # 70% chance when eligible — more active
 
     candidate = _get_cycle_candidate()
     if not candidate:
@@ -758,42 +765,60 @@ def maybe_reply_to_whitelist():
     if not non_vip_accounts:
         return
 
-    candidate = _search_tweets_from_accounts(non_vip_accounts)
-    if not candidate:
-        return
+    # Try up to MAX_REPLY_ATTEMPTS candidates — skip restricted tweets and move on
+    # instead of burning a 2h cooldown on the first 403.
+    MAX_REPLY_ATTEMPTS = 3
+    tried_ids: set = set()
 
-    try:
-        tweet_data = ask_larry_for_tweet(
-            "WHITELIST_REPLY",
-            extra_data={
-                "original_tweet": candidate["text"][:200],
-                "username": candidate["username"],
-            }
-        )
-        reply_text = tweet_data.get("tweet", "")
-        if not reply_text:
-            return
+    for attempt in range(MAX_REPLY_ATTEMPTS):
+        # Re-search excluding already-tried tweet_ids (blocked in _quote_blocked_ids)
+        candidate = _search_tweets_from_accounts(non_vip_accounts)
+        if not candidate or candidate["tweet_id"] in tried_ids:
+            break
+        tried_ids.add(candidate["tweet_id"])
 
-        client = get_twitter_client()
-        response = client.create_tweet(
-            text=reply_text,
-            in_reply_to_tweet_id=candidate["tweet_id"]
-        )
-        reply_id = str(response.data["id"])
-        save_tweet(tweet_id=reply_id, content=reply_text, tweet_type="WHITELIST_REPLY")
-        log.info(f"💬 Replied to @{candidate['username']}: {reply_text[:60]}...")
-        set_state("last_whitelist_reply_time", now.isoformat())
-        like_tweet(candidate["tweet_id"])
-    except tweepy.Forbidden as e:
-        # Tweet has reply restrictions ("not mentioned or engaged by author").
-        # Blacklist this tweet_id so we never retry it.
-        # Also advance the cooldown — no point retrying other tweets this cycle,
-        # we just burned a Claude API call. Wait 2h before trying again.
-        _quote_blocked_ids.add(candidate["tweet_id"])
-        set_state("last_whitelist_reply_time", now.isoformat())
-        log.warning(f"Whitelist reply forbidden for @{candidate['username']} (tweet restricted) — skipping 2h")
-    except Exception as e:
-        log.warning(f"Whitelist reply failed: {type(e).__name__}: {e}")
+        try:
+            tweet_data = ask_larry_for_tweet(
+                "WHITELIST_REPLY",
+                extra_data={
+                    "original_tweet": candidate["text"][:200],
+                    "username": candidate["username"],
+                }
+            )
+            reply_text = tweet_data.get("tweet", "")
+            if not reply_text:
+                break
+
+            client = get_twitter_client()
+            response = client.create_tweet(
+                text=reply_text,
+                in_reply_to_tweet_id=candidate["tweet_id"]
+            )
+            reply_id = str(response.data["id"])
+            save_tweet(tweet_id=reply_id, content=reply_text, tweet_type="WHITELIST_REPLY")
+            log.info(f"💬 Replied to @{candidate['username']}: {reply_text[:60]}...")
+            set_state("last_whitelist_reply_time", now.isoformat())
+            like_tweet(candidate["tweet_id"])
+            return  # success — done
+
+        except tweepy.Forbidden:
+            # This specific tweet has reply restrictions — blacklist tweet_id and try another.
+            # Do NOT advance the 2h cooldown yet — we haven't actually replied to anyone.
+            _quote_blocked_ids.add(candidate["tweet_id"])
+            log.info(
+                f"💬 Reply to @{candidate['username']} tweet restricted "
+                f"(attempt {attempt + 1}/{MAX_REPLY_ATTEMPTS}) — trying another tweet"
+            )
+            continue  # try next candidate
+
+        except Exception as e:
+            log.warning(f"Whitelist reply failed: {type(e).__name__}: {e}")
+            break
+
+    # All attempts failed — set a short 1h cooldown (was 2h) to avoid hammering
+    # the same restricted accounts. With more accounts in the list this recovers faster.
+    set_state("last_whitelist_reply_time", (now - timedelta(hours=1)).isoformat())
+    log.info("💬 All whitelist reply attempts restricted/failed — cooling down 1h")
 
 
 # ─── PRICE MOVE REACTIONS ─────────────────────────────────────────────────────
