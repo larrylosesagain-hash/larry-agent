@@ -49,6 +49,27 @@ _CTF_ABI = [{
     "type": "function",
 }]
 
+# Polymarket proxy wallet ABI — used when POLYMARKET_FUNDER is a proxy contract
+# (not the same address as the EOA derived from POLYMARKET_PRIVATE_KEY).
+# The proxy's execute() lets the owner EOA call any contract on the proxy's behalf,
+# so redeemPositions() is called FROM FUNDER (which owns the CTF positions).
+_PROXY_EXECUTE_ABI = [{
+    "name": "execute",
+    "type": "function",
+    "stateMutability": "nonpayable",
+    "inputs": [
+        {"name": "to",    "type": "address"},
+        {"name": "value", "type": "uint256"},
+        {"name": "data",  "type": "bytes"},
+    ],
+    "outputs": [{"type": "bool"}],
+}]
+
+# Minimum MATIC balance (wei) to warn before attempting claims.
+# Each redeemPositions costs ~100k-250k gas; at 100 gwei → 0.025 MATIC per claim.
+# Warn when < 0.05 MATIC (~$0.01) so the user can top up before running dry.
+_MATIC_WARN_THRESHOLD_WEI = int(0.05 * 1e18)
+
 from config import (
     POLYMARKET_PRIVATE_KEY, POLYMARKET_FUNDER,
     POLYMARKET_HOST, POLYMARKET_GAMMA_API,
@@ -188,9 +209,9 @@ def sync_bankroll_from_clob(client: ClobClient):
         # balance is returned as a string of raw units (6 decimals for USDC)
         raw = result.get("balance", "0")
         real_balance = float(raw) / 1_000_000  # convert from microUSDC to USDC
-        if real_balance > 0:
+        if real_balance >= 0:
             db_balance = get_bankroll()
-            if abs(real_balance - db_balance) > 1.0:  # only sync if diff > $1
+            if abs(real_balance - db_balance) > 0.01:  # sync whenever diff > 1 cent
                 log.info(f"💰 Balance sync: DB=${db_balance:.2f} → CLOB=${real_balance:.2f}")
                 set_bankroll(real_balance, real_balance - db_balance, "SYNC")
             else:
@@ -236,61 +257,135 @@ def get_positions_value() -> tuple[float, int]:
 
 # ─── AUTO-CLAIM WINNINGS ──────────────────────────────────────────────────────
 
+def _connect_polygon() -> "Web3 | None":
+    """Connect to Polygon via the first responsive RPC in _POLYGON_RPCS."""
+    for rpc in _POLYGON_RPCS:
+        try:
+            _w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 20}))
+            _ = _w3.eth.chain_id  # real RPC call — raises if unreachable
+            log.info(f"Connected to Polygon via {rpc}")
+            return _w3
+        except Exception as rpc_err:
+            log.warning(f"Polygon RPC {rpc} unreachable: {type(rpc_err).__name__}")
+    log.error("Cannot connect to any Polygon RPC — tried all fallbacks")
+    return None
+
+
+def check_matic_balance() -> float:
+    """
+    Return EOA MATIC balance (in MATIC, not wei).
+    Logs a warning + funding instructions if below threshold.
+    Called at startup and periodically so the user knows when to top up.
+    """
+    try:
+        w3 = _connect_polygon()
+        if w3 is None:
+            return 0.0
+        account = w3.eth.account.from_key(POLYMARKET_PRIVATE_KEY)
+        balance_wei = w3.eth.get_balance(account.address)
+        balance_matic = balance_wei / 1e18
+        if balance_wei < _MATIC_WARN_THRESHOLD_WEI:
+            log.warning(
+                f"⛽ Signer wallet MATIC low: {balance_matic:.4f} MATIC "
+                f"(address: {account.address}). "
+                f"Send at least 1 MATIC to enable auto-claim. "
+                f"Each claim costs ~0.005–0.025 MATIC (~$0.001–0.005)."
+            )
+        else:
+            log.info(f"⛽ Signer MATIC balance: {balance_matic:.4f} MATIC — OK for auto-claim")
+        return balance_matic
+    except Exception as e:
+        log.warning(f"MATIC balance check failed: {e}")
+        return 0.0
+
+
 def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
     """
     Redeem winning CTF positions on-chain via Polygon.
-    Calls redeemPositions() on the Gnosis CTF contract — this is what
-    'claiming' means on Polymarket. Works with the same private key used for trading.
+
+    Two call paths depending on whether POLYMARKET_FUNDER is the same
+    address as the EOA (POLYMARKET_PRIVATE_KEY) or a proxy wallet:
+
+      A) FUNDER == EOA   → call redeemPositions() directly from EOA
+      B) FUNDER == proxy → call proxy.execute(CTF, 0, redeemPositions_calldata)
+                           from EOA, so CTF sees FUNDER as msg.sender
+
+    Either way the EOA (PRIVATE_KEY's address) needs a small MATIC balance for gas.
+    ~0.005–0.025 MATIC per claim at typical Polygon gas prices.
 
     indexSets encoding (binary CTF):
       YES position = index set 1  (binary: 01)
       NO  position = index set 2  (binary: 10)
     """
     try:
-        w3 = None
-        for rpc in _POLYGON_RPCS:
-            try:
-                _w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 20}))
-                # Use chain_id instead of is_connected() — is_connected() can return True
-                # without an actual working connection in some web3.py versions.
-                # chain_id makes a real eth_chainId RPC call; raises on failure.
-                _ = _w3.eth.chain_id
-                w3 = _w3
-                log.info(f"Connected to Polygon via {rpc}")
-                break
-            except Exception as rpc_err:
-                log.warning(f"Polygon RPC {rpc} unreachable: {type(rpc_err).__name__}")
-                continue
+        w3 = _connect_polygon()
         if w3 is None:
-            log.error("Cannot connect to any Polygon RPC for claim — tried all fallbacks")
             return False
 
         account = w3.eth.account.from_key(POLYMARKET_PRIVATE_KEY)
+        funder  = Web3.to_checksum_address(POLYMARKET_FUNDER)
+
+        # Check MATIC balance upfront — gives actionable log before hitting gas error
+        matic_wei = w3.eth.get_balance(account.address)
+        if matic_wei == 0:
+            log.warning(
+                f"⛽ Auto-claim skipped: signer wallet has 0 MATIC. "
+                f"Send at least 1 MATIC to {account.address} on Polygon to enable auto-claim."
+            )
+            return False
+        if matic_wei < _MATIC_WARN_THRESHOLD_WEI:
+            log.warning(
+                f"⛽ MATIC low ({matic_wei/1e18:.4f}) on {account.address} — "
+                f"auto-claim may fail soon. Top up when convenient."
+            )
+
         ctf = w3.eth.contract(address=_CTF_ADDRESS, abi=_CTF_ABI)
 
-        # condition_id may have 0x prefix — strip it for bytes conversion
+        # condition_id may have 0x prefix — strip for bytes conversion
         cid_hex = condition_id.replace("0x", "").zfill(64)
-        condition_bytes = bytes.fromhex(cid_hex)
+        condition_bytes  = bytes.fromhex(cid_hex)
         parent_collection = b"\x00" * 32  # parentCollectionId = bytes32(0)
-
         index_sets = [1] if outcome.upper() == "YES" else [2]
 
-        tx = ctf.functions.redeemPositions(
-            _USDC_ADDRESS,
-            parent_collection,
-            condition_bytes,
-            index_sets,
-        ).build_transaction({
-            "from":     account.address,
-            "nonce":    w3.eth.get_transaction_count(account.address),
-            "gas":      250_000,
-            "gasPrice": w3.eth.gas_price,
-            "chainId":  137,  # Polygon mainnet
-        })
+        # ── Path A: FUNDER == EOA — call CTF directly ────────────────────────
+        if funder.lower() == account.address.lower():
+            tx = ctf.functions.redeemPositions(
+                _USDC_ADDRESS,
+                parent_collection,
+                condition_bytes,
+                index_sets,
+            ).build_transaction({
+                "from":     account.address,
+                "nonce":    w3.eth.get_transaction_count(account.address),
+                "gas":      250_000,
+                "gasPrice": w3.eth.gas_price,
+                "chainId":  137,
+            })
 
-        signed   = w3.eth.account.sign_transaction(tx, POLYMARKET_PRIVATE_KEY)
-        tx_hash  = w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt  = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        # ── Path B: FUNDER is a proxy wallet — route through proxy.execute() ─
+        else:
+            # Encode the redeemPositions calldata for the proxy to forward
+            redeem_calldata = ctf.encodeABI(
+                fn_name="redeemPositions",
+                args=[_USDC_ADDRESS, parent_collection, condition_bytes, index_sets],
+            )
+            proxy = w3.eth.contract(address=funder, abi=_PROXY_EXECUTE_ABI)
+            tx = proxy.functions.execute(
+                _CTF_ADDRESS,
+                0,               # value (no ETH/MATIC transfer)
+                redeem_calldata,
+            ).build_transaction({
+                "from":     account.address,
+                "nonce":    w3.eth.get_transaction_count(account.address),
+                "gas":      300_000,  # slightly more for proxy dispatch overhead
+                "gasPrice": w3.eth.gas_price,
+                "chainId":  137,
+            })
+            log.info(f"Using proxy execute path: EOA={account.address[:10]}… → FUNDER={funder[:10]}…")
+
+        signed  = w3.eth.account.sign_transaction(tx, POLYMARKET_PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
 
         if receipt.status == 1:
             log.info(f"✅ Auto-claimed ${payout:.2f}! TX: {tx_hash.hex()}")
@@ -897,13 +992,8 @@ def run_betting_agent():
 
     client = get_clob_client()
 
-    # Log signer address so user knows where to send MATIC for gas
-    try:
-        from web3 import Web3 as _W3
-        _signer_addr = _W3.eth.account.from_key(POLYMARKET_PRIVATE_KEY).address
-        log.info(f"🔑 Signer wallet: {_signer_addr} — needs MATIC for auto-claim gas")
-    except Exception:
-        pass
+    # Check MATIC balance for auto-claim — logs address + balance + funding instructions
+    check_matic_balance()
 
     # Step 1: Clear zombie bets (resolved/phantom bets stuck in DB)
     # Must run BEFORE sync so that cleared bets don't inflate "exposure" after sync.
@@ -915,18 +1005,14 @@ def run_betting_agent():
     # claimed ones) and any phantom bets that never actually consumed USDC.
     sync_bankroll_from_clob(client)
 
-    _cycle_count = 0  # for periodic CLOB sync
-
     while not _betting_shutdown:
         try:
             log.info("--- Betting cycle starting ---")
 
-            # Periodic CLOB sync every 4 cycles (~2h) — keeps bankroll accurate
-            # after manual claims on polymarket.com without needing a restart
-            _cycle_count += 1
-            if _cycle_count % 4 == 0:
-                log.info("🔄 Periodic balance sync with CLOB...")
-                sync_bankroll_from_clob(client)
+            # Sync CLOB balance every cycle — keeps DB accurate after manual claims,
+            # failed bets, or any external USDC movement. One API call per 30 min.
+            log.info("🔄 Syncing balance with CLOB...")
+            sync_bankroll_from_clob(client)
 
             # 1. Check if pending bets resolved
             check_pending_bets(client)
@@ -1032,17 +1118,23 @@ def run_betting_agent():
                         # 6. Deduct bet amount from bankroll first
                         bankroll = get_bankroll()
                         amount = float(decision.get("amount_usdc", ABSOLUTE_MIN_BET))
-                        if amount > bankroll:
-                            log.warning(f"Not enough bankroll (${bankroll:.2f}) for ${amount:.2f} bet")
+                        # IMPORTANT: place_bet enforces a $5 CLOB minimum — always check
+                        # against actual order size, not the raw Kelly amount. If we only
+                        # checked the Kelly amount (~$1) we'd pass the check but hit
+                        # "not enough balance" at CLOB, and also under-deduct from DB.
+                        actual_amount = max(amount, 5.0)
+                        if actual_amount > bankroll:
+                            log.warning(f"Not enough bankroll (${bankroll:.2f}) for ${actual_amount:.2f} bet")
                             continue
 
                         # 7. Place the bet
                         success = place_bet(client, decision)
 
                         if success:
-                            # Deduct from bankroll
-                            new_balance = bankroll - amount
-                            set_bankroll(new_balance, -amount, "BET_PLACED")
+                            # Deduct from bankroll — use actual_amount ($5 min), not Kelly amount,
+                            # so DB stays in sync with what CLOB actually reserved.
+                            new_balance = bankroll - actual_amount
+                            set_bankroll(new_balance, -actual_amount, "BET_PLACED")
 
                             # market_info already resolved above — no duplicate lookup
                             # no_price was removed from market dict; derive it
@@ -1050,13 +1142,13 @@ def run_betting_agent():
                                 odds = market_info.get("yes_price", 0.5)
                             else:
                                 odds = round(1 - market_info.get("yes_price", 0.5), 4)
-                            potential_payout = amount / odds if odds > 0 else amount * 2
+                            potential_payout = actual_amount / odds if odds > 0 else actual_amount * 2
 
                             bet_id = save_bet(
                                 polymarket_id=market_id,
                                 question=market_info.get("question", "Unknown market"),
                                 outcome=decision.get("outcome", "YES"),
-                                amount=amount,
+                                amount=actual_amount,
                                 odds=odds,
                                 potential_payout=potential_payout,
                                 category=market_info.get("category", "weird"),
