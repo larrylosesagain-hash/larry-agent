@@ -11,8 +11,12 @@ Runs on a loop every 30 minutes:
 import sys
 import time
 import json
+import hmac
 import signal
 import random
+import hashlib
+import base64
+import os
 import logging
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -69,6 +73,12 @@ _PROXY_EXECUTE_ABI = [{
 # Each redeemPositions costs ~100k-250k gas; at 100 gwei → 0.025 MATIC per claim.
 # Warn when < 0.05 MATIC (~$0.01) so the user can top up before running dry.
 _MATIC_WARN_THRESHOLD_WEI = int(0.05 * 1e18)
+
+# ─── BUILDER RELAYER (gasless claims) ─────────────────────────────────────────
+_RELAYER_URL       = "https://relayer-v2.polymarket.com"
+_BUILDER_API_KEY   = os.getenv("POLYMARKET_BUILDER_API_KEY", "")
+_BUILDER_SECRET    = os.getenv("POLYMARKET_BUILDER_SECRET", "")
+_BUILDER_PASSPHRASE = os.getenv("POLYMARKET_BUILDER_PASSPHRASE", "")
 
 from config import (
     POLYMARKET_PRIVATE_KEY, POLYMARKET_FUNDER,
@@ -272,140 +282,85 @@ def _connect_polygon() -> "Web3 | None":
 
 
 def check_matic_balance() -> float:
+    """MATIC no longer needed for claims (gasless via builder relayer). Just logs status."""
+    if _BUILDER_API_KEY:
+        log.info("⛽ Gasless claim enabled via Builder Relayer — no MATIC needed for claims")
+    else:
+        log.warning("⚠️  POLYMARKET_BUILDER_API_KEY not set — auto-claim disabled")
+    return 0.0
+
+
+def _build_relayer_headers(method: str, path: str, body: str = "") -> dict:
     """
-    Return EOA MATIC balance (in MATIC, not wei).
-    Logs a warning + funding instructions if below threshold.
-    Called at startup and periodically so the user knows when to top up.
+    Build HMAC-SHA256 auth headers for Polymarket Builder Relayer API.
+    Signature covers: timestamp + METHOD + path + body
     """
-    try:
-        w3 = _connect_polygon()
-        if w3 is None:
-            return 0.0
-        account = w3.eth.account.from_key(POLYMARKET_PRIVATE_KEY)
-        balance_wei = w3.eth.get_balance(account.address)
-        balance_matic = balance_wei / 1e18
-        if balance_wei < _MATIC_WARN_THRESHOLD_WEI:
-            log.warning(
-                f"⛽ Signer wallet MATIC low: {balance_matic:.4f} MATIC "
-                f"(address: {account.address}). "
-                f"Send at least 1 MATIC to enable auto-claim. "
-                f"Each claim costs ~0.005–0.025 MATIC (~$0.001–0.005)."
-            )
-        else:
-            log.info(f"⛽ Signer MATIC balance: {balance_matic:.4f} MATIC — OK for auto-claim")
-        return balance_matic
-    except Exception as e:
-        log.warning(f"MATIC balance check failed: {e}")
-        return 0.0
+    ts = str(int(time.time()))
+    message = ts + method.upper() + path + body
+    secret_bytes = base64.b64decode(_BUILDER_SECRET)
+    sig = hmac.new(secret_bytes, message.encode("utf-8"), hashlib.sha256)
+    signature = base64.b64encode(sig.digest()).decode("utf-8")
+    return {
+        "Content-Type":           "application/json",
+        "POLY_BUILDER_API_KEY":   _BUILDER_API_KEY,
+        "POLY_BUILDER_SIGNATURE": signature,
+        "POLY_BUILDER_TIMESTAMP": ts,
+        "POLY_BUILDER_PASSPHRASE": _BUILDER_PASSPHRASE,
+    }
 
 
 def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
     """
-    Redeem winning CTF positions on-chain via Polygon.
-
-    Two call paths depending on whether POLYMARKET_FUNDER is the same
-    address as the EOA (POLYMARKET_PRIVATE_KEY) or a proxy wallet:
-
-      A) FUNDER == EOA   → call redeemPositions() directly from EOA
-      B) FUNDER == proxy → call proxy.execute(CTF, 0, redeemPositions_calldata)
-                           from EOA, so CTF sees FUNDER as msg.sender
-
-    Either way the EOA (PRIVATE_KEY's address) needs a small MATIC balance for gas.
-    ~0.005–0.025 MATIC per claim at typical Polygon gas prices.
+    Gasless claim via Polymarket Builder Relayer API.
+    No MATIC needed — Polymarket's relayer pays the gas.
+    Equivalent to clicking "Collect" on polymarket.com.
 
     indexSets encoding (binary CTF):
       YES position = index set 1  (binary: 01)
       NO  position = index set 2  (binary: 10)
     """
+    if not _BUILDER_API_KEY:
+        log.warning("⚠️  POLYMARKET_BUILDER_API_KEY not set — skipping gasless claim")
+        return False
+
     try:
-        w3 = _connect_polygon()
-        if w3 is None:
-            return False
-
-        account = w3.eth.account.from_key(POLYMARKET_PRIVATE_KEY)
-        funder  = Web3.to_checksum_address(POLYMARKET_FUNDER)
-
-        # Check MATIC balance upfront — gives actionable log before hitting gas error
-        matic_wei = w3.eth.get_balance(account.address)
-        if matic_wei == 0:
-            log.warning(
-                f"⛽ Auto-claim skipped: signer wallet has 0 MATIC. "
-                f"Send at least 1 MATIC to {account.address} on Polygon to enable auto-claim."
-            )
-            return False
-        if matic_wei < _MATIC_WARN_THRESHOLD_WEI:
-            log.warning(
-                f"⛽ MATIC low ({matic_wei/1e18:.4f}) on {account.address} — "
-                f"auto-claim may fail soon. Top up when convenient."
-            )
-
-        ctf = w3.eth.contract(address=_CTF_ADDRESS, abi=_CTF_ABI)
-
-        # condition_id may have 0x prefix — strip for bytes conversion
-        cid_hex = condition_id.replace("0x", "").zfill(64)
-        condition_bytes  = bytes.fromhex(cid_hex)
-        parent_collection = b"\x00" * 32  # parentCollectionId = bytes32(0)
+        cid = condition_id.replace("0x", "").zfill(64)
         index_sets = [1] if outcome.upper() == "YES" else [2]
 
-        # ── Path A: FUNDER == EOA — call CTF directly ────────────────────────
-        if funder.lower() == account.address.lower():
-            tx = ctf.functions.redeemPositions(
-                _USDC_ADDRESS,
-                parent_collection,
-                condition_bytes,
-                index_sets,
-            ).build_transaction({
-                "from":     account.address,
-                "nonce":    w3.eth.get_transaction_count(account.address),
-                "gas":      250_000,
-                "gasPrice": w3.eth.gas_price,
-                "chainId":  137,
-            })
+        body = json.dumps({
+            "collateralToken":      _USDC_ADDRESS,
+            "parentCollectionId":   "0x" + "0" * 64,
+            "conditionId":          "0x" + cid,
+            "indexSets":            index_sets,
+        }, separators=(",", ":"))
 
-        # ── Path B: FUNDER is a proxy wallet — route through proxy.execute() ─
-        else:
-            # Encode redeemPositions calldata for the proxy to forward.
-            # encodeABI() was removed in web3.py v6 — use build_transaction to get
-            # the 'data' field (function selector + ABI-encoded args) instead.
-            redeem_calldata = ctf.functions.redeemPositions(
-                _USDC_ADDRESS,
-                parent_collection,
-                condition_bytes,
-                index_sets,
-            ).build_transaction({
-                "from":     account.address,
-                "gas":      0,
-                "gasPrice": 0,
-                "nonce":    0,
-                "chainId":  137,
-            })["data"]
-            proxy = w3.eth.contract(address=funder, abi=_PROXY_EXECUTE_ABI)
-            tx = proxy.functions.execute(
-                _CTF_ADDRESS,
-                0,               # value (no ETH/MATIC transfer)
-                redeem_calldata,
-            ).build_transaction({
-                "from":     account.address,
-                "nonce":    w3.eth.get_transaction_count(account.address),
-                "gas":      300_000,  # slightly more for proxy dispatch overhead
-                "gasPrice": w3.eth.gas_price,
-                "chainId":  137,
-            })
-            log.info(f"Using proxy execute path: EOA={account.address[:10]}… → FUNDER={funder[:10]}…")
+        path = "/redeem"
+        headers = _build_relayer_headers("POST", path, body)
 
-        signed  = w3.eth.account.sign_transaction(tx, POLYMARKET_PRIVATE_KEY)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        log.info(
+            f"⛽ Gasless claim | condition={condition_id[:16]}... "
+            f"| outcome={outcome} | payout=${payout:.2f}"
+        )
 
-        if receipt.status == 1:
-            log.info(f"✅ Auto-claimed ${payout:.2f}! TX: {tx_hash.hex()}")
+        resp = requests.post(
+            f"{_RELAYER_URL}{path}",
+            headers=headers,
+            data=body,
+            timeout=30,
+        )
+
+        if resp.status_code in (200, 201):
+            log.info(f"✅ Gasless claim submitted! ${payout:.2f} arriving shortly → {resp.text[:120]}")
             return True
         else:
-            log.error(f"❌ Claim tx reverted. TX: {tx_hash.hex()} — claim manually on polymarket.com")
+            log.warning(
+                f"❌ Gasless claim failed: HTTP {resp.status_code} — {resp.text[:300]}\n"
+                f"   Fallback: claim manually on polymarket.com"
+            )
             return False
 
     except Exception as e:
-        log.warning(f"Auto-claim failed ({type(e).__name__}: {e}) — claim manually on polymarket.com")
+        log.warning(f"❌ Gasless claim error ({type(e).__name__}: {e}) — claim manually on polymarket.com")
         return False
 
 
