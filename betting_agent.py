@@ -364,11 +364,21 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
 
         # ── Path B: FUNDER is a proxy wallet — route through proxy.execute() ─
         else:
-            # Encode the redeemPositions calldata for the proxy to forward
-            redeem_calldata = ctf.encodeABI(
-                fn_name="redeemPositions",
-                args=[_USDC_ADDRESS, parent_collection, condition_bytes, index_sets],
-            )
+            # Encode redeemPositions calldata for the proxy to forward.
+            # encodeABI() was removed in web3.py v6 — use build_transaction to get
+            # the 'data' field (function selector + ABI-encoded args) instead.
+            redeem_calldata = ctf.functions.redeemPositions(
+                _USDC_ADDRESS,
+                parent_collection,
+                condition_bytes,
+                index_sets,
+            ).build_transaction({
+                "from":     account.address,
+                "gas":      0,
+                "gasPrice": 0,
+                "nonce":    0,
+                "chainId":  137,
+            })["data"]
             proxy = w3.eth.contract(address=funder, abi=_PROXY_EXECUTE_ABI)
             tx = proxy.functions.execute(
                 _CTF_ADDRESS,
