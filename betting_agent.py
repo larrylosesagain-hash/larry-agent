@@ -320,35 +320,24 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
     try:
         w3 = _connect_polygon()
         if w3 is None:
-            log.warning("⛽ Auto-claim skipped: could not connect to Polygon RPC")
             return False
 
         account = w3.eth.account.from_key(POLYMARKET_PRIVATE_KEY)
         funder  = Web3.to_checksum_address(POLYMARKET_FUNDER)
 
-        # ── Diagnostics: always log signer + funder addresses so user can verify ──
-        log.info(
-            f"⛽ Claim attempt | signer={account.address} | funder={funder} | "
-            f"same={'YES (Path A)' if funder.lower() == account.address.lower() else 'NO (Path B — proxy)'}"
-        )
-
         # Check MATIC balance upfront — gives actionable log before hitting gas error
         matic_wei = w3.eth.get_balance(account.address)
-        matic_bal = matic_wei / 1e18
         if matic_wei == 0:
             log.warning(
                 f"⛽ Auto-claim skipped: signer wallet has 0 MATIC. "
-                f"Send MATIC to SIGNER address: {account.address} (NOT the funder). "
-                f"Each claim needs ~0.01–0.025 MATIC for Polygon gas."
+                f"Send at least 1 MATIC to {account.address} on Polygon to enable auto-claim."
             )
             return False
         if matic_wei < _MATIC_WARN_THRESHOLD_WEI:
             log.warning(
-                f"⛽ MATIC low ({matic_bal:.4f}) on signer {account.address} — "
+                f"⛽ MATIC low ({matic_wei/1e18:.4f}) on {account.address} — "
                 f"auto-claim may fail soon. Top up when convenient."
             )
-        else:
-            log.info(f"⛽ Signer MATIC balance: {matic_bal:.4f} MATIC — OK")
 
         ctf = w3.eth.contract(address=_CTF_ADDRESS, abi=_CTF_ABI)
 
@@ -412,22 +401,11 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
             log.info(f"✅ Auto-claimed ${payout:.2f}! TX: {tx_hash.hex()}")
             return True
         else:
-            log.error(
-                f"❌ Claim tx reverted. TX: {tx_hash.hex()}\n"
-                f"  → Possible causes: (1) wrong POLYMARKET_FUNDER address — tokens must be held by FUNDER={funder}, "
-                f"(2) condition not fully resolved on-chain yet, "
-                f"(3) positions already claimed. Check TX on polygonscan.com."
-            )
+            log.error(f"❌ Claim tx reverted. TX: {tx_hash.hex()} — claim manually on polymarket.com")
             return False
 
     except Exception as e:
-        log.warning(
-            f"Auto-claim failed ({type(e).__name__}: {e})\n"
-            f"  → If 'execution reverted': check that POLYMARKET_FUNDER={POLYMARKET_FUNDER} "
-            f"actually holds the winning CTF tokens.\n"
-            f"  → If connection error: Polygon RPC may be down, will retry next cycle.\n"
-            f"  → Claim manually on polymarket.com as fallback."
-        )
+        log.warning(f"Auto-claim failed ({type(e).__name__}: {e}) — claim manually on polymarket.com")
         return False
 
 
@@ -1139,27 +1117,37 @@ def reconcile_pending_bets():
         return
     log.info(f"🔍 Startup reconciliation: checking {len(pending)} pending bets for stale entries...")
     resolved_count = 0
+
+    # Phase 1: parallel status checks (read-only API calls — safe to run concurrently)
+    resolved_results = []
     with ThreadPoolExecutor(max_workers=min(len(pending), 8)) as ex:
         futures = {ex.submit(_check_single_bet, bet): bet for bet in pending}
         for future in as_completed(futures, timeout=60):
             result = future.result()
-            if not result:
-                continue
-            bet    = result["bet"]
-            won    = result["won"]
-            payout = result["payout"]
-            if won:
-                # Try to claim — if already claimed manually, tx reverts harmlessly
-                claim_winnings(
-                    condition_id=bet["polymarket_id"],
-                    outcome=bet["outcome"],
-                    payout=payout,
-                )
-            # Mark resolved in DB — bankroll NOT modified here (sync_bankroll runs after)
-            resolve_bet(bet["polymarket_id"], won, payout if won else 0.0)
-            label = f"WIN +${payout:.2f}" if won else f"LOSS/PHANTOM ${bet.get('amount_usdc', 0):.2f}"
-            log.info(f"🗑️  Reconciled {label}: {bet.get('question', '?')[:50]}")
-            resolved_count += 1
+            if result:
+                resolved_results.append(result)
+
+    # Phase 2: sequential claims — MUST be outside ThreadPoolExecutor so each
+    # claim_winnings call completes (including wait_for_transaction_receipt) before
+    # the next one starts. Running claims concurrently causes nonce collisions:
+    # all threads call get_transaction_count() simultaneously, get the same nonce,
+    # and every TX after the first fails with "replacement transaction underpriced".
+    for result in resolved_results:
+        bet    = result["bet"]
+        won    = result["won"]
+        payout = result["payout"]
+        if won:
+            # Try to claim — if already claimed manually, tx reverts harmlessly
+            claim_winnings(
+                condition_id=bet["polymarket_id"],
+                outcome=bet["outcome"],
+                payout=payout,
+            )
+        # Mark resolved in DB — bankroll NOT modified here (sync_bankroll runs after)
+        resolve_bet(bet["polymarket_id"], won, payout if won else 0.0)
+        label = f"WIN +${payout:.2f}" if won else f"LOSS/PHANTOM ${bet.get('amount_usdc', 0):.2f}"
+        log.info(f"🗑️  Reconciled {label}: {bet.get('question', '?')[:50]}")
+        resolved_count += 1
     remaining = len(get_pending_bets())
     if resolved_count:
         log.info(f"✅ Reconciliation: cleared {resolved_count} stale bets → {remaining} open remain")
@@ -1228,14 +1216,6 @@ def run_betting_agent():
                         log.info(f"💸 Capital freed via position sales — new bankroll: ${bankroll:.2f}")
                     else:
                         log.info(f"💸 No positions sold — still ${bankroll:.2f} free, need $5 to bet")
-
-                # Skip betting cycle entirely if still can't afford minimum bet.
-                # No point fetching 100+ markets + burning Claude tokens when every
-                # decision will be blocked by "Not enough bankroll" anyway.
-                if bankroll < ABSOLUTE_MIN_BET:
-                    log.info(f"💤 Bankroll ${bankroll:.2f} < min ${ABSOLUTE_MIN_BET:.2f} — skipping fetch+bet this cycle")
-                    time.sleep(30 * 60)
-                    continue
 
                 # 4. Fetch markets — three parallel Gamma batches, 24h window
                 markets = fetch_active_markets()
