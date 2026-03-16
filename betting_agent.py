@@ -26,53 +26,9 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.constants import POLYGON
 
-# ─── POLYGON / CTF CONSTANTS ──────────────────────────────────────────────────
-# Gnosis Conditional Token Framework contract on Polygon (same address all chains)
-_CTF_ADDRESS  = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+# ─── USDC ADDRESS ─────────────────────────────────────────────────────────────
 # USDC.e on Polygon (bridged) — what Polymarket settles in
 _USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-# Multiple RPC fallbacks — polygon-rpc.com is unreliable, try others if it fails
-_POLYGON_RPCS = [
-    # Verified working free public endpoints (March 2026)
-    # Old list (polygon-rpc.com → 401, ankr → needs API key, llamarpc → DNS dead)
-    "https://polygon-bor-rpc.publicnode.com",
-    "https://1rpc.io/matic",
-    "https://polygon.drpc.org",
-    "https://rpc-mainnet.matic.quiknode.pro",
-]
-_CTF_ABI = [{
-    "inputs": [
-        {"name": "collateralToken",    "type": "address"},
-        {"name": "parentCollectionId", "type": "bytes32"},
-        {"name": "conditionId",        "type": "bytes32"},
-        {"name": "indexSets",          "type": "uint256[]"},
-    ],
-    "name": "redeemPositions",
-    "outputs": [],
-    "stateMutability": "nonpayable",
-    "type": "function",
-}]
-
-# Polymarket proxy wallet ABI — used when POLYMARKET_FUNDER is a proxy contract
-# (not the same address as the EOA derived from POLYMARKET_PRIVATE_KEY).
-# The proxy's execute() lets the owner EOA call any contract on the proxy's behalf,
-# so redeemPositions() is called FROM FUNDER (which owns the CTF positions).
-_PROXY_EXECUTE_ABI = [{
-    "name": "execute",
-    "type": "function",
-    "stateMutability": "nonpayable",
-    "inputs": [
-        {"name": "to",    "type": "address"},
-        {"name": "value", "type": "uint256"},
-        {"name": "data",  "type": "bytes"},
-    ],
-    "outputs": [{"type": "bool"}],
-}]
-
-# Minimum MATIC balance (wei) to warn before attempting claims.
-# Each redeemPositions costs ~100k-250k gas; at 100 gwei → 0.025 MATIC per claim.
-# Warn when < 0.05 MATIC (~$0.01) so the user can top up before running dry.
-_MATIC_WARN_THRESHOLD_WEI = int(0.05 * 1e18)
 
 # ─── BUILDER RELAYER (gasless claims) ─────────────────────────────────────────
 _RELAYER_URL       = "https://relayer-v2.polymarket.com"
@@ -266,20 +222,6 @@ def get_positions_value() -> tuple[float, int]:
 
 
 # ─── AUTO-CLAIM WINNINGS ──────────────────────────────────────────────────────
-
-def _connect_polygon() -> "Web3 | None":
-    """Connect to Polygon via the first responsive RPC in _POLYGON_RPCS."""
-    for rpc in _POLYGON_RPCS:
-        try:
-            _w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 20}))
-            _ = _w3.eth.chain_id  # real RPC call — raises if unreachable
-            log.info(f"Connected to Polygon via {rpc}")
-            return _w3
-        except Exception as rpc_err:
-            log.warning(f"Polygon RPC {rpc} unreachable: {type(rpc_err).__name__}")
-    log.error("Cannot connect to any Polygon RPC — tried all fallbacks")
-    return None
-
 
 def check_matic_balance() -> float:
     """MATIC no longer needed for claims (gasless via builder relayer). Just logs status."""
