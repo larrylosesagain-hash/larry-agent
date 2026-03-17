@@ -869,8 +869,22 @@ def _check_gamma_for_resolution(cid: str, bet: dict) -> dict | None:
         if not isinstance(gm_list, list) or not gm_list:
             return None
         gm = gm_list[0]
-        if not gm.get("resolved"):
-            return None  # not resolved on Gamma either
+
+        # Log raw Gamma fields so we can see what it returns for resolved markets
+        log.info(
+            f"🔍 Gamma {cid[:16]}... | resolved={gm.get('resolved')} "
+            f"active={gm.get('active')} closed={gm.get('closed')} "
+            f"endDate={str(gm.get('endDate') or gm.get('end_date_iso') or '')[:10]}"
+        )
+
+        # Accept any indicator that the market is no longer active
+        is_resolved = (
+            gm.get("resolved") is True
+            or gm.get("active") is False
+            or gm.get("closed") is True
+        )
+        if not is_resolved:
+            return None  # still open on Gamma too
 
         # Gamma knows the winner — find our outcome's token price
         result = _resolve_from_tokens(gm.get("tokens") or [], bet["outcome"], bet)
@@ -879,7 +893,8 @@ def _check_gamma_for_resolution(cid: str, bet: dict) -> dict | None:
         # Resolved but our outcome token missing — treat as loss to clear zombie
         log.info(f"Gamma resolved (no token match for {bet['outcome']}) on {cid[:16]}... — treating as LOST")
         return {"bet": bet, "won": False, "payout": 0.0}
-    except Exception:
+    except Exception as e:
+        log.warning(f"Gamma check error for {cid[:16]}...: {e}")
         return None
 
 
@@ -937,8 +952,9 @@ def _check_single_bet(bet: dict) -> dict | None:
                     return {"bet": bet, "won": True, "payout": bet["potential_payout"]}
                 break
 
-        # ── Secondary path: end_date expired 4h+ ago but CLOB not closed yet ──
-        # CLOB can lag behind by hours. Gamma resolves faster.
+        # ── Secondary path: end_date passed → ask Gamma (no delay) ──────────────
+        # CLOB can lag behind by many hours. Gamma resolves much faster.
+        # We check Gamma as soon as end_date passes (previously was +4h delay — too long).
         end_date_str = (market.get("endDate") or market.get("end_date") or
                         market.get("end_date_iso") or market.get("endDateIso"))
         if end_date_str:
@@ -946,12 +962,12 @@ def _check_single_bet(bet: dict) -> dict | None:
                 end_date = datetime.fromisoformat(
                     end_date_str.replace("Z", "+00:00")
                 ).replace(tzinfo=None)
-                if datetime.utcnow() > end_date + timedelta(hours=4):
+                if datetime.utcnow() > end_date:
                     gamma_result = _check_gamma_for_resolution(cid, bet)
                     if gamma_result:
                         return gamma_result
-            except (ValueError, TypeError):
-                pass
+            except (ValueError, TypeError) as e:
+                log.warning(f"Could not parse end_date '{end_date_str}' for {cid[:16]}...: {e}")
 
     except Exception as e:
         log.error(f"Error checking bet {cid}: {e}")
