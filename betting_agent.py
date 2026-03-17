@@ -1185,6 +1185,17 @@ def run_betting_agent():
     log.info("🎰 Larry's Betting Agent starting up...")
     init_db()
 
+    # Enable WAL mode for SQLite — allows concurrent reads+writes from multiple threads
+    # (twitter agent + betting agent both write to the same DB simultaneously)
+    try:
+        import sqlite3
+        with sqlite3.connect("/app/data/larry.db") as _conn:
+            _conn.execute("PRAGMA journal_mode=WAL")
+            _conn.execute("PRAGMA busy_timeout=5000")  # wait up to 5s if locked
+        log.info("✅ SQLite WAL mode enabled")
+    except Exception as e:
+        log.debug(f"WAL mode setup skipped: {e}")  # non-critical
+
     # Restore scan page from DB so rotation continues across restarts
     _load_scan_page()
     log.info(f"📖 Scan page restored: {_scan_page}/10")
@@ -1353,22 +1364,28 @@ def run_betting_agent():
                                 odds = round(1 - market_info.get("yes_price", 0.5), 4)
                             potential_payout = actual_amount / odds if odds > 0 else actual_amount * 2
 
-                            try:
-                                bet_id = save_bet(
-                                    polymarket_id=market_id,
-                                    question=market_info.get("question", "Unknown market"),
-                                    outcome=decision.get("outcome", "YES"),
-                                    amount=actual_amount,
-                                    odds=odds,
-                                    potential_payout=potential_payout,
-                                    category=market_info.get("category", "weird"),
-                                    larry_comment=decision.get("reasoning", ""),
-                                )
-                            except Exception as db_err:
-                                # UNIQUE constraint: this market is already in DB (e.g. previously
-                                # cleared as resolved). Bet was placed on-chain but skip DB record.
-                                log.warning(f"⚠️  Could not save bet to DB ({type(db_err).__name__}): {market_id[:16]}... — bet placed but not tracked")
-                                bet_id = None
+                            bet_id = None
+                            for _db_attempt in range(4):
+                                try:
+                                    bet_id = save_bet(
+                                        polymarket_id=market_id,
+                                        question=market_info.get("question", "Unknown market"),
+                                        outcome=decision.get("outcome", "YES"),
+                                        amount=actual_amount,
+                                        odds=odds,
+                                        potential_payout=potential_payout,
+                                        category=market_info.get("category", "weird"),
+                                        larry_comment=decision.get("reasoning", ""),
+                                    )
+                                    break  # success
+                                except Exception as db_err:
+                                    err_str = str(db_err).lower()
+                                    if "locked" in err_str and _db_attempt < 3:
+                                        time.sleep(0.5 * (_db_attempt + 1))  # 0.5s, 1s, 1.5s
+                                        continue
+                                    # UNIQUE or non-recoverable error — bet on-chain but not tracked
+                                    log.warning(f"⚠️  Could not save bet to DB ({type(db_err).__name__}): {market_id[:16]}... — bet placed but not tracked")
+                                    break
 
                             # 8. Tweet the bet announcement
                             try:
