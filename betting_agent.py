@@ -175,8 +175,28 @@ _last_sell_attempt_at: datetime | None = None
 _SELL_COOLDOWN_MINUTES = 15  # wait at least 15 min between sell attempts
 
 # Positions that previously threw "not enough balance / allowance" — skip these
-# so they don't block every sell cycle.  Cleared on full process restart.
+# so they don't block every sell cycle.  Persisted to DB so survives restarts.
 _unsellable_positions: set = set()
+
+def _load_unsellable():
+    """Load persisted unsellable position blacklist from DB on startup."""
+    global _unsellable_positions
+    try:
+        raw = get_state("unsellable_positions")
+        if raw:
+            _unsellable_positions = set(json.loads(raw))
+            if _unsellable_positions:
+                log.info(f"💸 Loaded {len(_unsellable_positions)} unsellable position(s) from DB: "
+                         f"{', '.join(p[:16] for p in _unsellable_positions)}")
+    except Exception:
+        _unsellable_positions = set()
+
+def _save_unsellable():
+    """Persist unsellable position blacklist to DB."""
+    try:
+        set_state("unsellable_positions", json.dumps(list(_unsellable_positions)))
+    except Exception:
+        pass
 
 def _load_scan_page():
     global _scan_page
@@ -816,12 +836,23 @@ def try_sell_positions_for_capital(client: ClobClient, needed: float = 5.0) -> f
     """
     global _last_sell_attempt_at, _unsellable_positions
     now = _utcnow()
+
+    # Load sell cooldown from DB if in-memory is empty (e.g. after restart)
+    if _last_sell_attempt_at is None:
+        raw_ts = get_state("last_sell_attempt_at")
+        if raw_ts:
+            try:
+                _last_sell_attempt_at = datetime.fromisoformat(raw_ts)
+            except Exception:
+                pass
+
     if (_last_sell_attempt_at is not None and
             (now - _last_sell_attempt_at).total_seconds() < _SELL_COOLDOWN_MINUTES * 60):
         remaining = int(_SELL_COOLDOWN_MINUTES - (now - _last_sell_attempt_at).total_seconds() / 60)
         log.info(f"💸 Sell cooldown active ({remaining}m left) — skipping sell attempt")
         return 0.0
     _last_sell_attempt_at = now
+    set_state("last_sell_attempt_at", now.isoformat())
 
     pending = get_pending_bets()
     if not pending:
@@ -962,6 +993,7 @@ def try_sell_positions_for_capital(client: ClobClient, needed: float = 5.0) -> f
             log.error(f"💸 Exception selling {mid[:16]}: {type(e).__name__}: {e}")
             if "not enough balance" in err_str or "allowance" in err_str:
                 _unsellable_positions.add(mid)
+                _save_unsellable()  # persist so survives container restart
                 log.warning(
                     f"💸 Blacklisted {mid[:16]}... — repeated 'not enough balance/allowance' "
                     f"(total blacklisted: {len(_unsellable_positions)})"
@@ -1293,6 +1325,9 @@ def run_betting_agent():
     # Restore scan page from DB so rotation continues across restarts
     _load_scan_page()
     log.info(f"📖 Scan page restored: {_scan_page}/10")
+
+    # Restore unsellable position blacklist from DB
+    _load_unsellable()
 
     client = get_clob_client()
 
