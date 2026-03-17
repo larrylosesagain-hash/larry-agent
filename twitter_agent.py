@@ -17,7 +17,7 @@ import logging
 import threading
 import requests
 import tweepy
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from config import (
     TWITTER_API_KEY, TWITTER_API_SECRET,
     TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET,
@@ -40,6 +40,12 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 log = logging.getLogger(__name__)
+
+
+def _utcnow() -> datetime:
+    """Return current UTC time as naive datetime. Replaces datetime.utcnow() (deprecated Python 3.12+)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 # ─── REPLY RATIO: 1 reply per 4 own tweets ───────────────────────────────────
 REPLY_RATIO = 4
@@ -117,7 +123,7 @@ def post_tweet(text: str, tweet_type: str = "RANDOM", bet_id: int = None,
 
     # Anti-burst: sleep if we tweeted too recently
     if _last_tweet_at is not None:
-        elapsed = (datetime.utcnow() - _last_tweet_at).total_seconds()
+        elapsed = (_utcnow() - _last_tweet_at).total_seconds()
         wait = _TWEET_MIN_GAP_SECS - elapsed
         if wait > 0:
             log.info(f"⏳ Tweet throttle: waiting {wait:.0f}s (anti-burst gap, last tweet {elapsed:.0f}s ago)")
@@ -139,7 +145,7 @@ def post_tweet(text: str, tweet_type: str = "RANDOM", bet_id: int = None,
 
         tweet_id = str(response.data["id"])
         save_tweet(tweet_id=tweet_id, content=text, tweet_type=tweet_type, bet_id=bet_id)
-        _last_tweet_at = datetime.utcnow()  # update AFTER success
+        _last_tweet_at = _utcnow()  # update AFTER success
         log.info(f"✅ Tweeted [{tweet_type}]: {text[:80]}...")
         return tweet_id
 
@@ -319,7 +325,7 @@ def should_tweet_now() -> bool:
     No daily cap — only constraint is MIN_MINUTES_BETWEEN_TWEETS gap.
     25% chance per 15-min cycle when gap has elapsed = ~4-6 tweets/day naturally.
     """
-    now = datetime.utcnow()
+    now = _utcnow()
     last_tweet = get_last_tweet_time()
 
     if last_tweet:
@@ -339,7 +345,7 @@ def should_tweet_now() -> bool:
 
 
 def is_friday_pizza_time() -> bool:
-    now = datetime.utcnow()
+    now = _utcnow()
     return now.weekday() == 4 and 17 <= now.hour <= 19
 
 
@@ -347,7 +353,7 @@ def check_dead_man_switch() -> bool:
     last_tweet = get_last_tweet_time()
     if last_tweet is None:
         return False
-    hours_silent = (datetime.utcnow() - last_tweet).total_seconds() / 3600
+    hours_silent = (_utcnow() - last_tweet).total_seconds() / 3600
     return hours_silent >= DEAD_MAN_SWITCH_HOURS
 
 
@@ -356,7 +362,7 @@ def check_dead_man_switch() -> bool:
 # FIX: persist pizza flag in DB instead of module-level variable,
 # which was lost on every process restart (causing duplicate Friday tweets)
 def maybe_tweet_pizza():
-    now = datetime.utcnow()
+    now = _utcnow()
     # Reset flag on Monday via DB
     if now.weekday() == 0:
         set_state("pizza_tweeted_this_week", "false")
@@ -372,7 +378,7 @@ def maybe_tweet_pizza():
 
 def maybe_tweet_weekly_recap():
     """Every Sunday between 6-8pm UTC, Larry posts his weekly recap."""
-    now = datetime.utcnow()
+    now = _utcnow()
     if now.weekday() != 6 or not (18 <= now.hour <= 20):
         return
 
@@ -470,7 +476,7 @@ _candidate_cache: dict = {"candidate": None, "expires_at": datetime.min}
 def _get_cycle_candidate() -> dict | None:
     """Return cached candidate or fetch a fresh one. Shared across all engagement functions."""
     global _candidate_cache
-    now = datetime.utcnow()
+    now = _utcnow()
     if now < _candidate_cache["expires_at"]:
         return _candidate_cache["candidate"]
     candidate = _find_quote_tweet_candidate()
@@ -492,7 +498,7 @@ def _init_quote_blacklist():
         return
     try:
         data = json.loads(raw)
-        now = datetime.utcnow()
+        now = _utcnow()
         # Load only entries that haven't expired yet
         _quote_account_blacklist = {
             k: datetime.fromisoformat(v)
@@ -619,7 +625,7 @@ def _find_quote_tweet_candidate() -> dict | None:
     accounts are fine — it's only in maybe_reply_to_whitelist where we need to avoid them
     (to prevent double-replying with the VIP stream).
     """
-    now_dt = datetime.utcnow()
+    now_dt = _utcnow()
     available_accounts = [
         a for a in _QUOTE_ACCOUNTS
         if _quote_account_blacklist.get(a, datetime.min) < now_dt
@@ -637,7 +643,7 @@ def maybe_quote_tweet():
     Throttled: min 2 hours between quote tweets. 70% chance per check when eligible.
     Gives ~5-7 quote tweets per day — active but not spammy.
     """
-    now = datetime.utcnow()
+    now = _utcnow()
     if now.hour < 8 or now.hour >= 23:
         return  # only active hours
 
@@ -713,7 +719,7 @@ def maybe_retweet():
     No text needed — pure retweet. ~2-3 per day.
     Throttled: min 6 hours between retweets. 50% chance when eligible.
     """
-    now = datetime.utcnow()
+    now = _utcnow()
     if now.hour < 8 or now.hour >= 23:
         return
 
@@ -760,7 +766,7 @@ def maybe_reply_to_whitelist():
     - Cooldown: 30 minutes (was 2h — was the main reason Larry never replied).
     - Up to 5 attempts per cycle to find an open tweet.
     """
-    now = datetime.utcnow()
+    now = _utcnow()
     if now.hour < 7 or now.hour >= 24:
         return  # gentle active-hours limit
 
@@ -836,7 +842,7 @@ def maybe_react_to_price_moves():
     last_react = get_state("last_price_react_time")
     if last_react:
         try:
-            if (datetime.utcnow() - datetime.fromisoformat(last_react)).total_seconds() < 6 * 3600:
+            if (_utcnow() - datetime.fromisoformat(last_react)).total_seconds() < 6 * 3600:
                 return
         except Exception:
             pass
@@ -894,7 +900,7 @@ def maybe_react_to_price_moves():
         comment = tweet_data.get("tweet", "")
         if comment:
             post_tweet(comment, tweet_type="PRICE_MOVE")
-            set_state("last_price_react_time", datetime.utcnow().isoformat())
+            set_state("last_price_react_time", _utcnow().isoformat())
 
     except Exception as e:
         log.warning(f"Price move react failed: {type(e).__name__}: {e}")
@@ -944,7 +950,7 @@ class LarryStreamClient(tweepy.StreamingClient):
             if not tweet:
                 return
 
-            now = datetime.utcnow()
+            now = _utcnow()
 
             # No active-hours restriction — Elon tweets 24/7, Larry replies 24/7.
 
@@ -1052,7 +1058,7 @@ def run_vip_stream():
 
             # NOTE: matching_rules is returned by Twitter at the ROOT of the stream response,
             # not inside tweet data. We access it via on_response(response).matching_rules.
-            connected_at = datetime.utcnow()
+            connected_at = _utcnow()
             stream.filter(
                 tweet_fields=["id", "text", "author_id"],
                 expansions=["author_id"],
@@ -1080,7 +1086,7 @@ def run_vip_stream():
         else:
             # stream.filter() returned without raising — but was it a real clean disconnect,
             # or an immediate ConnectTimeout handled silently inside tweepy?
-            session_secs = (datetime.utcnow() - connected_at).total_seconds() if connected_at else 0
+            session_secs = (_utcnow() - connected_at).total_seconds() if connected_at else 0
             if session_secs >= 30:
                 backoff = 5  # genuinely connected for a while — reset backoff
                 log.info(f"VIP stream disconnected after {session_secs:.0f}s — reconnecting")

@@ -17,11 +17,16 @@ import os
 import logging
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from web3 import Web3
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.constants import POLYGON
+
+def _utcnow() -> datetime:
+    """Return current UTC time as naive datetime. Replaces datetime.utcnow() (deprecated Python 3.12+)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 # ─── USDC ADDRESS ─────────────────────────────────────────────────────────────
 # USDC.e on Polygon (bridged) — what Polymarket settles in
@@ -83,11 +88,11 @@ from config import (
     POLYMARKET_PRIVATE_KEY, POLYMARKET_FUNDER,
     POLYMARKET_HOST, POLYMARKET_GAMMA_API,
     BET_CHECK_INTERVAL_MINUTES,
-    ABSOLUTE_MIN_BET
+    ABSOLUTE_MIN_BET, ABSOLUTE_MAX_BET
 )
 from database import (
     get_bankroll, set_bankroll, get_pending_bets, save_bet, resolve_bet,
-    init_db, get_state, set_state
+    init_db, get_state, set_state, get_connection
 )
 from larry_brain import ask_larry_to_bet, ask_larry_for_tweet, ask_larry_to_sell
 
@@ -105,15 +110,15 @@ _token_not_found_blacklist: dict = {}
 _TOKEN_BLACKLIST_TTL_HOURS = 6
 
 def _blacklist_token(condition_id: str):
-    _token_not_found_blacklist[condition_id.lower()] = datetime.utcnow() + timedelta(hours=_TOKEN_BLACKLIST_TTL_HOURS)
+    _token_not_found_blacklist[condition_id.lower()] = _utcnow() + timedelta(hours=_TOKEN_BLACKLIST_TTL_HOURS)
 
 def _is_token_blacklisted(condition_id: str) -> bool:
     cid = condition_id.lower()
     expiry = _token_not_found_blacklist.get(cid)
     if expiry is None:
         return False
-    if datetime.utcnow() > expiry:
-        del _token_not_found_blacklist[cid]  # expired — remove and allow retry
+    if _utcnow() > expiry:
+        _token_not_found_blacklist.pop(cid, None)  # .pop avoids KeyError if two threads race here
         return False
     return True
 
@@ -128,7 +133,7 @@ _pass_cache: dict = {}  # condition_id → {"passed_at": datetime, "price": floa
 
 def _cache_pass(condition_id: str, yes_price: float, hours_to_end: int):
     _pass_cache[condition_id.lower()] = {
-        "passed_at": datetime.utcnow(),
+        "passed_at": _utcnow(),
         "price": yes_price,
         "hours_to_end": hours_to_end,
     }
@@ -142,19 +147,19 @@ def _is_pass_cached(market: dict) -> bool:
         return False
 
     # TTL expired — allow retry
-    if datetime.utcnow() - entry["passed_at"] > timedelta(hours=6):
-        del _pass_cache[cid]
+    if _utcnow() - entry["passed_at"] > timedelta(hours=6):
+        _pass_cache.pop(cid, None)  # .pop avoids KeyError if two code paths race
         return False
 
     # Price moved >5% — new information, worth re-analysing
     current_price = market.get("yes_price", 0.5)
     if abs(current_price - entry["price"]) > 0.05:
-        del _pass_cache[cid]
+        _pass_cache.pop(cid, None)
         return False
 
     # Market became urgent since last PASS — re-examine
     if market.get("hours_to_end", 24) <= 4 and entry["hours_to_end"] > 4:
-        del _pass_cache[cid]
+        _pass_cache.pop(cid, None)
         return False
 
     return True  # nothing changed — skip
@@ -207,26 +212,30 @@ def sync_bankroll_from_clob(client: ClobClient):
     Called at startup so Larry knows his real balance, not just what the DB thinks.
     NOTE: This reflects trading allowance (approved for CLOB), not total wallet balance.
     Unclaimed winnings may not appear here until claimed on polymarket.com.
+    Retries up to 3 times with 5s backoff — CLOB occasionally returns 5xx on cold start.
     """
-    try:
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-        # AssetType.USDC was renamed to COLLATERAL in newer versions of py_clob_client
-        asset = getattr(AssetType, "COLLATERAL", None) or getattr(AssetType, "USDC", None)
-        result = client.get_balance_allowance(
-            BalanceAllowanceParams(asset_type=asset)
-        )
-        # balance is returned as a string of raw units (6 decimals for USDC)
-        raw = result.get("balance", "0")
-        real_balance = float(raw) / 1_000_000  # convert from microUSDC to USDC
-        if real_balance >= 0:
-            db_balance = get_bankroll()
-            if abs(real_balance - db_balance) > 0.01:  # sync whenever diff > 1 cent
-                log.info(f"💰 Balance sync: DB=${db_balance:.2f} → CLOB=${real_balance:.2f}")
-                set_bankroll(real_balance, real_balance - db_balance, "SYNC")
+    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+    asset = getattr(AssetType, "COLLATERAL", None) or getattr(AssetType, "USDC", None)
+
+    for attempt in range(3):
+        try:
+            result = client.get_balance_allowance(BalanceAllowanceParams(asset_type=asset))
+            raw = result.get("balance", "0")
+            real_balance = float(raw) / 1_000_000  # microUSDC → USDC
+            if real_balance >= 0:
+                db_balance = get_bankroll()
+                if abs(real_balance - db_balance) > 0.01:
+                    log.info(f"💰 Balance sync: DB=${db_balance:.2f} → CLOB=${real_balance:.2f}")
+                    set_bankroll(real_balance, real_balance - db_balance, "SYNC")
+                else:
+                    log.info(f"💰 Balance OK: DB=${db_balance:.2f}, CLOB=${real_balance:.2f}")
+            return  # success
+        except Exception as e:
+            if attempt < 2:
+                log.warning(f"Balance sync attempt {attempt+1}/3 failed ({type(e).__name__}: {e}) — retrying in 5s")
+                time.sleep(5)
             else:
-                log.info(f"💰 Balance OK: DB=${db_balance:.2f}, CLOB=${real_balance:.2f}")
-    except Exception as e:
-        log.warning(f"Balance sync failed ({type(e).__name__}: {e}) — using DB balance")
+                log.warning(f"Balance sync failed after 3 attempts — using DB balance (last error: {type(e).__name__}: {e})")
 
 
 # ─── PORTFOLIO VALUATION ──────────────────────────────────────────────────────
@@ -264,15 +273,56 @@ def get_positions_value() -> tuple[float, int]:
         return 0.0, 0
 
 
-# ─── AUTO-CLAIM WINNINGS ──────────────────────────────────────────────────────
+# ─── DAILY LOSS LIMIT ─────────────────────────────────────────────────────────
+# Stop placing NEW bets if Larry has already lost more than this fraction of his
+# starting-of-day bankroll today. Existing open bets continue running.
+# e.g. 0.30 = stop after losing 30% of today's starting bankroll in one day.
+_DAILY_LOSS_LIMIT_PCT = 0.30
 
-def check_matic_balance() -> float:
-    """MATIC no longer needed for claims (gasless via builder relayer). Just logs status."""
-    if _BUILDER_API_KEY:
-        log.info("⛽ Gasless claim enabled via Builder Relayer — no MATIC needed for claims")
-    else:
-        log.warning("⚠️  POLYMARKET_BUILDER_API_KEY not set — auto-claim disabled")
-    return 0.0
+def _get_daily_loss_usdc() -> float:
+    """
+    Sum of USDC lost on bets that resolved today (UTC).
+    Reads resolved bets from DB where status='LOST' and resolved_at is today.
+    Returns 0.0 if DB has no resolved_at column or any other error.
+    """
+    try:
+        conn = get_connection()
+        row = conn.execute("""
+            SELECT COALESCE(SUM(amount_usdc), 0) as total_lost
+            FROM bets
+            WHERE status = 'LOST'
+              AND DATE(resolved_at) = DATE('now')
+        """).fetchone()
+        conn.close()
+        return float(row["total_lost"]) if row else 0.0
+    except Exception:
+        return 0.0
+
+def _is_daily_loss_limit_hit() -> bool:
+    """
+    Returns True if Larry has lost >= _DAILY_LOSS_LIMIT_PCT of his bankroll today.
+    Conservative check: uses current bankroll + today's losses as proxy for start-of-day bankroll.
+    """
+    try:
+        lost_today = _get_daily_loss_usdc()
+        if lost_today <= 0:
+            return False
+        bankroll = get_bankroll()
+        start_of_day_bankroll = bankroll + lost_today   # approximate: what he had before losing
+        limit = start_of_day_bankroll * _DAILY_LOSS_LIMIT_PCT
+        if lost_today >= limit:
+            log.warning(
+                f"🛑 Daily loss limit hit: lost ${lost_today:.2f} today "
+                f"(>{_DAILY_LOSS_LIMIT_PCT*100:.0f}% of ~${start_of_day_bankroll:.2f} start-of-day bankroll) "
+                f"— no new bets until tomorrow UTC"
+            )
+            return True
+        return False
+    except Exception:
+        return False
+
+
+# ─── AUTO-CLAIM WINNINGS ──────────────────────────────────────────────────────
 
 
 def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
@@ -377,10 +427,24 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
                 })
                 signed = account.sign_transaction(tx)
                 tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-                receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-                if receipt["status"] == 1:
+
+                # Polygon can be slow under congestion — retry receipt up to 3×60s
+                receipt = None
+                for _receipt_attempt in range(3):
+                    try:
+                        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+                        break
+                    except Exception as timeout_err:
+                        log.debug(f"Receipt attempt {_receipt_attempt+1}/3 timed out: {timeout_err}")
+                        time.sleep(5)
+
+                if receipt and receipt["status"] == 1:
                     log.info(f"✅ Direct on-chain claim success! tx={tx_hash.hex()[:16]}...")
                     return True
+                elif receipt:
+                    log.warning(f"❌ TX mined but status=0 (reverted) for indexSet={idx_set}")
+                else:
+                    log.warning(f"❌ Could not get receipt for indexSet={idx_set} tx after 3 attempts — chain may be congested")
                 nonce += 1
             except Exception as tx_err:
                 log.debug(f"indexSet={idx_set} failed: {tx_err}")
@@ -445,7 +509,7 @@ def fetch_active_markets() -> list:
     Claude sees: 12 anchor + 8 scan + 5 fresh = 25 markets per cycle.
     """
     global _scan_page
-    now = datetime.utcnow()
+    now = _utcnow()
     cutoff = now + timedelta(hours=24)   # TODAY only — must resolve within 24h
     min_time = now + timedelta(minutes=30)  # skip markets resolving in under 30min (too late to fill)
 
@@ -580,10 +644,6 @@ def fetch_active_markets() -> list:
                 if yes_price >= 0.97 or yes_price <= 0.03:
                     continue
 
-                best_bid_raw = m.get("bestBid")
-                best_bid  = float(best_bid_raw) if best_bid_raw is not None else (yes_price - 0.02)
-                last_price = float(m.get("lastTradePrice") or yes_price)
-
                 out.append({
                     "condition_id": (m.get("conditionId") or m.get("condition_id") or "").lower(),
                     "question": m.get("question"),
@@ -591,8 +651,6 @@ def fetch_active_markets() -> list:
                     "days_to_end": days_to_end,
                     "hours_to_end": hours_to_end,
                     "yes_price": round(yes_price, 4),
-                    "spread": round(yes_price - best_bid, 4),
-                    "price_vs_last": round(yes_price - last_price, 4),
                     "volume_24h": float(m.get("volume24hr", 0)),
                     "category": _guess_category(m.get("question", "")),
                 })
@@ -911,7 +969,10 @@ def _resolve_from_tokens(tokens: list, outcome: str, bet: dict) -> dict | None:
     """Helper: scan tokens list for matching outcome, return resolution dict."""
     for token in tokens:
         if token.get("outcome", "").upper() == outcome.upper():
-            price = float(token.get("price", 0))
+            try:
+                price = float(token.get("price", 0))
+            except (TypeError, ValueError):
+                price = 0.0
             won = price >= 0.99
             return {"bet": bet, "won": won, "payout": bet["potential_payout"] if won else 0.0}
     return None
@@ -1017,7 +1078,10 @@ def _check_single_bet(bet: dict) -> dict | None:
             # Find our outcome token's current price — winning token will be > 0.5
             for token in tokens:
                 if token.get("outcome", "").upper() == bet["outcome"].upper():
-                    price = float(token.get("price", 0))
+                    try:
+                        price = float(token.get("price", 0))
+                    except (TypeError, ValueError):
+                        price = 0.0
                     won = price > 0.5
                     log.info(
                         f"🔗 CTF resolved: {cid[:16]}... | "
@@ -1037,7 +1101,10 @@ def _check_single_bet(bet: dict) -> dict | None:
         # ── TERTIARY: Token price near 1.0 (CLOB lagging closed flag) ─────────
         for token in tokens:
             if token.get("outcome", "").upper() == bet["outcome"].upper():
-                price = float(token.get("price", 0))
+                try:
+                    price = float(token.get("price", 0))
+                except (TypeError, ValueError):
+                    price = 0.0
                 if price >= 0.99:
                     log.info(f"💡 Token price={price:.3f} → WIN (CLOB closed flag lagging): {cid[:16]}...")
                     return {"bet": bet, "won": True, "payout": bet["potential_payout"]}
@@ -1163,14 +1230,24 @@ def reconcile_pending_bets():
         won    = result["won"]
         payout = result["payout"]
         if won:
-            # Try to claim — if already claimed manually, tx reverts harmlessly
-            claim_winnings(
-                condition_id=bet["polymarket_id"],
-                outcome=bet["outcome"],
-                payout=payout,
-            )
+            # Try to claim — wrap so a single failed claim doesn't abort all reconciliation
+            try:
+                claim_winnings(
+                    condition_id=bet["polymarket_id"],
+                    outcome=bet["outcome"],
+                    payout=payout,
+                )
+            except Exception as claim_err:
+                log.warning(
+                    f"⚠️  Claim failed during reconcile for {bet.get('polymarket_id','?')[:16]}... "
+                    f"({type(claim_err).__name__}: {claim_err}) — marking resolved anyway, claim manually on polymarket.com"
+                )
         # Mark resolved in DB — bankroll NOT modified here (sync_bankroll runs after)
-        resolve_bet(bet["polymarket_id"], won, payout if won else 0.0)
+        try:
+            resolve_bet(bet["polymarket_id"], won, payout if won else 0.0)
+        except Exception as db_err:
+            log.warning(f"⚠️  resolve_bet failed ({type(db_err).__name__}: {db_err}) — will retry next startup")
+            continue
         label = f"WIN +${payout:.2f}" if won else f"LOSS/PHANTOM ${bet.get('amount_usdc', 0):.2f}"
         log.info(f"🗑️  Reconciled {label}: {bet.get('question', '?')[:50]}")
         resolved_count += 1
@@ -1202,8 +1279,10 @@ def run_betting_agent():
 
     client = get_clob_client()
 
-    # Check MATIC balance for auto-claim — logs address + balance + funding instructions
-    check_matic_balance()
+    if _BUILDER_API_KEY:
+        log.info("⛽ Gasless claim enabled via Builder Relayer")
+    else:
+        log.warning("⚠️  POLYMARKET_BUILDER_API_KEY not set — auto-claim disabled, claim manually on polymarket.com")
 
     # Step 1: Clear zombie bets (resolved/phantom bets stuck in DB)
     # Must run BEFORE sync so that cleared bets don't inflate "exposure" after sync.
@@ -1254,6 +1333,11 @@ def run_betting_agent():
                     else:
                         log.info(f"💸 No positions sold — still ${bankroll:.2f} free, need $5 to bet")
 
+                # 3c. Daily loss limit — stop placing new bets if lost too much today
+                if _is_daily_loss_limit_hit():
+                    log.info("💤 Skipping bet cycle — daily loss limit active")
+                    continue  # skip betting this cycle, still check pending bets next cycle
+
                 # 4. Fetch markets — three parallel Gamma batches, 24h window
                 markets = fetch_active_markets()
 
@@ -1286,13 +1370,22 @@ def run_betting_agent():
                     n_pass  = len(decisions) - n_bets
                     log.info(f"Larry made {len(decisions)} decisions — {n_bets} BETs, {n_pass} PASSes")
 
+                    # Build market lookup dict once — avoids O(N×M) searches in the decision loop
+                    market_by_id = {m["condition_id"]: m for m in markets}
+
+                    # Snapshot pending bets at decision-loop start — refreshed only when
+                    # a new bet is placed (avoiding 1 DB query per decision).
+                    mid_loop_bets = get_pending_bets()
+                    mid_loop_ids  = {(b.get("polymarket_id") or "").lower() for b in mid_loop_bets}
+                    mid_loop_qs   = {(b.get("question") or "").lower().strip() for b in mid_loop_bets}
+
                     for decision in decisions:
                         if decision.get("decision") != "BET":
                             log.info(f"PASS: {decision.get('reasoning', 'no reason given')}")
                             # Cache PASS so we don't re-send same market next cycle
                             mid = (decision.get("market_id") or "").lower()
                             if mid:
-                                m_info = next((m for m in markets if m["condition_id"] == mid), None)
+                                m_info = market_by_id.get(mid)
                                 if m_info:
                                     _cache_pass(mid, m_info.get("yes_price", 0.5), m_info.get("hours_to_end", 24))
                             continue
@@ -1307,24 +1400,19 @@ def run_betting_agent():
                         market_id = (decision.get("market_id") or "").lower()
                         decision_outcome = decision.get("outcome", "")
 
-                        # Skip if we already have an open bet on this exact market
-                        # Normalize both sides to lowercase — Claude may return different case
-                        mid_loop_bets = get_pending_bets()
-                        already_open = any(
-                            (b.get("polymarket_id") or "").lower() == market_id
-                            for b in mid_loop_bets
-                        )
+                        # Guard: Claude sometimes returns empty/malformed market_id
+                        if not market_id:
+                            log.warning(f"Decision missing market_id — skipping (outcome={decision_outcome}, reasoning={decision.get('reasoning','')[:60]})")
+                            continue
+
+                        # Skip if we already have an open bet on this exact market.
+                        # Use cached sets from the snapshot — updated immediately after each new bet.
+                        already_open = market_id in mid_loop_ids
                         if not already_open:
                             # Fallback: same question text (catches ID format mismatches)
-                            decision_question = next(
-                                (m.get("question", "") for m in markets if m["condition_id"] == market_id),
-                                ""
-                            ).lower().strip()
+                            decision_question = (market_by_id.get(market_id) or {}).get("question", "").lower().strip()
                             if decision_question:
-                                already_open = any(
-                                    (b.get("question") or "").lower().strip() == decision_question
-                                    for b in mid_loop_bets
-                                )
+                                already_open = decision_question in mid_loop_qs
                         if already_open:
                             log.info(f"Already have open bet on {market_id[:20]}..., skipping")
                             continue
@@ -1335,14 +1423,17 @@ def run_betting_agent():
                             {}
                         )
 
-                        # 6. Deduct bet amount from bankroll first
+                        # 6. Determine bet amount with safety clamps
                         bankroll = get_bankroll()
-                        amount = float(decision.get("amount_usdc", ABSOLUTE_MIN_BET))
-                        # IMPORTANT: place_bet enforces a $5 CLOB minimum — always check
-                        # against actual order size, not the raw Kelly amount. If we only
-                        # checked the Kelly amount (~$1) we'd pass the check but hit
-                        # "not enough balance" at CLOB, and also under-deduct from DB.
-                        actual_amount = max(amount, 5.0)
+                        try:
+                            raw_amount = float(decision.get("amount_usdc") or ABSOLUTE_MIN_BET)
+                        except (TypeError, ValueError):
+                            raw_amount = ABSOLUTE_MIN_BET
+                        # CLOB minimum is $5; cap at ABSOLUTE_MAX_BET AND 50% bankroll
+                        # (even if Larry's Kelly suggests more — prevents a single bad
+                        # bet from wiping the bankroll if something goes wrong).
+                        actual_amount = max(raw_amount, 5.0)
+                        actual_amount = min(actual_amount, ABSOLUTE_MAX_BET, bankroll * 0.5)
                         if actual_amount > bankroll:
                             log.warning(f"Not enough bankroll (${bankroll:.2f}) for ${actual_amount:.2f} bet")
                             continue
@@ -1358,19 +1449,22 @@ def run_betting_agent():
 
                             # market_info already resolved above — no duplicate lookup
                             # no_price was removed from market dict; derive it
-                            if decision.get("outcome") == "YES":
-                                odds = market_info.get("yes_price", 0.5)
+                            outcome_for_odds = decision.get("outcome", "YES")
+                            raw_yes = market_info.get("yes_price", 0.5)
+                            if outcome_for_odds == "YES":
+                                odds = max(0.01, min(raw_yes, 0.99))
                             else:
-                                odds = round(1 - market_info.get("yes_price", 0.5), 4)
-                            potential_payout = actual_amount / odds if odds > 0 else actual_amount * 2
+                                odds = max(0.01, min(round(1 - raw_yes, 4), 0.99))
+                            potential_payout = actual_amount / odds
 
                             bet_id = None
+                            q_text = market_info.get("question", "Unknown market")
                             for _db_attempt in range(4):
                                 try:
                                     bet_id = save_bet(
                                         polymarket_id=market_id,
-                                        question=market_info.get("question", "Unknown market"),
-                                        outcome=decision.get("outcome", "YES"),
+                                        question=q_text,
+                                        outcome=outcome_for_odds,
                                         amount=actual_amount,
                                         odds=odds,
                                         potential_payout=potential_payout,
@@ -1386,6 +1480,11 @@ def run_betting_agent():
                                     # UNIQUE or non-recoverable error — bet on-chain but not tracked
                                     log.warning(f"⚠️  Could not save bet to DB ({type(db_err).__name__}): {market_id[:16]}... — bet placed but not tracked")
                                     break
+
+                            # Update in-loop dedup cache so next decision in this same
+                            # batch sees this bet as already open (avoids re-betting).
+                            mid_loop_ids.add(market_id)
+                            mid_loop_qs.add(q_text.lower().strip())
 
                             # 8. Tweet the bet announcement
                             try:
