@@ -174,6 +174,10 @@ _scan_page: int = 0
 _last_sell_attempt_at: datetime | None = None
 _SELL_COOLDOWN_MINUTES = 15  # wait at least 15 min between sell attempts
 
+# Positions that previously threw "not enough balance / allowance" — skip these
+# so they don't block every sell cycle.  Cleared on full process restart.
+_unsellable_positions: set = set()
+
 def _load_scan_page():
     global _scan_page
     try:
@@ -330,20 +334,30 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
                     log.info(f"🔧 Using: {_name}")
                     break
 
+            def _make_relay_client(**extra_kwargs):
+                """Try RelayClient with host= first; fall back without if TypeError."""
+                base_kwargs = dict(
+                    chain_id=137,
+                    key=POLYMARKET_PRIVATE_KEY,
+                    funder=POLYMARKET_FUNDER,
+                    **extra_kwargs,
+                )
+                try:
+                    return RelayClient(host=_RELAYER_URL, **base_kwargs)
+                except TypeError as te:
+                    if "host" in str(te):
+                        log.info("🔧 RelayClient doesn't accept 'host=' — retrying without it")
+                        return RelayClient(**base_kwargs)
+                    raise
+
             if _BuilderConfig is not None:
                 builder_cfg = _BuilderConfig(
                     api_key=_BUILDER_API_KEY, secret=_BUILDER_SECRET, passphrase=_BUILDER_PASSPHRASE
                 )
-                relay_client = RelayClient(
-                    host=_RELAYER_URL, chain_id=137,
-                    key=POLYMARKET_PRIVATE_KEY, funder=POLYMARKET_FUNDER,
-                    builder_config=builder_cfg,
-                )
+                relay_client = _make_relay_client(builder_config=builder_cfg)
             else:
                 log.warning("⚠️  No config class found, trying raw credentials")
-                relay_client = RelayClient(
-                    host=_RELAYER_URL, chain_id=137,
-                    key=POLYMARKET_PRIVATE_KEY, funder=POLYMARKET_FUNDER,
+                relay_client = _make_relay_client(
                     api_key=_BUILDER_API_KEY, secret=_BUILDER_SECRET, passphrase=_BUILDER_PASSPHRASE,
                 )
 
@@ -800,7 +814,7 @@ def try_sell_positions_for_capital(client: ClobClient, needed: float = 5.0) -> f
 
     Returns: estimated USDC freed (sum of sell values; 0 if nothing sold / cooldown active).
     """
-    global _last_sell_attempt_at
+    global _last_sell_attempt_at, _unsellable_positions
     now = _utcnow()
     if (_last_sell_attempt_at is not None and
             (now - _last_sell_attempt_at).total_seconds() < _SELL_COOLDOWN_MINUTES * 60):
@@ -819,9 +833,16 @@ def try_sell_positions_for_capital(client: ClobClient, needed: float = 5.0) -> f
     token_lookup: dict = {}   # market_id → token_id (needed for sell order)
     price_lookup: dict = {}   # market_id → current price
 
+    if _unsellable_positions:
+        log.info(f"💸 Skipping {len(_unsellable_positions)} blacklisted unsellable position(s): "
+                 f"{', '.join(p[:16] for p in _unsellable_positions)}")
+
     for bet in pending:
         mid = bet.get("polymarket_id", "")
         if not mid:
+            continue
+        if mid in _unsellable_positions:
+            log.debug(f"💸 Skipping blacklisted position {mid[:16]}")
             continue
         try:
             md = client.get_market(mid)
@@ -937,7 +958,14 @@ def try_sell_positions_for_capital(client: ClobClient, needed: float = 5.0) -> f
                     f"{resp.get('errorMsg', resp.get('error', 'unknown'))}"
                 )
         except Exception as e:
+            err_str = str(e).lower()
             log.error(f"💸 Exception selling {mid[:16]}: {type(e).__name__}: {e}")
+            if "not enough balance" in err_str or "allowance" in err_str:
+                _unsellable_positions.add(mid)
+                log.warning(
+                    f"💸 Blacklisted {mid[:16]}... — repeated 'not enough balance/allowance' "
+                    f"(total blacklisted: {len(_unsellable_positions)})"
+                )
 
     if total_freed > 0:
         # Wait briefly for GTC orders to fill, then re-sync bankroll from CLOB
@@ -1322,8 +1350,14 @@ def run_betting_agent():
                     else:
                         log.info(f"💸 No positions sold — still ${bankroll:.2f} free, need $5 to bet")
 
-                # 4. Fetch markets — three parallel Gamma batches, 24h window
-                markets = fetch_active_markets()
+                # Guard: if still under $5 after sell attempt, skip Claude entirely.
+                # Calling Claude to pick markets when we can't afford the $5 minimum
+                # wastes API budget and time — just wait for open bets to resolve.
+                if bankroll < 5.0:
+                    log.info(f"💤 Bankroll ${bankroll:.2f} < $5 minimum — skipping market scan until capital frees up")
+                else:
+                    # 4. Fetch markets — three parallel Gamma batches, 24h window
+                    markets = fetch_active_markets()
 
                 if markets:
                     # Filter out markets Larry already has open bets on, token-blacklisted,
