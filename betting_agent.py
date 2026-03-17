@@ -239,7 +239,7 @@ def _build_relayer_headers(method: str, path: str, body: str = "") -> dict:
     """
     ts = str(int(time.time()))
     message = ts + method.upper() + path + body
-    secret_bytes = base64.b64decode(_BUILDER_SECRET)
+    secret_bytes = _BUILDER_SECRET.encode("utf-8")
     sig = hmac.new(secret_bytes, message.encode("utf-8"), hashlib.sha256)
     signature = base64.b64encode(sig.digest()).decode("utf-8")
     return {
