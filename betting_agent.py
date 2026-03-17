@@ -286,9 +286,11 @@ _DAILY_LOSS_LIMIT_PCT = 0.30
 
 def _get_daily_loss_usdc() -> float:
     """
-    Sum of USDC lost on bets that resolved today (UTC).
-    Reads resolved bets from DB where status='LOST' and resolved_at is today.
-    Returns 0.0 if DB has no resolved_at column or any other error.
+    Sum of USDC lost on bets PLACED today (UTC) that have already resolved as LOST.
+
+    Filters by placed_at (not resolved_at) so that old positions from previous days
+    that happen to expire today don't inflate today's loss figure.
+    Returns 0.0 on any DB error.
     """
     try:
         conn = get_connection()
@@ -296,7 +298,7 @@ def _get_daily_loss_usdc() -> float:
             SELECT COALESCE(SUM(amount_usdc), 0) as total_lost
             FROM bets
             WHERE status = 'LOST'
-              AND DATE(resolved_at) = DATE('now')
+              AND DATE(placed_at) = DATE('now')
         """).fetchone()
         conn.close()
         return float(row["total_lost"]) if row else 0.0
@@ -319,11 +321,21 @@ def _is_daily_loss_limit_hit(log_if_hit: bool = False) -> bool:
         if lost_today <= 0:
             return False
         bankroll = get_bankroll()
-        # Sum amount_usdc of all currently open bets (cost basis, not current market value)
-        pending = get_pending_bets()
-        open_exposure = sum(float(b.get("amount_usdc", 0)) for b in pending)
-        # Approximate start-of-day bankroll: what Larry had before today's losses
-        start_of_day_bankroll = bankroll + open_exposure + lost_today
+        # Only count bets placed TODAY that are still open — these represent capital
+        # spent from today's starting bankroll that hasn't resolved yet.
+        # Do NOT include old positions from previous days: their cost was already
+        # deducted from the bankroll on the day they were placed.
+        conn = get_connection()
+        row = conn.execute("""
+            SELECT COALESCE(SUM(amount_usdc), 0) as today_open
+            FROM bets
+            WHERE status = 'OPEN'
+              AND DATE(placed_at) = DATE('now')
+        """).fetchone()
+        conn.close()
+        today_open = float(row["today_open"]) if row else 0.0
+        # start_of_day_free ≈ what free cash Larry had at midnight UTC
+        start_of_day_bankroll = bankroll + today_open + lost_today
         if start_of_day_bankroll <= 0:
             return False
         limit = start_of_day_bankroll * _DAILY_LOSS_LIMIT_PCT
@@ -332,7 +344,7 @@ def _is_daily_loss_limit_hit(log_if_hit: bool = False) -> bool:
                 log.warning(
                     f"🛑 Daily loss limit hit: lost ${lost_today:.2f} today "
                     f"(>{_DAILY_LOSS_LIMIT_PCT*100:.0f}% of ~${start_of_day_bankroll:.2f} "
-                    f"start-of-day bankroll = ${bankroll:.2f} free + ${open_exposure:.2f} open + ${lost_today:.2f} lost) "
+                    f"start-of-day = ${bankroll:.2f} free + ${today_open:.2f} today-open + ${lost_today:.2f} lost) "
                     f"— no new bets until tomorrow UTC"
                 )
             return True
