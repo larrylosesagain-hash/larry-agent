@@ -278,79 +278,6 @@ def get_positions_value() -> tuple[float, int]:
         return 0.0, 0
 
 
-# ─── DAILY LOSS LIMIT ─────────────────────────────────────────────────────────
-# Stop placing NEW bets if Larry has already lost more than this fraction of his
-# starting-of-day bankroll today. Existing open bets continue running.
-# e.g. 0.30 = stop after losing 30% of today's starting bankroll in one day.
-_DAILY_LOSS_LIMIT_PCT = 0.30
-
-def _get_daily_loss_usdc() -> float:
-    """
-    Sum of USDC lost on bets PLACED today (UTC) that have already resolved as LOST.
-
-    Filters by placed_at (not resolved_at) so that old positions from previous days
-    that happen to expire today don't inflate today's loss figure.
-    Returns 0.0 on any DB error.
-    """
-    try:
-        conn = get_connection()
-        row = conn.execute("""
-            SELECT COALESCE(SUM(amount_usdc), 0) as total_lost
-            FROM bets
-            WHERE status = 'LOST'
-              AND DATE(placed_at) = DATE('now')
-        """).fetchone()
-        conn.close()
-        return float(row["total_lost"]) if row else 0.0
-    except Exception:
-        return 0.0
-
-def _is_daily_loss_limit_hit(log_if_hit: bool = False) -> bool:
-    """
-    Returns True if Larry has lost >= _DAILY_LOSS_LIMIT_PCT of his bankroll today.
-
-    Correct formula: start_of_day_bankroll = free_cash + open_positions_cost + lost_today
-    (NOT just free_cash + lost_today — that ignores capital tied up in open bets and
-    produces a wildly overstated loss percentage, triggering the limit too early.)
-
-    Pass log_if_hit=True to emit a warning at most ONCE per cycle.
-    The helper itself never logs so it can be called freely without spam.
-    """
-    try:
-        lost_today = _get_daily_loss_usdc()
-        if lost_today <= 0:
-            return False
-        bankroll = get_bankroll()
-        # Only count bets placed TODAY that are still open — these represent capital
-        # spent from today's starting bankroll that hasn't resolved yet.
-        # Do NOT include old positions from previous days: their cost was already
-        # deducted from the bankroll on the day they were placed.
-        conn = get_connection()
-        row = conn.execute("""
-            SELECT COALESCE(SUM(amount_usdc), 0) as today_open
-            FROM bets
-            WHERE status = 'OPEN'
-              AND DATE(placed_at) = DATE('now')
-        """).fetchone()
-        conn.close()
-        today_open = float(row["today_open"]) if row else 0.0
-        # start_of_day_free ≈ what free cash Larry had at midnight UTC
-        start_of_day_bankroll = bankroll + today_open + lost_today
-        if start_of_day_bankroll <= 0:
-            return False
-        limit = start_of_day_bankroll * _DAILY_LOSS_LIMIT_PCT
-        if lost_today >= limit:
-            if log_if_hit:
-                log.warning(
-                    f"🛑 Daily loss limit hit: lost ${lost_today:.2f} today "
-                    f"(>{_DAILY_LOSS_LIMIT_PCT*100:.0f}% of ~${start_of_day_bankroll:.2f} "
-                    f"start-of-day = ${bankroll:.2f} free + ${today_open:.2f} today-open + ${lost_today:.2f} lost) "
-                    f"— no new bets until tomorrow UTC"
-                )
-            return True
-        return False
-    except Exception:
-        return False
 
 
 def _get_all_bet_market_ids() -> set:
@@ -1395,16 +1322,8 @@ def run_betting_agent():
                     else:
                         log.info(f"💸 No positions sold — still ${bankroll:.2f} free, need $5 to bet")
 
-                # 3c. Daily loss limit — stop placing new bets if lost too much today.
-                # IMPORTANT: do NOT use `continue` here — it bypasses the sleep at the
-                # bottom of the loop and causes a tight busy-loop (~5s per iteration)
-                # that spams the log hundreds of times per hour.
-                # Initialize markets to None so subsequent `if markets:` blocks are safe
-                # even when the limit is hit and fetch_active_markets() is skipped.
-                markets = None
-                if not _is_daily_loss_limit_hit(log_if_hit=True):
-                    # 4. Fetch markets — three parallel Gamma batches, 24h window
-                    markets = fetch_active_markets()
+                # 4. Fetch markets — three parallel Gamma batches, 24h window
+                markets = fetch_active_markets()
 
                 if markets:
                     # Filter out markets Larry already has open bets on, token-blacklisted,
