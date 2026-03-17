@@ -1337,6 +1337,7 @@ def run_betting_agent():
                 # Gamma unavailable — fall back to DB cost sum
                 open_exposure = sum(float(b.get("amount_usdc", 0)) for b in open_bets)
                 log.info(f"💼 Bankroll: ${bankroll:.2f} free | ~${open_exposure:.2f} cost in {len(open_bets)} open bets (Gamma unavailable)")
+            markets = None  # always initialize before bankroll branches so `if markets:` below never raises UnboundLocalError
             if bankroll <= 0:
                 log.info("No free bankroll remaining — waiting for open bets to resolve")
             else:
