@@ -245,29 +245,56 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
     try:
         from poly_web3 import PolyWeb3Service, RELAYER_URL as _LIB_RELAYER_URL  # noqa
         from py_builder_relayer_client.client import RelayClient
-        from py_builder_relayer_client.config import BuilderConfig
     except ImportError as e:
         log.warning(
             f"⚠️  poly-web3 not installed ({e}) — add 'poly-web3' to requirements.txt on Railway"
         )
         return False
 
+    # Dynamically find the config class — it was renamed across library versions
+    _BuilderConfig = None
     try:
-        # BuilderConfig holds your builder API credentials
-        builder_cfg = BuilderConfig(
-            api_key=_BUILDER_API_KEY,
-            secret=_BUILDER_SECRET,
-            passphrase=_BUILDER_PASSPHRASE,
-        )
+        import importlib, inspect as _inspect
+        _cfg_mod = importlib.import_module("py_builder_relayer_client.config")
+        _available = [n for n, o in _inspect.getmembers(_cfg_mod, _inspect.isclass)
+                      if not n.startswith("_")]
+        log.info(f"🔧 py_builder_relayer_client.config classes: {_available}")
+        for _name in ("BuilderConfig", "Config", "ApiConfig", "RelayConfig",
+                      "BuilderApiConfig", "BuilderClientConfig"):
+            _BuilderConfig = getattr(_cfg_mod, _name, None)
+            if _BuilderConfig is not None:
+                log.info(f"🔧 Using config class: {_name}")
+                break
+    except Exception as e:
+        log.warning(f"⚠️  Could not inspect py_builder_relayer_client.config: {e}")
 
+    try:
         # RelayClient wraps the /submit endpoint with proper signing
-        relayer_client = RelayClient(
-            host=_RELAYER_URL,
-            chain_id=137,   # Polygon mainnet
-            key=POLYMARKET_PRIVATE_KEY,
-            funder=POLYMARKET_FUNDER,
-            builder_config=builder_cfg,
-        )
+        if _BuilderConfig is not None:
+            builder_cfg = _BuilderConfig(
+                api_key=_BUILDER_API_KEY,
+                secret=_BUILDER_SECRET,
+                passphrase=_BUILDER_PASSPHRASE,
+            )
+            relayer_client = RelayClient(
+                host=_RELAYER_URL,
+                chain_id=137,
+                key=POLYMARKET_PRIVATE_KEY,
+                funder=POLYMARKET_FUNDER,
+                builder_config=builder_cfg,
+            )
+        else:
+            # Fallback: try passing credentials directly (some versions accept this)
+            log.warning("⚠️  No config class found — trying RelayClient with raw credentials")
+            relayer_client = RelayClient(
+                host=_RELAYER_URL,
+                chain_id=137,
+                key=POLYMARKET_PRIVATE_KEY,
+                funder=POLYMARKET_FUNDER,
+                api_key=_BUILDER_API_KEY,
+                secret=_BUILDER_SECRET,
+                passphrase=_BUILDER_PASSPHRASE,
+            )
 
         # PolyWeb3Service ties ClobClient + RelayerClient together
         clob = get_clob_client()
