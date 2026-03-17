@@ -11,11 +11,8 @@ Runs on a loop every 30 minutes:
 import sys
 import time
 import json
-import hmac
 import signal
 import random
-import hashlib
-import base64
 import os
 import logging
 import requests
@@ -232,74 +229,73 @@ def check_matic_balance() -> float:
     return 0.0
 
 
-def _build_relayer_headers(method: str, path: str, body: str = "") -> dict:
-    """
-    Build HMAC-SHA256 auth headers for Polymarket Builder Relayer API.
-    Signature covers: timestamp + METHOD + path + body
-    """
-    ts = str(int(time.time()))
-    message = ts + method.upper() + path + body
-    secret_bytes = _BUILDER_SECRET.encode("utf-8")
-    sig = hmac.new(secret_bytes, message.encode("utf-8"), hashlib.sha256)
-    signature = base64.b64encode(sig.digest()).decode("utf-8")
-    return {
-        "Content-Type":           "application/json",
-        "POLY_BUILDER_API_KEY":   _BUILDER_API_KEY,
-        "POLY_BUILDER_SIGNATURE": signature,
-        "POLY_BUILDER_TIMESTAMP": ts,
-        "POLY_BUILDER_PASSPHRASE": _BUILDER_PASSPHRASE,
-    }
-
-
 def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
     """
-    Gasless claim via Polymarket Builder Relayer API.
-    No MATIC needed — Polymarket's relayer pays the gas.
-    Equivalent to clicking "Collect" on polymarket.com.
+    Gasless claim via poly-web3 (wraps Polymarket Builder Relayer).
+    Uses PolyWeb3Service which handles proxy wallet signing + relayer submission.
+    Equivalent to clicking "Collect" on polymarket.com — no MATIC needed.
 
-    indexSets encoding (binary CTF):
-      YES position = index set 1  (binary: 01)
-      NO  position = index set 2  (binary: 10)
+    Requires pip package: poly-web3>=0.0.1
+    Add to requirements.txt if not already present.
     """
     if not _BUILDER_API_KEY:
         log.warning("⚠️  POLYMARKET_BUILDER_API_KEY not set — skipping gasless claim")
         return False
 
     try:
-        cid = condition_id.replace("0x", "").zfill(64)
-        index_sets = [1] if outcome.upper() == "YES" else [2]
+        from poly_web3 import PolyWeb3Service, RELAYER_URL as _LIB_RELAYER_URL  # noqa
+        from py_builder_relayer_client.client import RelayerClient
+        from py_builder_relayer_client.config import BuilderConfig
+    except ImportError as e:
+        log.warning(
+            f"⚠️  poly-web3 not installed ({e}) — add 'poly-web3' to requirements.txt on Railway"
+        )
+        return False
 
-        body = json.dumps({
-            "collateralToken":      _USDC_ADDRESS,
-            "parentCollectionId":   "0x" + "0" * 64,
-            "conditionId":          "0x" + cid,
-            "indexSets":            index_sets,
-        }, separators=(",", ":"))
+    try:
+        # BuilderConfig holds your builder API credentials
+        builder_cfg = BuilderConfig(
+            api_key=_BUILDER_API_KEY,
+            secret=_BUILDER_SECRET,
+            passphrase=_BUILDER_PASSPHRASE,
+        )
 
-        path = "/redeem"
-        headers = _build_relayer_headers("POST", path, body)
+        # RelayerClient wraps the /submit endpoint with proper signing
+        relayer_client = RelayerClient(
+            host=_RELAYER_URL,
+            chain_id=137,   # Polygon mainnet
+            key=POLYMARKET_PRIVATE_KEY,
+            funder=POLYMARKET_FUNDER,
+            builder_config=builder_cfg,
+        )
+
+        # PolyWeb3Service ties ClobClient + RelayerClient together
+        clob = get_clob_client()
+        service = PolyWeb3Service(
+            clob_client=clob,
+            relayer_client=relayer_client,
+        )
+
+        # amounts: [yes_amount, no_amount] in USDC
+        # Only the winning side has tokens — losing tokens are worth $0
+        if outcome.upper() == "YES":
+            amounts = [payout, 0.0]
+        else:
+            amounts = [0.0, payout]
 
         log.info(
             f"⛽ Gasless claim | condition={condition_id[:16]}... "
             f"| outcome={outcome} | payout=${payout:.2f}"
         )
 
-        resp = requests.post(
-            f"{_RELAYER_URL}{path}",
-            headers=headers,
-            data=body,
-            timeout=30,
+        result = service.redeem_position(
+            condition_id=condition_id,
+            amounts=amounts,
+            neg_risk=False,
         )
 
-        if resp.status_code in (200, 201):
-            log.info(f"✅ Gasless claim submitted! ${payout:.2f} arriving shortly → {resp.text[:120]}")
-            return True
-        else:
-            log.warning(
-                f"❌ Gasless claim failed: HTTP {resp.status_code} — {resp.text[:300]}\n"
-                f"   Fallback: claim manually on polymarket.com"
-            )
-            return False
+        log.info(f"✅ Gasless claim submitted! ${payout:.2f} arriving shortly → {str(result)[:120]}")
+        return True
 
     except Exception as e:
         log.warning(f"❌ Gasless claim error ({type(e).__name__}: {e}) — claim manually on polymarket.com")
