@@ -870,27 +870,38 @@ def _check_gamma_for_resolution(cid: str, bet: dict) -> dict | None:
             return None
         gm = gm_list[0]
 
-        # Log raw Gamma fields so we can see what it returns for resolved markets
+        end_date_raw = str(gm.get("endDate") or gm.get("end_date_iso") or "")
         log.info(
             f"🔍 Gamma {cid[:16]}... | resolved={gm.get('resolved')} "
             f"active={gm.get('active')} closed={gm.get('closed')} "
-            f"endDate={str(gm.get('endDate') or gm.get('end_date_iso') or '')[:10]}"
+            f"endDate={end_date_raw[:10]}"
         )
 
-        # Accept any indicator that the market is no longer active
-        is_resolved = (
-            gm.get("resolved") is True
-            or gm.get("active") is False
-            or gm.get("closed") is True
-        )
-        if not is_resolved:
-            return None  # still open on Gamma too
+        # Sanity check: endDate before 2024 = Gamma returned garbage/stale data.
+        # CLOB condition_ids don't always map to Gamma market IDs — Gamma returns
+        # a null-ish record with closed=True and a 2020 date. Ignore it.
+        if end_date_raw and end_date_raw[:4].isdigit() and int(end_date_raw[:4]) < 2024:
+            log.warning(
+                f"⚠️  Gamma garbage data (endDate={end_date_raw[:10]}) for {cid[:16]}... — ignoring"
+            )
+            return None
 
-        # Gamma knows the winner — find our outcome's token price
-        result = _resolve_from_tokens(gm.get("tokens") or [], bet["outcome"], bet)
+        # Only trust explicit resolved=True
+        if not gm.get("resolved"):
+            return None
+
+        # Gamma resolved=True — find our outcome's token price
+        tokens = gm.get("tokens") or []
+        result = _resolve_from_tokens(tokens, bet["outcome"], bet)
         if result:
             return result
-        # Resolved but our outcome token missing — treat as loss to clear zombie
+        # resolved=True but no matching token → only call LOST if tokens list is non-empty
+        # (empty = Gamma doesn't actually know this market)
+        if not tokens:
+            log.warning(
+                f"⚠️  Gamma resolved=True but no tokens for {cid[:16]}... — skipping"
+            )
+            return None
         log.info(f"Gamma resolved (no token match for {bet['outcome']}) on {cid[:16]}... — treating as LOST")
         return {"bet": bet, "won": False, "payout": 0.0}
     except Exception as e:
