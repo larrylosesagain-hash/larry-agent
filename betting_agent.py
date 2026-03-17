@@ -27,6 +27,52 @@ from py_clob_client.constants import POLYGON
 # USDC.e on Polygon (bridged) — what Polymarket settles in
 _USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
 
+# ─── CTF CONTRACT (Conditional Token Framework) ───────────────────────────────
+# Standard Gnosis CTF deployed at same address on all EVM chains via CREATE2.
+# payoutDenominator(conditionId) > 0 means condition is resolved on-chain.
+# This is the authoritative source — no API lag, no garbage data.
+_CTF_ADDRESS = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+_CTF_ABI_MINIMAL = [
+    {
+        "inputs": [{"type": "bytes32", "name": "conditionId"}],
+        "name": "payoutDenominator",
+        "outputs": [{"type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"type": "address", "name": "collateralToken"},
+            {"type": "bytes32", "name": "parentCollectionId"},
+            {"type": "bytes32", "name": "conditionId"},
+            {"type": "uint256[]", "name": "indexSets"},
+        ],
+        "name": "redeemPositions",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+]
+_POLYGON_RPC = "https://polygon-rpc.com"
+_w3: Web3 | None = None  # cached Web3 instance
+
+def _get_w3() -> Web3:
+    global _w3
+    if _w3 is None or not _w3.is_connected():
+        _w3 = Web3(Web3.HTTPProvider(_POLYGON_RPC, request_kwargs={"timeout": 8}))
+    return _w3
+
+def _ctf_payout_denominator(condition_id: str) -> int:
+    """Call CTF.payoutDenominator on-chain. Returns 0 if not resolved or on error."""
+    try:
+        w3 = _get_w3()
+        ctf = w3.eth.contract(address=_CTF_ADDRESS, abi=_CTF_ABI_MINIMAL)
+        cid_bytes = bytes.fromhex(condition_id.lstrip("0x"))
+        return ctf.functions.payoutDenominator(cid_bytes).call()
+    except Exception as e:
+        log.debug(f"CTF check error for {condition_id[:16]}...: {e}")
+        return 0
+
 # ─── BUILDER RELAYER (gasless claims) ─────────────────────────────────────────
 _RELAYER_URL       = "https://relayer-v2.polymarket.com"
 _BUILDER_API_KEY   = os.getenv("POLYMARKET_BUILDER_API_KEY", "")
@@ -231,101 +277,120 @@ def check_matic_balance() -> float:
 
 def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
     """
-    Gasless claim via poly-web3 (wraps Polymarket Builder Relayer).
-    Uses PolyWeb3Service which handles proxy wallet signing + relayer submission.
-    Equivalent to clicking "Collect" on polymarket.com — no MATIC needed.
+    Claim winning position. Tries gasless (Builder Relayer) first, then direct on-chain.
 
-    Requires pip package: poly-web3>=0.0.1
-    Add to requirements.txt if not already present.
+    Gasless path (preferred, no MATIC needed):
+      Uses poly-web3 library which handles signing + relayer submission.
+      Requires POLYMARKET_BUILDER_* env vars.
+
+    Direct on-chain fallback (needs ~0.01 MATIC in funder wallet):
+      Calls CTF.redeemPositions() directly via Web3.
     """
-    if not _BUILDER_API_KEY:
-        log.warning("⚠️  POLYMARKET_BUILDER_API_KEY not set — skipping gasless claim")
-        return False
+    log.info(f"⛽ Claiming | condition={condition_id[:16]}... | outcome={outcome} | ${payout:.2f}")
 
-    try:
-        from poly_web3 import PolyWeb3Service, RELAYER_URL as _LIB_RELAYER_URL  # noqa
-        from py_builder_relayer_client.client import RelayClient
-    except ImportError as e:
-        log.warning(
-            f"⚠️  poly-web3 not installed ({e}) — add 'poly-web3' to requirements.txt on Railway"
-        )
-        return False
+    # ── Path 1: Gasless via Builder Relayer ───────────────────────────────────
+    if _BUILDER_API_KEY:
+        try:
+            import importlib, inspect as _insp
+            from poly_web3 import PolyWeb3Service
+            from py_builder_relayer_client.client import RelayClient
 
-    # Dynamically find the config class — it was renamed across library versions
-    _BuilderConfig = None
-    try:
-        import importlib, inspect as _inspect
-        _cfg_mod = importlib.import_module("py_builder_relayer_client.config")
-        _available = [n for n, o in _inspect.getmembers(_cfg_mod, _inspect.isclass)
-                      if not n.startswith("_")]
-        log.info(f"🔧 py_builder_relayer_client.config classes: {_available}")
-        for _name in ("BuilderConfig", "Config", "ApiConfig", "RelayConfig",
-                      "BuilderApiConfig", "BuilderClientConfig"):
-            _BuilderConfig = getattr(_cfg_mod, _name, None)
+            # Dynamically find the config class (name changed between versions)
+            _cfg_mod = importlib.import_module("py_builder_relayer_client.config")
+            _available = [n for n, _ in _insp.getmembers(_cfg_mod, _insp.isclass) if not n.startswith("_")]
+            log.info(f"🔧 Config classes available: {_available}")
+
+            _BuilderConfig = None
+            for _name in ("BuilderConfig", "Config", "ApiConfig", "RelayConfig", "BuilderApiConfig"):
+                _BuilderConfig = getattr(_cfg_mod, _name, None)
+                if _BuilderConfig is not None:
+                    log.info(f"🔧 Using: {_name}")
+                    break
+
             if _BuilderConfig is not None:
-                log.info(f"🔧 Using config class: {_name}")
-                break
-    except Exception as e:
-        log.warning(f"⚠️  Could not inspect py_builder_relayer_client.config: {e}")
+                builder_cfg = _BuilderConfig(
+                    api_key=_BUILDER_API_KEY, secret=_BUILDER_SECRET, passphrase=_BUILDER_PASSPHRASE
+                )
+                relay_client = RelayClient(
+                    host=_RELAYER_URL, chain_id=137,
+                    key=POLYMARKET_PRIVATE_KEY, funder=POLYMARKET_FUNDER,
+                    builder_config=builder_cfg,
+                )
+            else:
+                log.warning("⚠️  No config class found, trying raw credentials")
+                relay_client = RelayClient(
+                    host=_RELAYER_URL, chain_id=137,
+                    key=POLYMARKET_PRIVATE_KEY, funder=POLYMARKET_FUNDER,
+                    api_key=_BUILDER_API_KEY, secret=_BUILDER_SECRET, passphrase=_BUILDER_PASSPHRASE,
+                )
 
+            clob = get_clob_client()
+            service = PolyWeb3Service(clob_client=clob, relayer_client=relay_client)
+            amounts = [payout, 0.0] if outcome.upper() == "YES" else [0.0, payout]
+            result = service.redeem_position(condition_id=condition_id, amounts=amounts, neg_risk=False)
+            log.info(f"✅ Gasless claim submitted! ${payout:.2f} → {str(result)[:120]}")
+            return True
+        except Exception as e:
+            log.warning(f"⚠️  Gasless claim failed ({type(e).__name__}: {e}) — trying direct on-chain")
+
+    # ── Path 2: Direct on-chain via CTF.redeemPositions() ────────────────────
+    # Requires small amount of MATIC in funder wallet (~0.01 MATIC = ~$0.005)
     try:
-        # RelayClient wraps the /submit endpoint with proper signing
-        if _BuilderConfig is not None:
-            builder_cfg = _BuilderConfig(
-                api_key=_BUILDER_API_KEY,
-                secret=_BUILDER_SECRET,
-                passphrase=_BUILDER_PASSPHRASE,
+        from eth_account import Account
+        w3 = _get_w3()
+        account = Account.from_key(POLYMARKET_PRIVATE_KEY)
+        ctf = w3.eth.contract(address=_CTF_ADDRESS, abi=_CTF_ABI_MINIMAL)
+        cid_bytes = bytes.fromhex(condition_id.lstrip("0x"))
+
+        # Verify resolved before spending gas
+        if ctf.functions.payoutDenominator(cid_bytes).call() == 0:
+            log.warning(f"⚠️  CTF not resolved yet for {condition_id[:16]}... — skipping")
+            return False
+
+        matic_balance = w3.eth.get_balance(POLYMARKET_FUNDER)
+        if matic_balance < w3.to_wei("0.005", "ether"):
+            log.warning(
+                f"⚠️  Insufficient MATIC ({w3.from_wei(matic_balance, 'ether'):.4f}) "
+                f"for direct claim. Send 0.1 MATIC to {POLYMARKET_FUNDER} to enable auto-claim."
             )
-            relayer_client = RelayClient(
-                host=_RELAYER_URL,
-                chain_id=137,
-                key=POLYMARKET_PRIVATE_KEY,
-                funder=POLYMARKET_FUNDER,
-                builder_config=builder_cfg,
-            )
-        else:
-            # Fallback: try passing credentials directly (some versions accept this)
-            log.warning("⚠️  No config class found — trying RelayClient with raw credentials")
-            relayer_client = RelayClient(
-                host=_RELAYER_URL,
-                chain_id=137,
-                key=POLYMARKET_PRIVATE_KEY,
-                funder=POLYMARKET_FUNDER,
-                api_key=_BUILDER_API_KEY,
-                secret=_BUILDER_SECRET,
-                passphrase=_BUILDER_PASSPHRASE,
-            )
+            return False
 
-        # PolyWeb3Service ties ClobClient + RelayerClient together
-        clob = get_clob_client()
-        service = PolyWeb3Service(
-            clob_client=clob,
-            relayer_client=relayer_client,
-        )
+        nonce = w3.eth.get_transaction_count(POLYMARKET_FUNDER)
+        gas_price = min(w3.eth.gas_price, w3.to_wei("50", "gwei"))
 
-        # amounts: [yes_amount, no_amount] in USDC
-        # Only the winning side has tokens — losing tokens are worth $0
-        if outcome.upper() == "YES":
-            amounts = [payout, 0.0]
-        else:
-            amounts = [0.0, payout]
+        # Try indexSets [1] and [2] — one corresponds to YES, one to NO
+        # Polymarket binary: indexSet=1 → outcome0, indexSet=2 → outcome1
+        index_sets = [1, 2] if outcome.upper() == "YES" else [2, 1]
+        for idx_set in index_sets:
+            try:
+                tx = ctf.functions.redeemPositions(
+                    Web3.to_checksum_address(_USDC_ADDRESS),
+                    b"\x00" * 32,   # parentCollectionId = zero
+                    cid_bytes,
+                    [idx_set],
+                ).build_transaction({
+                    "from": POLYMARKET_FUNDER,
+                    "gas": 200000,
+                    "gasPrice": gas_price,
+                    "nonce": nonce,
+                    "chainId": 137,
+                })
+                signed = account.sign_transaction(tx)
+                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+                if receipt["status"] == 1:
+                    log.info(f"✅ Direct on-chain claim success! tx={tx_hash.hex()[:16]}...")
+                    return True
+                nonce += 1
+            except Exception as tx_err:
+                log.debug(f"indexSet={idx_set} failed: {tx_err}")
+                nonce += 1
 
-        log.info(
-            f"⛽ Gasless claim | condition={condition_id[:16]}... "
-            f"| outcome={outcome} | payout=${payout:.2f}"
-        )
-
-        result = service.redeem_position(
-            condition_id=condition_id,
-            amounts=amounts,
-            neg_risk=False,
-        )
-
-        log.info(f"✅ Gasless claim submitted! ${payout:.2f} arriving shortly → {str(result)[:120]}")
-        return True
+        log.warning(f"❌ Direct claim failed for both indexSets — claim manually on polymarket.com")
+        return False
 
     except Exception as e:
-        log.warning(f"❌ Gasless claim error ({type(e).__name__}: {e}) — claim manually on polymarket.com")
+        log.warning(f"❌ Direct on-chain claim error ({type(e).__name__}: {e}) — claim manually on polymarket.com")
         return False
 
 
@@ -911,78 +976,76 @@ def _check_gamma_for_resolution(cid: str, bet: dict) -> dict | None:
 
 def _check_single_bet(bet: dict) -> dict | None:
     """
-    Check one pending bet against CLOB + Gamma.
-    Returns resolution dict or None if still genuinely open.
+    Check one pending bet. Returns resolution dict or None if still open.
     Runs in a thread — no shared state written here, only reads.
 
-    Resolution priority:
-      1. CLOB market.closed=True  → authoritative
-      2. CLOB 404 → try Gamma (might be resolved + purged from CLOB)
-                   → if Gamma also unknown → treat as LOST (order never filled / purged)
-      3. end_date + 4h passed but CLOB still "active" → Gamma fallback
-         (CLOB sometimes lags marking markets closed by hours)
+    Resolution priority (most reliable first):
+      1. On-chain CTF.payoutDenominator > 0  → authoritative, no lag
+      2. CLOB market.closed=True             → reliable when available
+      3. CLOB token price >= 0.99            → catches CLOB lag before closed flag
+      4. CLOB 404                            → market purged = phantom bet
     """
     cid = bet["polymarket_id"]
     try:
         resp = requests.get(f"{POLYMARKET_HOST}/markets/{cid}", timeout=10)
 
-        # ── CLOB 404: market purged, try Gamma before giving up ───────────────
+        # ── CLOB 404: market purged entirely ─────────────────────────────────
         if resp.status_code == 404:
-            log.warning(f"Bet {cid[:16]}... returned 404 from CLOB — checking Gamma")
-            gamma_result = _check_gamma_for_resolution(cid, bet)
-            if gamma_result:
-                return gamma_result
-            # Gamma also doesn't know it — order was never filled or fully expired
-            log.warning(f"Bet {cid[:16]}... not found on CLOB or Gamma — removing as phantom")
+            # Check on-chain first before treating as phantom
+            denom = _ctf_payout_denominator(cid)
+            if denom > 0:
+                log.info(f"🔗 CTF resolved (CLOB 404 but on-chain settled): {cid[:16]}...")
+                # Can't determine price from CLOB — use Gamma as backup
+                gamma_result = _check_gamma_for_resolution(cid, bet)
+                if gamma_result:
+                    return gamma_result
+                # CTF resolved but can't determine winner — treat as won (payout known)
+                log.info(f"🔗 Assuming WIN based on CTF resolution: {cid[:16]}...")
+                return {"bet": bet, "won": True, "payout": bet["potential_payout"]}
+            log.warning(f"Bet {cid[:16]}... not found on CLOB and not resolved on-chain — removing as phantom")
             return {"bet": bet, "won": False, "payout": 0.0}
 
         resp.raise_for_status()
         market = resp.json()
+        tokens = market.get("tokens", [])
 
-        # ── Primary path: CLOB says closed ────────────────────────────────────
+        # ── PRIMARY: On-chain CTF check ───────────────────────────────────────
+        # payoutDenominator > 0 = condition resolved on blockchain.
+        # Zero API lag, zero garbage data. This is ground truth.
+        denom = _ctf_payout_denominator(cid)
+        if denom > 0:
+            # Find our outcome token's current price — winning token will be > 0.5
+            for token in tokens:
+                if token.get("outcome", "").upper() == bet["outcome"].upper():
+                    price = float(token.get("price", 0))
+                    won = price > 0.5
+                    log.info(
+                        f"🔗 CTF resolved: {cid[:16]}... | "
+                        f"bet={bet['outcome']} price={price:.3f} → {'WON' if won else 'LOST'}"
+                    )
+                    return {"bet": bet, "won": won, "payout": bet["potential_payout"] if won else 0.0}
+            # No token found for our outcome — fall through to other checks
+            log.info(f"🔗 CTF resolved but no price data for {bet['outcome']} on {cid[:16]}...")
+
+        # ── SECONDARY: CLOB closed flag ───────────────────────────────────────
         if market.get("closed", False):
-            result = _resolve_from_tokens(market.get("tokens", []), bet["outcome"], bet)
+            result = _resolve_from_tokens(tokens, bet["outcome"], bet)
             if result:
                 return result
-            # closed but our outcome token missing — treat as loss
             return {"bet": bet, "won": False, "payout": 0.0}
 
-        # ── Price-based path: token at 0.99+ = resolved, CLOB just hasn't flipped closed yet ──
-        # Polymarket freezes trading and moves token to $1.00 when a market resolves,
-        # but CLOB can take hours to flip closed=True. This catches early resolutions
-        # (e.g. game ended before scheduled end_date).
-        tokens = market.get("tokens", [])
+        # ── TERTIARY: Token price near 1.0 (CLOB lagging closed flag) ─────────
         for token in tokens:
             if token.get("outcome", "").upper() == bet["outcome"].upper():
                 price = float(token.get("price", 0))
                 if price >= 0.99:
-                    log.info(
-                        f"💡 Token price={price:.3f} for {bet['outcome']} on {cid[:16]}... "
-                        f"— treating as resolved WIN (CLOB closed flag lagging)"
-                    )
+                    log.info(f"💡 Token price={price:.3f} → WIN (CLOB closed flag lagging): {cid[:16]}...")
                     return {"bet": bet, "won": True, "payout": bet["potential_payout"]}
                 break
 
-        # ── Secondary path: end_date passed → ask Gamma (no delay) ──────────────
-        # CLOB can lag behind by many hours. Gamma resolves much faster.
-        # We check Gamma as soon as end_date passes (previously was +4h delay — too long).
-        end_date_str = (market.get("endDate") or market.get("end_date") or
-                        market.get("end_date_iso") or market.get("endDateIso"))
-        if end_date_str:
-            try:
-                end_date = datetime.fromisoformat(
-                    end_date_str.replace("Z", "+00:00")
-                ).replace(tzinfo=None)
-                if datetime.utcnow() > end_date:
-                    gamma_result = _check_gamma_for_resolution(cid, bet)
-                    if gamma_result:
-                        return gamma_result
-            except (ValueError, TypeError) as e:
-                log.warning(f"Could not parse end_date '{end_date_str}' for {cid[:16]}...: {e}")
-
     except Exception as e:
         log.error(f"Error checking bet {cid}: {e}")
-    return None  # still genuinely open, check again next cycle
+    return None  # still open
 
 
 def check_pending_bets(client: ClobClient):
@@ -1290,16 +1353,22 @@ def run_betting_agent():
                                 odds = round(1 - market_info.get("yes_price", 0.5), 4)
                             potential_payout = actual_amount / odds if odds > 0 else actual_amount * 2
 
-                            bet_id = save_bet(
-                                polymarket_id=market_id,
-                                question=market_info.get("question", "Unknown market"),
-                                outcome=decision.get("outcome", "YES"),
-                                amount=actual_amount,
-                                odds=odds,
-                                potential_payout=potential_payout,
-                                category=market_info.get("category", "weird"),
-                                larry_comment=decision.get("reasoning", ""),
-                            )
+                            try:
+                                bet_id = save_bet(
+                                    polymarket_id=market_id,
+                                    question=market_info.get("question", "Unknown market"),
+                                    outcome=decision.get("outcome", "YES"),
+                                    amount=actual_amount,
+                                    odds=odds,
+                                    potential_payout=potential_payout,
+                                    category=market_info.get("category", "weird"),
+                                    larry_comment=decision.get("reasoning", ""),
+                                )
+                            except Exception as db_err:
+                                # UNIQUE constraint: this market is already in DB (e.g. previously
+                                # cleared as resolved). Bet was placed on-chain but skip DB record.
+                                log.warning(f"⚠️  Could not save bet to DB ({type(db_err).__name__}): {market_id[:16]}... — bet placed but not tracked")
+                                bet_id = None
 
                             # 8. Tweet the bet announcement
                             try:
