@@ -615,6 +615,62 @@ def _search_tweets_from_accounts(account_list: list, sort_by_recency: bool = Fal
         return None
 
 
+def _search_tweets_by_topic() -> dict | None:
+    """
+    Fallback reply candidate: search for RECENT tweets discussing prediction markets,
+    crypto bets, or Polymarket from any public user — not just whitelisted accounts.
+    These are regular users who almost always have open replies, so Larry can actually reply.
+
+    Used when all _REPLY_WHITELIST attempts fail with 403 (quality filter / restricted).
+    """
+    try:
+        client = get_twitter_client()
+        # Target: people discussing things Larry cares about — prediction markets, BTC, elections.
+        # Exclude: retweets, replies, our own account, and known restricted accounts.
+        query = (
+            "(polymarket OR \"prediction market\" OR \"betting market\" OR \"BTC prediction\" "
+            "OR kalshi OR \"crypto bet\") "
+            "-is:retweet -is:reply lang:en "
+            "-from:LarryLosesAgain -from:Polymarket -from:elonmusk -from:saylor"
+        )
+        response = get_twitter_client().search_recent_tweets(
+            query=query,
+            max_results=15,
+            sort_order="recency",
+            tweet_fields=["author_id", "text", "public_metrics", "reply_settings", "created_at"],
+            expansions=["author_id"],
+            user_fields=["username", "public_metrics"],
+        )
+        if not response or not response.data:
+            return None
+
+        users = {}
+        if response.includes and "users" in response.includes:
+            for u in response.includes["users"]:
+                users[u.id] = {"username": u.username, "followers": (u.public_metrics or {}).get("followers_count", 0)}
+
+        for tweet in response.data:
+            if str(tweet.id) in _quote_blocked_ids:
+                continue
+            if not _is_safe_to_engage(tweet.text):
+                continue
+            reply_settings = getattr(tweet, "reply_settings", None)
+            if reply_settings and reply_settings != "everyone":
+                continue
+            user = users.get(tweet.author_id, {})
+            return {
+                "tweet_id": str(tweet.id),
+                "text": tweet.text,
+                "username": user.get("username", ""),
+                "score": 0,
+                "created_at": getattr(tweet, "created_at", None),
+            }
+        return None
+    except Exception as e:
+        log.debug(f"Topic tweet search failed: {type(e).__name__}: {e}")
+        return None
+
+
 def _find_quote_tweet_candidate() -> dict | None:
     """
     Search Twitter for a recent tweet from whitelisted accounts worth Larry commenting on.
@@ -825,10 +881,42 @@ def maybe_reply_to_whitelist():
             log.warning(f"Whitelist reply failed: {type(e).__name__}: {e}")
             break
 
-    # All attempts failed — will retry next cycle (~15 min) since all failed tweets are now
-    # blacklisted in _quote_blocked_ids, so next search should surface different tweets.
+    # All whitelist attempts failed (likely quality filter from big accounts).
+    # Fallback: find a recent topic tweet from any public user discussing prediction markets.
+    # These regular users almost always have open replies — Larry can actually engage.
+    log.info("💬 All whitelist attempts restricted — trying topic fallback...")
+    topic_candidate = _search_tweets_by_topic()
+    if topic_candidate and topic_candidate["tweet_id"] not in tried_ids:
+        try:
+            tweet_data = ask_larry_for_tweet(
+                "WHITELIST_REPLY",
+                extra_data={
+                    "original_tweet": topic_candidate["text"][:200],
+                    "username": topic_candidate["username"],
+                }
+            )
+            reply_text = tweet_data.get("tweet", "")
+            if reply_text:
+                client = get_twitter_client()
+                response = client.create_tweet(
+                    text=reply_text,
+                    in_reply_to_tweet_id=topic_candidate["tweet_id"]
+                )
+                reply_id = str(response.data["id"])
+                save_tweet(tweet_id=reply_id, content=reply_text, tweet_type="TOPIC_REPLY")
+                log.info(f"💬 [topic fallback] Replied to @{topic_candidate['username']}: {reply_text[:60]}...")
+                set_state("last_whitelist_reply_time", now.isoformat())
+                like_tweet(topic_candidate["tweet_id"])
+                return
+        except tweepy.Forbidden:
+            _quote_blocked_ids.add(topic_candidate["tweet_id"])
+            log.info("💬 Topic fallback also restricted — giving up this cycle")
+        except Exception as e:
+            log.warning(f"Topic fallback reply failed: {type(e).__name__}: {e}")
+
+    # Still failed — reset cooldown so next cycle retries fresh tweets
     set_state("last_whitelist_reply_time", (now - timedelta(minutes=30)).isoformat())
-    log.info("💬 All whitelist reply attempts restricted/failed — retrying next cycle")
+    log.info("💬 All reply attempts failed — retrying next cycle")
 
 
 # ─── PRICE MOVE REACTIONS ─────────────────────────────────────────────────────
@@ -915,8 +1003,20 @@ def maybe_react_to_price_moves():
 # VIP accounts Larry monitors and replies to immediately via filtered stream.
 # Only Elon — every tweet, 24/7, no per-account cooldown.
 # Whitelist for the 30-min proactive reply cycle — Larry drops a comment under their fresh tweets.
-# Small and focused: Elon (real-time via VIP stream + 30-min backup), Saylor, Polymarket.
-_REPLY_WHITELIST = ["elonmusk", "saylor", "Polymarket"]
+# ⚠️  @elonmusk, @saylor, @Polymarket have Twitter quality filters that block replies from small
+# accounts even when reply_settings="everyone". Expand whitelist to include mid-tier accounts
+# that genuinely allow open replies, so Larry stays social even when the big 3 reject him.
+_REPLY_WHITELIST = [
+    "Polymarket",       # prediction markets — home turf; try every cycle
+    "saylor",           # Bitcoin max — Larry bets on BTC
+    "elonmusk",         # Elon — VIP stream handles real-time; this is 30-min backup
+    "APompliano",       # Anthony Pompliano — macro + crypto, consistently open replies
+    "AriDavidPaul",     # Ari Paul — prediction markets OG, very active engager
+    "balajis",          # Balaji — loves making bets on predictions, open engagement
+    "WatcherGuru",      # crypto news, fast posts, usually open replies
+    "KobeissiLetter",   # macro commentary — great thread starter
+    "NateSilver538",    # forecasting — Larry thinks he's better than Nate
+]
 
 _VIP_STREAM_ACCOUNTS = ["elonmusk", "saylor", "Polymarket"]
 
