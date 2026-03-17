@@ -169,6 +169,11 @@ def _is_pass_cached(market: dict) -> bool:
 # (otherwise Larry always restarts at page 0 and misses pages 1-9)
 _scan_page: int = 0
 
+# Sell-position cooldown: prevent hammering the sell function every cycle when GTC
+# orders haven't filled yet and bankroll stays below $5.
+_last_sell_attempt_at: datetime | None = None
+_SELL_COOLDOWN_MINUTES = 15  # wait at least 15 min between sell attempts
+
 def _load_scan_page():
     global _scan_page
     try:
@@ -298,28 +303,57 @@ def _get_daily_loss_usdc() -> float:
     except Exception:
         return 0.0
 
-def _is_daily_loss_limit_hit() -> bool:
+def _is_daily_loss_limit_hit(log_if_hit: bool = False) -> bool:
     """
     Returns True if Larry has lost >= _DAILY_LOSS_LIMIT_PCT of his bankroll today.
-    Conservative check: uses current bankroll + today's losses as proxy for start-of-day bankroll.
+
+    Correct formula: start_of_day_bankroll = free_cash + open_positions_cost + lost_today
+    (NOT just free_cash + lost_today — that ignores capital tied up in open bets and
+    produces a wildly overstated loss percentage, triggering the limit too early.)
+
+    Pass log_if_hit=True to emit a warning at most ONCE per cycle.
+    The helper itself never logs so it can be called freely without spam.
     """
     try:
         lost_today = _get_daily_loss_usdc()
         if lost_today <= 0:
             return False
         bankroll = get_bankroll()
-        start_of_day_bankroll = bankroll + lost_today   # approximate: what he had before losing
+        # Sum amount_usdc of all currently open bets (cost basis, not current market value)
+        pending = get_pending_bets()
+        open_exposure = sum(float(b.get("amount_usdc", 0)) for b in pending)
+        # Approximate start-of-day bankroll: what Larry had before today's losses
+        start_of_day_bankroll = bankroll + open_exposure + lost_today
+        if start_of_day_bankroll <= 0:
+            return False
         limit = start_of_day_bankroll * _DAILY_LOSS_LIMIT_PCT
         if lost_today >= limit:
-            log.warning(
-                f"🛑 Daily loss limit hit: lost ${lost_today:.2f} today "
-                f"(>{_DAILY_LOSS_LIMIT_PCT*100:.0f}% of ~${start_of_day_bankroll:.2f} start-of-day bankroll) "
-                f"— no new bets until tomorrow UTC"
-            )
+            if log_if_hit:
+                log.warning(
+                    f"🛑 Daily loss limit hit: lost ${lost_today:.2f} today "
+                    f"(>{_DAILY_LOSS_LIMIT_PCT*100:.0f}% of ~${start_of_day_bankroll:.2f} "
+                    f"start-of-day bankroll = ${bankroll:.2f} free + ${open_exposure:.2f} open + ${lost_today:.2f} lost) "
+                    f"— no new bets until tomorrow UTC"
+                )
             return True
         return False
     except Exception:
         return False
+
+
+def _get_all_bet_market_ids() -> set:
+    """
+    Return the set of ALL condition_ids Larry has EVER bet on (any status).
+    Used to prevent re-betting on resolved markets that are no longer in pending_bets.
+    Falls back to empty set on any DB error so filtering degrades gracefully.
+    """
+    try:
+        conn = get_connection()
+        rows = conn.execute("SELECT polymarket_id FROM bets").fetchall()
+        conn.close()
+        return {(r["polymarket_id"] or "").lower() for r in rows if r["polymarket_id"]}
+    except Exception:
+        return set()
 
 
 # ─── AUTO-CLAIM WINNINGS ──────────────────────────────────────────────────────
@@ -820,10 +854,22 @@ def try_sell_positions_for_capital(client: ClobClient, needed: float = 5.0) -> f
     2. Ask Claude/Larry which ones to sell (larry_brain.ask_larry_to_sell)
     3. Place SELL orders (GTC) for chosen positions
     4. Mark those bets as resolved in DB (they'll disappear from pending)
-    5. Sleep 3s then re-sync bankroll from CLOB — sell proceeds should appear
+    5. Sleep 4s then re-sync bankroll from CLOB — sell proceeds should appear
 
-    Returns: estimated USDC freed (sum of sell values; 0 if nothing sold).
+    Cooldown: _SELL_COOLDOWN_MINUTES between attempts so GTC orders have time to fill
+    before we try to sell another position (avoids hammering every 30-min cycle).
+
+    Returns: estimated USDC freed (sum of sell values; 0 if nothing sold / cooldown active).
     """
+    global _last_sell_attempt_at
+    now = _utcnow()
+    if (_last_sell_attempt_at is not None and
+            (now - _last_sell_attempt_at).total_seconds() < _SELL_COOLDOWN_MINUTES * 60):
+        remaining = int(_SELL_COOLDOWN_MINUTES - (now - _last_sell_attempt_at).total_seconds() / 60)
+        log.info(f"💸 Sell cooldown active ({remaining}m left) — skipping sell attempt")
+        return 0.0
+    _last_sell_attempt_at = now
+
     pending = get_pending_bets()
     if not pending:
         log.info("💸 No open positions to sell")
@@ -1132,9 +1178,13 @@ def check_pending_bets(client: ClobClient):
     with ThreadPoolExecutor(max_workers=min(len(pending), 8)) as ex:
         futures = {ex.submit(_check_single_bet, bet): bet for bet in pending}
         for future in as_completed(futures, timeout=30):
-            result = future.result()
-            if result:
-                resolved.append(result)
+            try:
+                result = future.result()
+                if result:
+                    resolved.append(result)
+            except Exception as worker_err:
+                bet_id = futures[future].get("polymarket_id", "?")[:16]
+                log.warning(f"check_pending_bets: worker failed for {bet_id}...: {type(worker_err).__name__}: {worker_err}")
 
     for r in resolved:
         bet = r["bet"]
@@ -1333,28 +1383,35 @@ def run_betting_agent():
                     else:
                         log.info(f"💸 No positions sold — still ${bankroll:.2f} free, need $5 to bet")
 
-                # 3c. Daily loss limit — stop placing new bets if lost too much today
-                if _is_daily_loss_limit_hit():
-                    log.info("💤 Skipping bet cycle — daily loss limit active")
-                    continue  # skip betting this cycle, still check pending bets next cycle
-
-                # 4. Fetch markets — three parallel Gamma batches, 24h window
-                markets = fetch_active_markets()
+                # 3c. Daily loss limit — stop placing new bets if lost too much today.
+                # IMPORTANT: do NOT use `continue` here — it bypasses the sleep at the
+                # bottom of the loop and causes a tight busy-loop (~5s per iteration)
+                # that spams the log hundreds of times per hour.
+                # Initialize markets to None so subsequent `if markets:` blocks are safe
+                # even when the limit is hit and fetch_active_markets() is skipped.
+                markets = None
+                if not _is_daily_loss_limit_hit(log_if_hit=True):
+                    # 4. Fetch markets — three parallel Gamma batches, 24h window
+                    markets = fetch_active_markets()
 
                 if markets:
                     # Filter out markets Larry already has open bets on, token-blacklisted,
-                    # or already passed on this cycle (price/urgency unchanged)
+                    # or already passed on this cycle (price/urgency unchanged).
+                    # NOTE: use ALL-time bet IDs (not just pending) so resolved markets don't
+                    #       trigger an IntegrityError from the UNIQUE constraint on polymarket_id.
                     pending_bets_now = get_pending_bets()
+                    all_ever_bet_ids  = _get_all_bet_market_ids()  # includes WON/LOST
                     open_bet_ids  = {(b.get("polymarket_id") or "").lower() for b in pending_bets_now}
                     open_questions = {(b.get("question") or "").lower().strip() for b in pending_bets_now}
+                    combined_bet_ids = open_bet_ids | all_ever_bet_ids
                     fresh_markets = [
                         m for m in markets
-                        if m["condition_id"].lower() not in open_bet_ids
+                        if m["condition_id"].lower() not in combined_bet_ids
                         and m.get("question", "").lower().strip() not in open_questions
                         and not _is_token_blacklisted(m["condition_id"])
                         and not _is_pass_cached(m)
                     ]
-                    skipped_open  = sum(1 for m in markets if m["condition_id"].lower() in open_bet_ids or m.get("question","").lower().strip() in open_questions)
+                    skipped_open  = sum(1 for m in markets if m["condition_id"].lower() in combined_bet_ids or m.get("question","").lower().strip() in open_questions)
                     skipped_pass  = sum(1 for m in markets if _is_pass_cached(m))
                     skipped_token = len(markets) - len(fresh_markets) - skipped_open - skipped_pass
                     log.info(
@@ -1499,8 +1556,13 @@ def run_betting_agent():
             log.info("👋 Betting agent stopped by user")
             break
         except Exception as e:
+            err_str = str(e).lower()
             # SECURITY: no exc_info (traceback can expose env vars/keys)
             log.error(f"Unexpected error in betting loop: {type(e).__name__}: {e}")
+            # DB lock at cycle level: short backoff then continue normally
+            if "locked" in err_str or "operationalerror" in type(e).__name__.lower():
+                log.warning("DB locked at cycle level — sleeping 10s then retrying")
+                time.sleep(10)
 
         if _betting_shutdown:
             break
