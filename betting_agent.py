@@ -244,7 +244,7 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
 
     try:
         from poly_web3 import PolyWeb3Service, RELAYER_URL as _LIB_RELAYER_URL  # noqa
-        from py_builder_relayer_client.client import RelayerClient
+        from py_builder_relayer_client.client import RelayClient
         from py_builder_relayer_client.config import BuilderConfig
     except ImportError as e:
         log.warning(
@@ -260,8 +260,8 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
             passphrase=_BUILDER_PASSPHRASE,
         )
 
-        # RelayerClient wraps the /submit endpoint with proper signing
-        relayer_client = RelayerClient(
+        # RelayClient wraps the /submit endpoint with proper signing
+        relayer_client = RelayClient(
             host=_RELAYER_URL,
             chain_id=137,   # Polygon mainnet
             key=POLYMARKET_PRIVATE_KEY,
