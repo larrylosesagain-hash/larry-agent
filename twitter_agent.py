@@ -524,26 +524,35 @@ _QUOTE_ACCOUNTS = [
     "CryptoBanter",     # crypto commentary, large engaged audience
 ]
 
-def _search_tweets_from_accounts(account_list: list) -> dict | None:
+def _search_tweets_from_accounts(account_list: list, sort_by_recency: bool = False) -> dict | None:
     """
-    Core search: find a recent tweet from the given account list.
-    Returns best candidate by engagement score, or None.
+    Core search: find a tweet from the given account list.
+
+    sort_by_recency=False (default): returns highest-engagement tweet — good for quote tweets/retweets.
+    sort_by_recency=True: returns the FRESHEST valid tweet — good for proactive replies
+                          so Larry comments on something that just happened, not yesterday's news.
     """
     if not account_list:
         return None
     try:
         client = get_twitter_client()
-        accounts = random.sample(account_list, min(5, len(account_list)))
+        # For recency search: include ALL whitelist accounts to find freshest across all of them.
+        # For engagement search: sample 5 to stay within query length limits.
+        accounts = account_list if sort_by_recency else random.sample(account_list, min(5, len(account_list)))
         from_query = " OR ".join(f"from:{a}" for a in accounts)
         query = f"({from_query}) -is:retweet -is:reply lang:en"
 
-        response = client.search_recent_tweets(
+        api_kwargs = dict(
             query=query,
             max_results=20,
-            tweet_fields=["author_id", "text", "public_metrics", "reply_settings"],
+            tweet_fields=["author_id", "text", "public_metrics", "reply_settings", "created_at"],
             expansions=["author_id"],
             user_fields=["username", "public_metrics"],
         )
+        if sort_by_recency:
+            api_kwargs["sort_order"] = "recency"  # Twitter returns newest first
+
+        response = client.search_recent_tweets(**api_kwargs)
         if not response.data:
             return None
 
@@ -573,13 +582,25 @@ def _search_tweets_from_accounts(account_list: list) -> dict | None:
                 metrics.get("retweet_count", 0) * 3 +
                 min(user.get("followers", 0), 500000) / 50000
             )
+            # Tweet ID is a snowflake — higher ID = more recent.
             candidates.append({
                 "tweet_id": str(tweet.id),
                 "text": text,
                 "username": user.get("username", ""),
                 "score": score,
+                "created_at": getattr(tweet, "created_at", None),
             })
-        return max(candidates, key=lambda x: x["score"]) if candidates else None
+
+        if not candidates:
+            return None
+
+        if sort_by_recency:
+            # Sort by tweet ID descending — snowflake IDs are monotonically increasing.
+            # Twitter already returns recency order but explicit sort is safer.
+            return sorted(candidates, key=lambda x: int(x["tweet_id"]), reverse=True)[0]
+        else:
+            return max(candidates, key=lambda x: x["score"])
+
     except tweepy.errors.Unauthorized:
         log.warning("Tweet search: Unauthorized — Basic tier required")
         return None
@@ -728,51 +749,35 @@ def maybe_retweet():
 
 def maybe_reply_to_whitelist():
     """
-    Larry drops a comment under a tweet from a whitelisted account.
-    Different from quote tweet — appears as a reply thread under their post.
-    ~4-5 per day. Throttled: min 2 hours. 70% chance when eligible.
+    Larry proactively drops a reply under a FRESH tweet from a whitelist account.
+    Runs every 30 minutes. Targets @elonmusk, @saylor, @Polymarket only.
 
-    IMPORTANT: searches ONLY non-VIP accounts.
-    VIP accounts (elonmusk, realDonaldTrump, polymarket) are covered by the real-time
-    VIP stream. Using _get_cycle_candidate() here was wrong — those top accounts
-    dominate the score ranking (millions of likes), so the shared candidate was always
-    a VIP account, the skip-VIP check fired, and Larry NEVER replied to anyone.
-    Fix: separate search for non-VIP accounts only.
+    - Searches for the FRESHEST eligible tweet (sort_by_recency=True).
+    - VIP stream already handles real-time @elonmusk replies — this is a 30-min
+      backup pass across all 3 accounts so Larry stays engaged even if the stream
+      misses something or the account tweets while stream is reconnecting.
+    - No random gate (was 70% — was silently blocking Larry most of the time).
+    - Cooldown: 30 minutes (was 2h — was the main reason Larry never replied).
+    - Up to 5 attempts per cycle to find an open tweet.
     """
     now = datetime.utcnow()
-    if now.hour < 8 or now.hour >= 23:
-        return
+    if now.hour < 7 or now.hour >= 24:
+        return  # gentle active-hours limit
 
     last_wr = get_state("last_whitelist_reply_time")
     if last_wr:
         try:
-            if (now - datetime.fromisoformat(last_wr)).total_seconds() < 2 * 3600:
-                return
+            if (now - datetime.fromisoformat(last_wr)).total_seconds() < 30 * 60:
+                return  # 30-min cooldown
         except Exception:
             pass
 
-    if random.random() > 0.70:
-        return
-
-    # Search only non-VIP accounts — VIPs are handled by the real-time stream
-    vip_lower = {a.lower() for a in _VIP_STREAM_ACCOUNTS}
-    now_dt = datetime.utcnow()
-    non_vip_accounts = [
-        a for a in _QUOTE_ACCOUNTS
-        if a.lower() not in vip_lower
-        and _quote_account_blacklist.get(a, datetime.min) < now_dt
-    ]
-    if not non_vip_accounts:
-        return
-
-    # Try up to MAX_REPLY_ATTEMPTS candidates — skip restricted tweets and move on
-    # instead of burning a 2h cooldown on the first 403.
-    MAX_REPLY_ATTEMPTS = 3
+    # Search REPLY_WHITELIST for the freshest tweet — no random gate
+    MAX_REPLY_ATTEMPTS = 5
     tried_ids: set = set()
 
     for attempt in range(MAX_REPLY_ATTEMPTS):
-        # Re-search excluding already-tried tweet_ids (blocked in _quote_blocked_ids)
-        candidate = _search_tweets_from_accounts(non_vip_accounts)
+        candidate = _search_tweets_from_accounts(_REPLY_WHITELIST, sort_by_recency=True)
         if not candidate or candidate["tweet_id"] in tried_ids:
             break
         tried_ids.add(candidate["tweet_id"])
@@ -802,8 +807,7 @@ def maybe_reply_to_whitelist():
             return  # success — done
 
         except tweepy.Forbidden:
-            # This specific tweet has reply restrictions — blacklist tweet_id and try another.
-            # Do NOT advance the 2h cooldown yet — we haven't actually replied to anyone.
+            # Tweet has restricted replies — blacklist this tweet and try the next fresh one.
             _quote_blocked_ids.add(candidate["tweet_id"])
             log.info(
                 f"💬 Reply to @{candidate['username']} tweet restricted "
@@ -815,10 +819,10 @@ def maybe_reply_to_whitelist():
             log.warning(f"Whitelist reply failed: {type(e).__name__}: {e}")
             break
 
-    # All attempts failed — set a short 1h cooldown (was 2h) to avoid hammering
-    # the same restricted accounts. With more accounts in the list this recovers faster.
-    set_state("last_whitelist_reply_time", (now - timedelta(hours=1)).isoformat())
-    log.info("💬 All whitelist reply attempts restricted/failed — cooling down 1h")
+    # All attempts failed — will retry next cycle (~15 min) since all failed tweets are now
+    # blacklisted in _quote_blocked_ids, so next search should surface different tweets.
+    set_state("last_whitelist_reply_time", (now - timedelta(minutes=30)).isoformat())
+    log.info("💬 All whitelist reply attempts restricted/failed — retrying next cycle")
 
 
 # ─── PRICE MOVE REACTIONS ─────────────────────────────────────────────────────
@@ -904,7 +908,11 @@ def maybe_react_to_price_moves():
 #
 # VIP accounts Larry monitors and replies to immediately via filtered stream.
 # Only Elon — every tweet, 24/7, no per-account cooldown.
-_VIP_STREAM_ACCOUNTS = ["elonmusk"]
+# Whitelist for the 30-min proactive reply cycle — Larry drops a comment under their fresh tweets.
+# Small and focused: Elon (real-time via VIP stream + 30-min backup), Saylor, Polymarket.
+_REPLY_WHITELIST = ["elonmusk", "saylor", "Polymarket"]
+
+_VIP_STREAM_ACCOUNTS = ["elonmusk", "saylor", "Polymarket"]
 
 # Anti-spam guard: minimum seconds between consecutive VIP replies.
 # Elon sometimes posts 5 tweets in 2 minutes — without this Larry would fire
@@ -1130,13 +1138,13 @@ def run_twitter_agent():
             # 4. Check mentions and maybe reply (1 reply per 4 own tweets)
             check_and_reply_to_mentions()
 
-            # 5. Quote tweet something relevant
-            maybe_quote_tweet()
+            # 5. Quote tweets disabled — too many 403s, low ROI
+            # maybe_quote_tweet()
 
             # 6. Retweet something from whitelist
             maybe_retweet()
 
-            # 7. Reply under a whitelist account's tweet
+            # 7. Reply under a fresh whitelist tweet (every 30 min)
             maybe_reply_to_whitelist()
 
             # 8. React to price moves on open bets (throttled, only big moves)
