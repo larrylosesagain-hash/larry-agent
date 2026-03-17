@@ -894,6 +894,22 @@ def _check_single_bet(bet: dict) -> dict | None:
             # closed but our outcome token missing — treat as loss
             return {"bet": bet, "won": False, "payout": 0.0}
 
+        # ── Price-based path: token at 0.99+ = resolved, CLOB just hasn't flipped closed yet ──
+        # Polymarket freezes trading and moves token to $1.00 when a market resolves,
+        # but CLOB can take hours to flip closed=True. This catches early resolutions
+        # (e.g. game ended before scheduled end_date).
+        tokens = market.get("tokens", [])
+        for token in tokens:
+            if token.get("outcome", "").upper() == bet["outcome"].upper():
+                price = float(token.get("price", 0))
+                if price >= 0.99:
+                    log.info(
+                        f"💡 Token price={price:.3f} for {bet['outcome']} on {cid[:16]}... "
+                        f"— treating as resolved WIN (CLOB closed flag lagging)"
+                    )
+                    return {"bet": bet, "won": True, "payout": bet["potential_payout"]}
+                break
+
         # ── Secondary path: end_date expired 4h+ ago but CLOB not closed yet ──
         # CLOB can lag behind by hours. Gamma resolves faster.
         end_date_str = (market.get("endDate") or market.get("end_date") or
