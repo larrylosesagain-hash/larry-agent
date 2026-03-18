@@ -248,6 +248,11 @@ def get_clob_client() -> ClobClient:
     # create_or_derive_api_creds() is idempotent — safe to call every startup
     creds = client.create_or_derive_api_creds()
     client.set_api_creds(creds)
+
+    # Log available approval methods so we know what to call for CTF allowance fix
+    approval_methods = [m for m in dir(client) if any(kw in m.lower() for kw in ("approv", "allow", "ctf"))]
+    log.info(f"🔧 ClobClient approval methods: {approval_methods}")
+
     return client
 
 
