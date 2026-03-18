@@ -361,6 +361,124 @@ def _get_all_bet_market_ids() -> set:
 # ─── AUTO-CLAIM WINNINGS ──────────────────────────────────────────────────────
 
 
+def _build_relay_service():
+    """
+    Build a (PolyWeb3Service, relay_client) pair using the Builder Relayer.
+    Shared by claim_winnings() and sweep_unclaimed_winnings().
+    Returns (service, svc_methods) or raises on failure.
+    """
+    import importlib, inspect as _insp
+    from poly_web3 import PolyWeb3Service
+    from py_builder_relayer_client.client import RelayClient
+
+    _cfg_mod = importlib.import_module("py_builder_relayer_client.config")
+    _available = [n for n, _ in _insp.getmembers(_cfg_mod, _insp.isclass) if not n.startswith("_")]
+    log.info(f"🔧 Config classes available: {_available}")
+
+    _auth_hints = {"key", "secret", "pass", "token", "credential", "auth"}
+    _BuilderConfig = None
+    for _name in ("BuilderConfig", "Config", "ApiConfig", "RelayConfig", "BuilderApiConfig", "ContractConfig"):
+        _Cls = getattr(_cfg_mod, _name, None)
+        if _Cls is None:
+            continue
+        try:
+            _sig = _insp.signature(_Cls.__init__)
+            _params = {p.lower() for p in _sig.parameters.keys() if p != "self"}
+            _has_auth = any(any(h in p for h in _auth_hints) for p in _params)
+            log.info(f"🔧 {_name} params: {_params} | has_auth={_has_auth}")
+            if _has_auth:
+                _BuilderConfig = _Cls
+                log.info(f"🔧 Using config class: {_name}")
+                break
+        except Exception:
+            _BuilderConfig = _Cls
+            log.info(f"🔧 Using config class (uninspectable): {_name}")
+            break
+
+    def _make_relay(**extra):
+        sig = _insp.signature(RelayClient.__init__)
+        valid = set(sig.parameters.keys()) - {"self"}
+        has_var_kw = any(p.kind == _insp.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        candidates = dict(
+            host=_RELAYER_URL, relayer_url=_RELAYER_URL, chain_id=137,
+            key=POLYMARKET_PRIVATE_KEY, private_key=POLYMARKET_PRIVATE_KEY,
+            funder=POLYMARKET_FUNDER, funder_address=POLYMARKET_FUNDER,
+            wallet_address=POLYMARKET_FUNDER, **extra,
+        )
+        filtered = candidates if has_var_kw else {k: v for k, v in candidates.items() if k in valid}
+        log.info(f"🔧 RelayClient: {sorted(filtered.keys())}")
+        return RelayClient(**filtered)
+
+    builder_cfg = None
+    if _BuilderConfig is not None:
+        try:
+            _cfg_sig = _insp.signature(_BuilderConfig.__init__)
+            _cfg_params = {p: v for p, v in _cfg_sig.parameters.items() if p != "self"}
+            _cred_map = {
+                "api_key": _BUILDER_API_KEY, "key": _BUILDER_API_KEY,
+                "secret": _BUILDER_SECRET,
+                "passphrase": _BUILDER_PASSPHRASE, "pass": _BUILDER_PASSPHRASE,
+            }
+            _cfg_kwargs = {}
+            for pname in _cfg_params:
+                plow = pname.lower()
+                for hint, val in _cred_map.items():
+                    if hint in plow:
+                        _cfg_kwargs[pname] = val
+                        break
+            log.info(f"🔧 {_BuilderConfig.__name__}({list(_cfg_kwargs.keys())})")
+            builder_cfg = _BuilderConfig(**_cfg_kwargs) if _cfg_kwargs else _BuilderConfig()
+        except Exception as _e:
+            log.warning(f"🔧 Config init failed ({_e}) — trying no-arg fallback")
+            try:
+                builder_cfg = _BuilderConfig()
+            except Exception:
+                builder_cfg = None
+
+    relay_client = _make_relay(**({"builder_config": builder_cfg} if builder_cfg is not None else {}))
+    clob = get_clob_client()
+    service = PolyWeb3Service(clob_client=clob, relayer_client=relay_client)
+    svc_methods = [m for m in dir(service) if not m.startswith("_")]
+    log.info(f"🔧 PolyWeb3Service methods: {svc_methods}")
+    return service, svc_methods
+
+
+def sweep_unclaimed_winnings(client: ClobClient) -> bool:
+    """
+    Proactive sweep: call redeem_all() via Builder Relayer every cycle.
+    Catches winnings that were PREVIOUSLY marked WON in DB but never actually
+    claimed (e.g. because prior redeem attempts silently failed).
+    Does NOT require any specific condition_id — the relayer finds all redeemable positions.
+    Returns True if any winnings were successfully claimed.
+    """
+    if not _BUILDER_API_KEY:
+        return False
+
+    last_sweep = getattr(sweep_unclaimed_winnings, "_last_ran", None)
+    now_ts = time.time()
+    # Throttle: sweep at most once per 30 minutes (matches betting cycle sleep)
+    if last_sweep and (now_ts - last_sweep) < 1800:
+        return False
+    sweep_unclaimed_winnings._last_ran = now_ts
+
+    try:
+        service, _ = _build_relay_service()
+        if not hasattr(service, "redeem_all"):
+            return False
+        log.info("🧹 Sweeping unclaimed winnings via redeem_all()...")
+        result = service.redeem_all()
+        if result:
+            log.info(f"✅ Sweep claimed winnings! result={str(result)[:200]}")
+            sync_bankroll_from_clob(client)
+            return True
+        else:
+            log.info("🧹 Sweep: redeem_all returned [] — nothing redeemable yet (or builder_config still broken)")
+            return False
+    except Exception as e:
+        log.warning(f"🧹 Sweep failed ({type(e).__name__}: {e})")
+        return False
+
+
 def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
     """
     Claim winning position. Tries gasless (Builder Relayer) first, then direct on-chain.
@@ -377,131 +495,22 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
     # ── Path 1: Gasless via Builder Relayer ───────────────────────────────────
     if _BUILDER_API_KEY:
         try:
-            import importlib, inspect as _insp
-            from poly_web3 import PolyWeb3Service
-            from py_builder_relayer_client.client import RelayClient
-
-            # Dynamically find the config class (name changed between versions)
-            _cfg_mod = importlib.import_module("py_builder_relayer_client.config")
-            _available = [n for n, _ in _insp.getmembers(_cfg_mod, _insp.isclass) if not n.startswith("_")]
-            log.info(f"🔧 Config classes available: {_available}")
-
-            # Find the config class — name changed between SDK versions.
-            # Strategy: try known names first, then inspect ALL available classes
-            # looking for one that accepts api_key/secret/passphrase parameters.
-            _BuilderConfig = None
-            _auth_kwarg_hints = {"key", "secret", "pass", "token", "credential", "auth"}
-
-            # Try specific names first (most likely matches across SDK versions)
-            for _name in ("BuilderConfig", "Config", "ApiConfig", "RelayConfig",
-                          "BuilderApiConfig", "ContractConfig"):
-                _Cls = getattr(_cfg_mod, _name, None)
-                if _Cls is None:
-                    continue
-                try:
-                    _sig = _insp.signature(_Cls.__init__)
-                    _params = {p.lower() for p in _sig.parameters.keys() if p != "self"}
-                    _has_auth = any(
-                        any(hint in p for hint in _auth_kwarg_hints)
-                        for p in _params
-                    )
-                    log.info(f"🔧 {_name} __init__ params: {_params} | has_auth={_has_auth}")
-                    if _has_auth:
-                        _BuilderConfig = _Cls
-                        log.info(f"🔧 Using config class: {_name}")
-                        break
-                except Exception:
-                    # Can't inspect — try it anyway as a last resort
-                    _BuilderConfig = _Cls
-                    log.info(f"🔧 Using config class (uninspectable): {_name}")
-                    break
-
-            def _make_relay_client(**extra_kwargs):
-                """Instantiate RelayClient with only the kwargs it actually accepts."""
-                import inspect as _inspect_rc
-                sig = _inspect_rc.signature(RelayClient.__init__)
-                valid_params = set(sig.parameters.keys()) - {"self"}
-                log.info(f"🔧 RelayClient accepts: {sorted(valid_params)}")
-
-                # Full candidate kwargs — cover common naming variants across SDK versions
-                candidates = dict(
-                    host=_RELAYER_URL,
-                    relayer_url=_RELAYER_URL,   # newer SDK uses relayer_url instead of host
-                    chain_id=137,
-                    key=POLYMARKET_PRIVATE_KEY,
-                    private_key=POLYMARKET_PRIVATE_KEY,
-                    funder=POLYMARKET_FUNDER,
-                    funder_address=POLYMARKET_FUNDER,
-                    wallet_address=POLYMARKET_FUNDER,
-                    **extra_kwargs,
-                )
-                # Only pass kwargs the constructor actually declares (or **kwargs)
-                has_var_keyword = any(
-                    p.kind == _inspect_rc.Parameter.VAR_KEYWORD
-                    for p in sig.parameters.values()
-                )
-                if has_var_keyword:
-                    filtered = candidates  # accepts **kwargs — pass everything
-                else:
-                    filtered = {k: v for k, v in candidates.items() if k in valid_params}
-                log.info(f"🔧 Passing to RelayClient: {list(filtered.keys())}")
-                return RelayClient(**filtered)
-
-            if _BuilderConfig is not None:
-                # Try to instantiate config with API credentials.
-                # Use introspection to map our credentials to actual param names.
-                try:
-                    _cfg_sig = _insp.signature(_BuilderConfig.__init__)
-                    _cfg_params = {p: v for p, v in _cfg_sig.parameters.items() if p != "self"}
-                    _cfg_kwargs = {}
-                    _cred_map = {
-                        "api_key": _BUILDER_API_KEY, "key": _BUILDER_API_KEY,
-                        "secret": _BUILDER_SECRET,
-                        "passphrase": _BUILDER_PASSPHRASE, "pass": _BUILDER_PASSPHRASE,
-                    }
-                    for pname in _cfg_params:
-                        plow = pname.lower()
-                        for hint, val in _cred_map.items():
-                            if hint in plow:
-                                _cfg_kwargs[pname] = val
-                                break
-                    log.info(f"🔧 Instantiating {_BuilderConfig.__name__} with: {list(_cfg_kwargs.keys())}")
-                    builder_cfg = _BuilderConfig(**_cfg_kwargs) if _cfg_kwargs else _BuilderConfig()
-                except Exception as _cfg_err:
-                    log.warning(f"🔧 Config instantiation error ({_cfg_err}) — trying no-args fallback")
-                    try:
-                        builder_cfg = _BuilderConfig()
-                    except Exception:
-                        builder_cfg = None
-                relay_client = _make_relay_client(
-                    **({"builder_config": builder_cfg} if builder_cfg is not None else {})
-                )
-            else:
-                log.warning("⚠️  No config class found — trying without builder_config (private_key auth only)")
-                relay_client = _make_relay_client()
-
-            clob = get_clob_client()
-            service = PolyWeb3Service(clob_client=clob, relayer_client=relay_client)
-            svc_methods = [m for m in dir(service) if not m.startswith("_")]
-            log.info(f"🔧 PolyWeb3Service methods: {svc_methods}")
+            service, svc_methods = _build_relay_service()
             amounts = [payout, 0.0] if outcome.upper() == "YES" else [0.0, payout]
 
-            # ── Try redeem_all() first: no args needed, redeems all resolved positions ──
-            # IMPORTANT: the poly_web3 library swallows errors internally and returns []
-            # instead of raising. Empty [] = nothing was redeemed = failure, NOT success.
+            # Try redeem_all() first — catches this bet AND any other unclaimed wins
             if hasattr(service, "redeem_all"):
                 try:
                     result = service.redeem_all()
-                    if result:  # non-empty list means at least one redeem succeeded
-                        log.info(f"✅ Gasless redeem_all submitted! ${payout:.2f} → {str(result)[:120]}")
+                    if result:
+                        log.info(f"✅ Gasless redeem_all! ${payout:.2f} → {str(result)[:120]}")
                         return True
                     else:
-                        log.warning(f"⚠️  redeem_all returned [] (library swallowed an error — builder_config issue or CTF not resolved) — trying redeem()")
+                        log.warning("⚠️  redeem_all returned [] (builder_config broken or CTF not resolved yet)")
                 except Exception as _e_all:
-                    log.debug(f"redeem_all raised ({type(_e_all).__name__}: {_e_all}) — trying redeem()")
+                    log.debug(f"redeem_all raised ({type(_e_all).__name__}: {_e_all})")
 
-            # ── Try redeem() — use inspect to get ACTUAL param names across SDK versions ──
-            # Avoids "unexpected keyword argument 'condition_id'" when the param is named differently.
+            # Try redeem() with introspected param names
             import inspect as _insp_redeem
             redeem_fn = getattr(service, "redeem", None)
             if redeem_fn is not None:
@@ -509,7 +518,6 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
                     sig = _insp_redeem.signature(redeem_fn)
                     param_names = [p for p in sig.parameters.keys() if p != "self"]
                     log.info(f"🔧 redeem() params: {param_names}")
-                    # Build kwargs using actual param names (handle name variations across SDK versions)
                     call_kwargs = {}
                     for pname in param_names:
                         plow = pname.lower()
@@ -519,24 +527,20 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
                             call_kwargs[pname] = amounts
                         elif "neg" in plow or "risk" in plow:
                             call_kwargs[pname] = False
-                    if call_kwargs:
-                        result = redeem_fn(**call_kwargs)
-                    else:
-                        # All positional — typical: redeem(condition_id, amounts, neg_risk=False)
-                        result = redeem_fn(condition_id, amounts, False)
-                    if result:  # non-empty / non-None means library submitted successfully
-                        log.info(f"✅ Gasless redeem submitted! ${payout:.2f} → {str(result)[:120]}")
+                    result = redeem_fn(**call_kwargs) if call_kwargs else redeem_fn(condition_id, amounts, False)
+                    if result:
+                        log.info(f"✅ Gasless redeem! ${payout:.2f} → {str(result)[:120]}")
                         return True
                     else:
-                        log.warning(f"⚠️  redeem() returned empty result (library swallowed error) — falling through to CTF path")
+                        log.warning("⚠️  redeem() returned empty (library swallowed error)")
                 except Exception as _e_redeem:
                     log.warning(f"redeem() failed ({type(_e_redeem).__name__}: {_e_redeem})")
 
-            raise AttributeError(f"No working redeem method on {type(service).__name__}. Available: {svc_methods}")
+            raise AttributeError(f"No working redeem method. Available: {svc_methods}")
         except Exception as e:
             log.warning(f"⚠️  Gasless claim failed ({type(e).__name__}: {e}) — trying direct on-chain")
 
-    # ── Path 2: Direct on-chain via CTF.redeemPositions() ────────────────────
+        # ── Path 2: Direct on-chain via CTF.redeemPositions() ────────────────────
     # Requires small amount of MATIC in funder wallet (~0.01 MATIC = ~$0.005)
     # To enable: send 0.1 MATIC to POLYMARKET_FUNDER address (check Railway env vars)
     try:
@@ -1660,8 +1664,11 @@ def run_betting_agent():
             log.info("🔄 Syncing balance with CLOB...")
             sync_bankroll_from_clob(client)
 
-            # 1. Check if pending bets resolved
-            # 1. Check if pending bets resolved — claims winning positions at 100¢
+            # 1. Proactive sweep — claim any unclaimed winnings via Builder Relayer.
+            # Catches winnings from previous cycles that never got claimed (e.g. $14.25 stuck in "Получить").
+            sweep_unclaimed_winnings(client)
+
+            # 2. Check if pending bets resolved — claims newly resolved positions
             check_pending_bets(client)
 
             # 2. Check free bankroll — bet until it hits zero (no exposure cap)
