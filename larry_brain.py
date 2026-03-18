@@ -145,20 +145,25 @@ REPLY_TOOL = {
 
 SELL_TOOL = {
     "name": "submit_sell_decisions",
-    "description": "Decide which open positions to sell early to free up capital for new bets.",
+    "description": (
+        "Review open positions and decide if you've genuinely changed your mind on any of them. "
+        "Return an empty array if you still believe in all your positions — that is totally fine. "
+        "Only mark SELL if you truly no longer believe in a position (new info changed your view, "
+        "the thesis broke, or the market is clearly dead). Never sell just to free up cash."
+    ),
     "input_schema": {
         "type": "object",
         "properties": {
             "sell_decisions": {
                 "type": "array",
-                "minItems": 1,
+                "description": "List of positions you want to exit. Can be empty — returning [] means 'I still believe in everything, let them ride'.",
                 "items": {
                     "type": "object",
                     "properties": {
                         "market_id":   {"type": "string", "description": "condition_id of the market"},
                         "action":      {"type": "string", "enum": ["SELL", "KEEP"]},
-                        "reasoning":   {"type": "string"},
-                        "larry_tweet": {"type": "string", "description": "Short 1-sentence tweet about cutting the position. SELL decisions only. Optional."},
+                        "reasoning":   {"type": "string", "description": "Why you changed your mind (or why you're keeping it)"},
+                        "larry_tweet": {"type": "string", "description": "Short 1-sentence tweet about cutting the position. SELL only. Optional."},
                     },
                     "required": ["market_id", "action", "reasoning"]
                 }
@@ -535,81 +540,47 @@ def ask_larry_to_reply(mention: dict) -> dict:
 
 def ask_larry_to_sell(open_positions: list) -> list:
     """
-    When Larry has < $5 free cash, ask him which open positions to sell early
-    to free up capital for something more exciting today.
+    Ask Larry if he has genuinely changed his mind on any open positions.
+    This is NOT about freeing capital — it's about cutting positions where the
+    original thesis no longer holds.
 
-    open_positions: list of dicts with keys:
-        market_id, question, outcome, bought_at (price paid),
-        current_price, paid (USDC), current_value (USDC), pnl_usdc,
-        end_date (ISO string, optional)
-
-    Returns list of sell_decision dicts: [{market_id, action, reasoning, larry_tweet?}, ...]
+    Returns list of sell_decision dicts (can be empty = keep everything).
     """
     ctx = _get_larry_context()
-
     today = __import__("datetime").date.today().isoformat()
 
     user_message = (
         f"Larry Status: {json.dumps(ctx, separators=(',',':'))}\n\n"
-        f"Today is {today}. Larry has ${ctx['bankroll_usdc']} free cash — not enough for the $5 minimum bet.\n"
-        f"He is STUCK. He can't bet on anything new until he frees up capital.\n\n"
+        f"Today is {today}. Review your open positions below.\n\n"
         f"His open positions:\n"
         f"{json.dumps(open_positions, separators=(',',':'))}\n\n"
-        f"LARRY'S SITUATION: He sees markets resolving TODAY that he wants to bet on, but he's locked out because "
-        f"his money is all tied up in positions that won't resolve for WEEKS or MONTHS.\n\n"
-        f"Larry's decision process for each position:\n"
-        f"- end_date far in future (after {today} + 7 days or 'unknown') → SELL unless conviction is extremely strong\n"
-        f"- end_date in the next 1-7 days → KEEP (almost done, let it ride)\n"
-        f"- pnl_usdc near 0 (between -$1 and +$1) → ideal sell, barely any loss\n"
-        f"- current_price < 0.10 → bag-holding a loser, SELL and cut it\n"
-        f"- current_price > 0.85 → almost won, KEEP and let it finish\n\n"
-        f"YOU MUST SELL AT LEAST 1 POSITION. Larry is impatient. He always finds one boring position to dump.\n"
-        f"Every position must have an action (SELL or KEEP). Empty decisions array is not acceptable.\n\n"
-        f"For SELL decisions: write larry_tweet — a short 1-sentence tweet about ditching the position. "
-        f"Larry's voice. Examples: 'cutting my oil bet, rather bet on something that actually happens today' / "
-        f"'selling my march crypto position, boring. found something better' / 'done waiting on this one'"
+        f"Question: have you GENUINELY CHANGED YOUR MIND on any of these?\n\n"
+        f"IMPORTANT: You placed each of these bets because you believed in them. "
+        f"Do NOT sell just because balance is low — that's trading a good bet for a random new one. "
+        f"Only sell if something real changed: new info invalidated your thesis, "
+        f"the position is clearly dead (price < 0.05, thesis dead), or you made a clear mistake.\n\n"
+        f"If you still believe in all your positions: return an empty sell_decisions array — that is the RIGHT answer. "
+        f"Patience is a strategy. Let your bets resolve.\n\n"
+        f"Signals that MIGHT justify selling (not a requirement):\n"
+        f"- current_price < 0.05 AND you no longer believe in the thesis → dead weight, cut it\n"
+        f"- end_date is MONTHS away AND you've completely lost conviction → free the capital\n"
+        f"- A real-world event already proved the bet wrong → no point holding\n\n"
+        f"For SELL decisions: optionally write a larry_tweet (1 sentence, his voice). "
+        f"Examples: 'thesis broke, moving on' / 'this one isn't happening, cut it'"
     )
     try:
         messages = [{"role": "user", "content": user_message}]
-        result = _call_claude_with_tool(1000, messages, SELL_TOOL, model=CLAUDE_MODEL)
+        result = _call_claude_with_tool(800, messages, SELL_TOOL, model=CLAUDE_MODEL)
         decisions = result.get("sell_decisions", [])
 
-        # Retry once if Claude returned empty — inject a strict correction turn
-        if not decisions and open_positions:
-            log.warning("💸 Claude returned empty on first try — retrying with correction prompt")
-            retry_messages = messages + [
-                {
-                    "role": "assistant",
-                    "content": [{"type": "tool_use", "id": "sell_retry", "name": SELL_TOOL["name"], "input": {"sell_decisions": []}}],
-                },
-                {
-                    "role": "user",
-                    "content": [{"type": "tool_result", "tool_use_id": "sell_retry",
-                                 "content": "REJECTED: sell_decisions is empty. You MUST include at least one SELL decision. "
-                                            "Pick the position with the highest current_value and mark it SELL. "
-                                            "Returning an empty array is not acceptable."}],
-                },
-            ]
-            result2 = _call_claude_with_tool(500, retry_messages, SELL_TOOL, model=CLAUDE_MODEL)
-            decisions = result2.get("sell_decisions", [])
-            if decisions:
-                log.info(f"💸 Retry succeeded — Claude returned {len(decisions)} decision(s)")
+        sells = [d for d in decisions if d.get("action") == "SELL"]
+        keeps = [d for d in decisions if d.get("action") == "KEEP"]
+        if sells:
+            log.info(f"💸 Larry changed mind on {len(sells)} position(s): "
+                     f"{', '.join(d['market_id'][:16] for d in sells)}")
+        else:
+            log.info(f"💸 Larry holding all positions — no conviction changes (keeping {len(open_positions)} bets)")
 
-        # Final fallback: if Claude still returned empty, force-sell the most liquid position.
-        # Prefer positions with highest current_value (most likely to have liquidity/buyers)
-        # and avoid near-zero positions (deep losers are illiquid and unsellable).
-        if not decisions and open_positions:
-            candidates = [p for p in open_positions if p.get("current_value", 0) > 0.10]
-            if not candidates:
-                candidates = open_positions  # last resort: try anything
-            worst = max(candidates, key=lambda p: p.get("current_value", 0))
-            log.warning(f"💸 Claude returned empty sell decisions — force-selling most liquid position: {worst.get('question','?')[:40]}")
-            decisions = [{
-                "market_id": worst["market_id"],
-                "action": "SELL",
-                "reasoning": "auto-selected as worst-performing position to free capital",
-                # No larry_tweet here — avoid duplicate-content 403 on every forced sell
-            }]
         return decisions
     except Exception as e:
         log.warning(f"Claude unavailable for sell decisions: {type(e).__name__} — skipping")

@@ -868,6 +868,139 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
         return False
 
 
+# ─── COLLECT NEAR-RESOLVED POSITIONS ──────────────────────────────────────────
+
+_NEAR_RESOLVED_THRESHOLD = 0.99   # sell positions trading at ≥ 99¢ — market has effectively resolved
+
+def collect_near_resolved_positions(client: ClobClient) -> float:
+    """
+    Proactively sell positions that are already trading at ≥ 0.95.
+    These are effectively won — selling early collects ~95% of the value
+    immediately rather than waiting days for formal resolution.
+
+    Runs every betting cycle regardless of bankroll.
+    Returns estimated USDC collected.
+    """
+    pending = get_pending_bets()
+    if not pending:
+        return 0.0
+
+    # Fetch current prices and token IDs for all pending bets
+    near_won = []
+    token_lookup: dict = {}
+    price_lookup: dict = {}
+
+    for bet in pending:
+        mid = bet.get("polymarket_id", "")
+        if not mid or mid in _unsellable_positions:
+            continue
+        try:
+            md = client.get_market(mid)
+            tokens = md.get("tokens", []) if md else []
+            for token in tokens:
+                if token.get("outcome", "").lower() == bet.get("outcome", "").lower():
+                    current_price = float(token.get("price", 0))
+                    token_id = token.get("token_id")
+                    token_lookup[mid] = token_id
+                    price_lookup[mid] = current_price
+                    if current_price >= _NEAR_RESOLVED_THRESHOLD:
+                        shares = float(bet.get("amount_usdc", 5.0))
+                        near_won.append({
+                            "market_id": mid,
+                            "question": bet.get("question", "?")[:80],
+                            "outcome": bet.get("outcome", "YES"),
+                            "current_price": current_price,
+                            "paid": shares,
+                            "token_id": token_id,
+                        })
+                    break
+        except Exception as e:
+            log.debug(f"⛏️  Price fetch failed for {mid[:16]}: {e}")
+
+    if not near_won:
+        return 0.0
+
+    log.info(
+        f"⛏️  Found {len(near_won)} near-resolved position(s) at ≥{_NEAR_RESOLVED_THRESHOLD:.0%} — collecting early: "
+        + ", ".join(f"{p['question'][:30]} ({p['current_price']:.2f})" for p in near_won)
+    )
+
+    total_freed = 0.0
+
+    for p in near_won:
+        mid = p["market_id"]
+        token_id = token_lookup.get(mid)
+        current_price = price_lookup.get(mid, 0)
+        if not token_id or not current_price:
+            continue
+
+        bet = next((b for b in pending if b.get("polymarket_id") == mid), None)
+        if not bet:
+            continue
+
+        # Sell at a small discount to ensure fill
+        sell_price = max(0.90, round(current_price - 0.02, 4))
+        shares = round(float(bet.get("amount_usdc", 5.0)), 2)
+
+        try:
+            # Per-sell CONDITIONAL allowance
+            try:
+                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                conditional = getattr(AssetType, "CONDITIONAL", None)
+                if conditional:
+                    client.update_balance_allowance(
+                        BalanceAllowanceParams(asset_type=conditional, token_id=str(token_id))
+                    )
+            except Exception as _ae:
+                log.warning(f"⛏️  CONDITIONAL allowance update failed for {mid[:16]}: {_ae}")
+
+            order_args = OrderArgs(token_id=token_id, price=sell_price, size=shares, side="SELL")
+            signed_order = client.create_order(order_args)
+            resp = client.post_order(signed_order, OrderType.GTC)
+
+            if resp.get("success"):
+                estimated = round(shares * sell_price, 2)
+                total_freed += estimated
+                log.info(
+                    f"⛏️  COLLECTED: {bet.get('outcome')} on \"{bet.get('question','?')[:50]}\" "
+                    f"@ {sell_price:.3f} → ~${estimated:.2f}"
+                )
+                resolve_bet(mid, False, 0.0)
+
+                # Tweet the win
+                try:
+                    from larry_brain import ask_larry_for_tweet
+                    from twitter_agent import post_tweet
+                    ctx = {
+                        "question": bet.get("question", ""),
+                        "outcome": bet.get("outcome", ""),
+                        "price": sell_price,
+                        "pnl": estimated - float(bet.get("amount_usdc", 5.0)),
+                    }
+                    tweet = ask_larry_for_tweet("NEAR_WIN_COLLECT", ctx)
+                    if tweet:
+                        post_tweet(tweet, tweet_type="COLLECTED_WIN")
+                except Exception as te:
+                    log.debug(f"Collect tweet failed: {te}")
+            else:
+                log.warning(
+                    f"⛏️  Collect order rejected for {mid[:16]}: "
+                    f"{resp.get('errorMsg', resp.get('error', 'unknown'))}"
+                )
+        except Exception as e:
+            err_str = str(e).lower()
+            log.warning(f"⛏️  Exception collecting {mid[:16]}: {type(e).__name__}: {e}")
+            if "not enough balance" in err_str or "allowance" in err_str:
+                _unsellable_positions.add(mid)
+                _save_unsellable()
+
+    if total_freed > 0:
+        time.sleep(4)
+        sync_bankroll_from_clob(client)
+
+    return total_freed
+
+
 # ─── SELL POSITIONS FOR CAPITAL ───────────────────────────────────────────────
 
 def try_sell_positions_for_capital(client: ClobClient, needed: float = 5.0) -> float:
@@ -1017,7 +1150,7 @@ def try_sell_positions_for_capital(client: ClobClient, needed: float = 5.0) -> f
                         BalanceAllowanceParams(asset_type=conditional, token_id=str(token_id))
                     )
             except Exception as _ae:
-                log.debug(f"💸 Pre-sell allowance update skipped: {_ae}")
+                log.warning(f"💸 Pre-sell CONDITIONAL allowance failed for {mid[:16]}: {type(_ae).__name__}: {_ae}")
 
             order_args = OrderArgs(
                 token_id=token_id,
@@ -1427,6 +1560,7 @@ def run_betting_agent():
             sync_bankroll_from_clob(client)
 
             # 1. Check if pending bets resolved
+            # 1. Check if pending bets resolved — claims winning positions at 100¢
             check_pending_bets(client)
 
             # 2. Check free bankroll — bet until it hits zero (no exposure cap)
@@ -1447,19 +1581,18 @@ def run_betting_agent():
             if bankroll <= 0:
                 log.info("No free bankroll remaining — waiting for open bets to resolve")
             else:
-                # 3b. If bankroll too low to bet ($5 min), try selling boring long-dated positions
-                #     to free capital for something more interesting today.
+                # 3b. If bankroll too low to bet ($5 min), wait for open bets to resolve.
+                #     Larry only sells positions he's genuinely changed his mind on — not
+                #     just to free capital for the next bet.  Forcing a sell-to-bet cycle
+                #     destroys value: you exit a position you believe in just to enter a
+                #     new one.  Better to be patient and let winners resolve.
                 if bankroll < 5.0 and open_bets:
-                    freed = try_sell_positions_for_capital(client, needed=5.0)
-                    if freed > 0:
-                        bankroll = get_bankroll()  # re-read after sync inside sell function
-                        log.info(f"💸 Capital freed via position sales — new bankroll: ${bankroll:.2f}")
-                    else:
-                        log.info(f"💸 No positions sold — still ${bankroll:.2f} free, need $5 to bet")
+                    log.info(
+                        f"💤 Bankroll ${bankroll:.2f} < $5 — waiting for open positions to resolve. "
+                        f"Larry holds his convictions."
+                    )
 
-                # Guard: if still under $5 after sell attempt, skip Claude entirely.
-                # Calling Claude to pick markets when we can't afford the $5 minimum
-                # wastes API budget and time — just wait for open bets to resolve.
+                # Guard: if under $5, skip Claude entirely.
                 if bankroll < 5.0:
                     log.info(f"💤 Bankroll ${bankroll:.2f} < $5 minimum — skipping market scan until capital frees up")
                 else:
