@@ -386,11 +386,34 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
             _available = [n for n, _ in _insp.getmembers(_cfg_mod, _insp.isclass) if not n.startswith("_")]
             log.info(f"🔧 Config classes available: {_available}")
 
+            # Find the config class — name changed between SDK versions.
+            # Strategy: try known names first, then inspect ALL available classes
+            # looking for one that accepts api_key/secret/passphrase parameters.
             _BuilderConfig = None
-            for _name in ("BuilderConfig", "Config", "ApiConfig", "RelayConfig", "BuilderApiConfig"):
-                _BuilderConfig = getattr(_cfg_mod, _name, None)
-                if _BuilderConfig is not None:
-                    log.info(f"🔧 Using: {_name}")
+            _auth_kwarg_hints = {"key", "secret", "pass", "token", "credential", "auth"}
+
+            # Try specific names first (most likely matches across SDK versions)
+            for _name in ("BuilderConfig", "Config", "ApiConfig", "RelayConfig",
+                          "BuilderApiConfig", "ContractConfig"):
+                _Cls = getattr(_cfg_mod, _name, None)
+                if _Cls is None:
+                    continue
+                try:
+                    _sig = _insp.signature(_Cls.__init__)
+                    _params = {p.lower() for p in _sig.parameters.keys() if p != "self"}
+                    _has_auth = any(
+                        any(hint in p for hint in _auth_kwarg_hints)
+                        for p in _params
+                    )
+                    log.info(f"🔧 {_name} __init__ params: {_params} | has_auth={_has_auth}")
+                    if _has_auth:
+                        _BuilderConfig = _Cls
+                        log.info(f"🔧 Using config class: {_name}")
+                        break
+                except Exception:
+                    # Can't inspect — try it anyway as a last resort
+                    _BuilderConfig = _Cls
+                    log.info(f"🔧 Using config class (uninspectable): {_name}")
                     break
 
             def _make_relay_client(**extra_kwargs):
@@ -425,15 +448,37 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
                 return RelayClient(**filtered)
 
             if _BuilderConfig is not None:
-                builder_cfg = _BuilderConfig(
-                    api_key=_BUILDER_API_KEY, secret=_BUILDER_SECRET, passphrase=_BUILDER_PASSPHRASE
-                )
-                relay_client = _make_relay_client(builder_config=builder_cfg)
-            else:
-                log.warning("⚠️  No config class found, trying raw credentials")
+                # Try to instantiate config with API credentials.
+                # Use introspection to map our credentials to actual param names.
+                try:
+                    _cfg_sig = _insp.signature(_BuilderConfig.__init__)
+                    _cfg_params = {p: v for p, v in _cfg_sig.parameters.items() if p != "self"}
+                    _cfg_kwargs = {}
+                    _cred_map = {
+                        "api_key": _BUILDER_API_KEY, "key": _BUILDER_API_KEY,
+                        "secret": _BUILDER_SECRET,
+                        "passphrase": _BUILDER_PASSPHRASE, "pass": _BUILDER_PASSPHRASE,
+                    }
+                    for pname in _cfg_params:
+                        plow = pname.lower()
+                        for hint, val in _cred_map.items():
+                            if hint in plow:
+                                _cfg_kwargs[pname] = val
+                                break
+                    log.info(f"🔧 Instantiating {_BuilderConfig.__name__} with: {list(_cfg_kwargs.keys())}")
+                    builder_cfg = _BuilderConfig(**_cfg_kwargs) if _cfg_kwargs else _BuilderConfig()
+                except Exception as _cfg_err:
+                    log.warning(f"🔧 Config instantiation error ({_cfg_err}) — trying no-args fallback")
+                    try:
+                        builder_cfg = _BuilderConfig()
+                    except Exception:
+                        builder_cfg = None
                 relay_client = _make_relay_client(
-                    api_key=_BUILDER_API_KEY, secret=_BUILDER_SECRET, passphrase=_BUILDER_PASSPHRASE,
+                    **({"builder_config": builder_cfg} if builder_cfg is not None else {})
                 )
+            else:
+                log.warning("⚠️  No config class found — trying without builder_config (private_key auth only)")
+                relay_client = _make_relay_client()
 
             clob = get_clob_client()
             service = PolyWeb3Service(clob_client=clob, relayer_client=relay_client)
@@ -442,14 +487,18 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
             amounts = [payout, 0.0] if outcome.upper() == "YES" else [0.0, payout]
 
             # ── Try redeem_all() first: no args needed, redeems all resolved positions ──
-            # This is the cleanest path and avoids all the condition_id kwarg drama.
+            # IMPORTANT: the poly_web3 library swallows errors internally and returns []
+            # instead of raising. Empty [] = nothing was redeemed = failure, NOT success.
             if hasattr(service, "redeem_all"):
                 try:
                     result = service.redeem_all()
-                    log.info(f"✅ Gasless redeem_all submitted! ${payout:.2f} → {str(result)[:120]}")
-                    return True
+                    if result:  # non-empty list means at least one redeem succeeded
+                        log.info(f"✅ Gasless redeem_all submitted! ${payout:.2f} → {str(result)[:120]}")
+                        return True
+                    else:
+                        log.warning(f"⚠️  redeem_all returned [] (library swallowed an error — builder_config issue or CTF not resolved) — trying redeem()")
                 except Exception as _e_all:
-                    log.debug(f"redeem_all failed ({type(_e_all).__name__}: {_e_all}) — trying redeem()")
+                    log.debug(f"redeem_all raised ({type(_e_all).__name__}: {_e_all}) — trying redeem()")
 
             # ── Try redeem() — use inspect to get ACTUAL param names across SDK versions ──
             # Avoids "unexpected keyword argument 'condition_id'" when the param is named differently.
@@ -475,8 +524,11 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
                     else:
                         # All positional — typical: redeem(condition_id, amounts, neg_risk=False)
                         result = redeem_fn(condition_id, amounts, False)
-                    log.info(f"✅ Gasless redeem submitted! ${payout:.2f} → {str(result)[:120]}")
-                    return True
+                    if result:  # non-empty / non-None means library submitted successfully
+                        log.info(f"✅ Gasless redeem submitted! ${payout:.2f} → {str(result)[:120]}")
+                        return True
+                    else:
+                        log.warning(f"⚠️  redeem() returned empty result (library swallowed error) — falling through to CTF path")
                 except Exception as _e_redeem:
                     log.warning(f"redeem() failed ({type(_e_redeem).__name__}: {_e_redeem})")
 
@@ -486,6 +538,7 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
 
     # ── Path 2: Direct on-chain via CTF.redeemPositions() ────────────────────
     # Requires small amount of MATIC in funder wallet (~0.01 MATIC = ~$0.005)
+    # To enable: send 0.1 MATIC to POLYMARKET_FUNDER address (check Railway env vars)
     try:
         from eth_account import Account
         w3 = _get_w3()
@@ -494,15 +547,22 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
         cid_bytes = bytes.fromhex(condition_id.lstrip("0x"))
 
         # Verify resolved before spending gas
-        if ctf.functions.payoutDenominator(cid_bytes).call() == 0:
-            log.warning(f"⚠️  CTF not resolved yet for {condition_id[:16]}... — skipping")
+        denom = ctf.functions.payoutDenominator(cid_bytes).call()
+        if denom == 0:
+            log.warning(
+                f"⚠️  CTF not resolved yet for {condition_id[:16]}... — "
+                f"winnings will appear in Polymarket UI as 'Получить'. "
+                f"Funder wallet: {POLYMARKET_FUNDER}"
+            )
             return False
 
         matic_balance = w3.eth.get_balance(POLYMARKET_FUNDER)
+        matic_eth = w3.from_wei(matic_balance, 'ether')
+        log.info(f"⛽ Funder wallet: {POLYMARKET_FUNDER} | MATIC balance: {matic_eth:.4f}")
         if matic_balance < w3.to_wei("0.005", "ether"):
             log.warning(
-                f"⚠️  Insufficient MATIC ({w3.from_wei(matic_balance, 'ether'):.4f}) "
-                f"for direct claim. Send 0.1 MATIC to {POLYMARKET_FUNDER} to enable auto-claim."
+                f"⚠️  Insufficient MATIC ({matic_eth:.4f}) for direct claim. "
+                f"Send 0.1 MATIC to {POLYMARKET_FUNDER} on Polygon network to enable auto-claim."
             )
             return False
 
