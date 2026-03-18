@@ -577,10 +577,15 @@ def ask_larry_to_sell(open_positions: list) -> list:
             model=CLAUDE_MODEL,  # Use Sonnet — this is a financial decision, not just a tweet
         )
         decisions = result.get("sell_decisions", [])
-        # Fallback: if Claude still returned empty, force-sell the position with worst PnL
+        # Fallback: if Claude still returned empty, force-sell the most liquid position.
+        # Prefer positions with highest current_value (most likely to have liquidity/buyers)
+        # and avoid near-zero positions (deep losers are illiquid and unsellable).
         if not decisions and open_positions:
-            worst = min(open_positions, key=lambda p: p.get("pnl_usdc", 0))
-            log.warning(f"💸 Claude returned empty sell decisions — force-selling worst position: {worst.get('question','?')[:40]}")
+            candidates = [p for p in open_positions if p.get("current_value", 0) > 0.10]
+            if not candidates:
+                candidates = open_positions  # last resort: try anything
+            worst = max(candidates, key=lambda p: p.get("current_value", 0))
+            log.warning(f"💸 Claude returned empty sell decisions — force-selling most liquid position: {worst.get('question','?')[:40]}")
             decisions = [{
                 "market_id": worst["market_id"],
                 "action": "SELL",
