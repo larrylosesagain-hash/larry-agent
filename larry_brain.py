@@ -151,6 +151,7 @@ SELL_TOOL = {
         "properties": {
             "sell_decisions": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -584,7 +585,7 @@ def ask_larry_to_sell(open_positions: list) -> list:
                 "market_id": worst["market_id"],
                 "action": "SELL",
                 "reasoning": "auto-selected as worst-performing position to free capital",
-                "larry_tweet": "cutting my losses. needed the capital for something better today.",
+                # No larry_tweet here — avoid duplicate-content 403 on every forced sell
             }]
         return decisions
     except Exception as e:

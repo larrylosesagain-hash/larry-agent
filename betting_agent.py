@@ -58,13 +58,29 @@ _CTF_ABI_MINIMAL = [
         "type": "function",
     },
 ]
-_POLYGON_RPC = "https://polygon-rpc.com"
+_POLYGON_RPCS = [
+    "https://polygon-bor-rpc.publicnode.com",   # no auth, reliable
+    "https://rpc.ankr.com/polygon",              # no auth, high rate limit
+    "https://polygon.meowrpc.com",               # no auth, fallback
+    "https://polygon-rpc.com",                   # original (401s on some IPs)
+]
 _w3: Web3 | None = None  # cached Web3 instance
 
 def _get_w3() -> Web3:
     global _w3
-    if _w3 is None or not _w3.is_connected():
-        _w3 = Web3(Web3.HTTPProvider(_POLYGON_RPC, request_kwargs={"timeout": 8}))
+    if _w3 is not None and _w3.is_connected():
+        return _w3
+    for rpc in _POLYGON_RPCS:
+        try:
+            candidate = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 8}))
+            if candidate.is_connected():
+                log.info(f"⛓️  Connected to Polygon RPC: {rpc}")
+                _w3 = candidate
+                return _w3
+        except Exception:
+            continue
+    # Last resort: return the first one anyway and let it fail loudly
+    _w3 = Web3(Web3.HTTPProvider(_POLYGON_RPCS[0], request_kwargs={"timeout": 8}))
     return _w3
 
 def _ctf_payout_denominator(condition_id: str) -> int:
@@ -355,20 +371,34 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
                     break
 
             def _make_relay_client(**extra_kwargs):
-                """Try RelayClient with host= first; fall back without if TypeError."""
-                base_kwargs = dict(
+                """Instantiate RelayClient with only the kwargs it actually accepts."""
+                import inspect as _inspect_rc
+                sig = _inspect_rc.signature(RelayClient.__init__)
+                valid_params = set(sig.parameters.keys()) - {"self"}
+                log.info(f"🔧 RelayClient accepts: {sorted(valid_params)}")
+
+                # Full candidate kwargs — cover common naming variants across SDK versions
+                candidates = dict(
+                    host=_RELAYER_URL,
                     chain_id=137,
                     key=POLYMARKET_PRIVATE_KEY,
+                    private_key=POLYMARKET_PRIVATE_KEY,
                     funder=POLYMARKET_FUNDER,
+                    funder_address=POLYMARKET_FUNDER,
+                    wallet_address=POLYMARKET_FUNDER,
                     **extra_kwargs,
                 )
-                try:
-                    return RelayClient(host=_RELAYER_URL, **base_kwargs)
-                except TypeError as te:
-                    if "host" in str(te):
-                        log.info("🔧 RelayClient doesn't accept 'host=' — retrying without it")
-                        return RelayClient(**base_kwargs)
-                    raise
+                # Only pass kwargs the constructor actually declares (or **kwargs)
+                has_var_keyword = any(
+                    p.kind == _inspect_rc.Parameter.VAR_KEYWORD
+                    for p in sig.parameters.values()
+                )
+                if has_var_keyword:
+                    filtered = candidates  # accepts **kwargs — pass everything
+                else:
+                    filtered = {k: v for k, v in candidates.items() if k in valid_params}
+                log.info(f"🔧 Passing to RelayClient: {list(filtered.keys())}")
+                return RelayClient(**filtered)
 
             if _BuilderConfig is not None:
                 builder_cfg = _BuilderConfig(
