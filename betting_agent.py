@@ -403,6 +403,7 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
                 # Full candidate kwargs — cover common naming variants across SDK versions
                 candidates = dict(
                     host=_RELAYER_URL,
+                    relayer_url=_RELAYER_URL,   # newer SDK uses relayer_url instead of host
                     chain_id=137,
                     key=POLYMARKET_PRIVATE_KEY,
                     private_key=POLYMARKET_PRIVATE_KEY,
