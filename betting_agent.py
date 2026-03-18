@@ -286,14 +286,7 @@ def _ensure_allowances(client: ClobClient) -> None:
                     _unsellable_positions = set()
                     _save_unsellable()
             except Exception as e:
-                log.warning(f"⚠️  CONDITIONAL allowance update failed: {e}")
-                # CONDITIONAL via CLOB API doesn't work — but COLLATERAL was just refreshed.
-                # Reset blacklist anyway: some positions may now sell after USDC allowance refresh.
-                global _unsellable_positions
-                if _unsellable_positions:
-                    log.info(f"🔓 Resetting blacklist ({len(_unsellable_positions)} positions) — COLLATERAL refreshed, retrying all")
-                    _unsellable_positions = set()
-                    _save_unsellable()
+                log.debug(f"⚠️  Blanket CONDITIONAL allowance not supported: {e} (will set per token_id before each sell)")
         else:
             log.warning("⚠️  AssetType.CONDITIONAL not found in this py_clob_client version")
     except Exception as e:
@@ -1034,6 +1027,17 @@ def try_sell_positions_for_capital(client: ClobClient, needed: float = 5.0) -> f
         shares = round(float(bet.get("amount_usdc", 5.0)), 2)
 
         try:
+            # Ensure CONDITIONAL allowance for this specific token before selling
+            try:
+                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                conditional = getattr(AssetType, "CONDITIONAL", None)
+                if conditional:
+                    client.update_balance_allowance(
+                        BalanceAllowanceParams(asset_type=conditional, token_id=str(token_id))
+                    )
+            except Exception as _ae:
+                log.debug(f"💸 Pre-sell allowance update skipped: {_ae}")
+
             order_args = OrderArgs(
                 token_id=token_id,
                 price=sell_price,
@@ -1407,6 +1411,12 @@ def run_betting_agent():
 
     # Restore unsellable position blacklist from DB
     _load_unsellable()
+    # Clear blacklist on startup — CONDITIONAL allowance is now set per token_id
+    # before each sell attempt, so previously-failing positions should work now.
+    if _unsellable_positions:
+        log.info(f"🔓 Clearing {len(_unsellable_positions)} blacklisted positions — allowance now set per-sell")
+        _unsellable_positions = set()
+        _save_unsellable()
 
     client = get_clob_client()
 
