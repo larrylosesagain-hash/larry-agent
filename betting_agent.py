@@ -437,8 +437,19 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
 
             clob = get_clob_client()
             service = PolyWeb3Service(clob_client=clob, relayer_client=relay_client)
+            svc_methods = [m for m in dir(service) if not m.startswith("_")]
+            log.info(f"🔧 PolyWeb3Service methods: {svc_methods}")
             amounts = [payout, 0.0] if outcome.upper() == "YES" else [0.0, payout]
-            result = service.redeem_position(condition_id=condition_id, amounts=amounts, neg_risk=False)
+            # Try known method names across SDK versions
+            redeem_fn = (
+                getattr(service, "redeem_position", None) or
+                getattr(service, "redeem", None) or
+                getattr(service, "claim", None) or
+                getattr(service, "settle_position", None)
+            )
+            if redeem_fn is None:
+                raise AttributeError(f"No redeem method found on {type(service).__name__}. Available: {svc_methods}")
+            result = redeem_fn(condition_id=condition_id, amounts=amounts, neg_risk=False)
             log.info(f"✅ Gasless claim submitted! ${payout:.2f} → {str(result)[:120]}")
             return True
         except Exception as e:
