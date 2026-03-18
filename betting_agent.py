@@ -257,38 +257,19 @@ def get_clob_client() -> ClobClient:
 
 def _ensure_allowances(client: ClobClient) -> None:
     """
-    Call update_balance_allowance for COLLATERAL and CONDITIONAL on startup.
-    This sets the on-chain approvals that Polymarket needs to execute trades.
-    Fixes the 'not enough balance / allowance' error when selling positions.
+    Call update_balance_allowance for COLLATERAL on startup.
+    CONDITIONAL allowance is set per token_id before each sell attempt.
     Safe to call every restart — idempotent if allowance is already sufficient.
     """
     try:
         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
         collateral = getattr(AssetType, "COLLATERAL", None) or getattr(AssetType, "USDC", None)
-        conditional = getattr(AssetType, "CONDITIONAL", None)
-
         if collateral:
             try:
                 client.update_balance_allowance(BalanceAllowanceParams(asset_type=collateral))
                 log.info("✅ COLLATERAL allowance updated (USDC approved for CLOB)")
             except Exception as e:
                 log.warning(f"⚠️  COLLATERAL allowance update failed: {e}")
-
-        if conditional:
-            try:
-                client.update_balance_allowance(BalanceAllowanceParams(asset_type=conditional))
-                log.info("✅ CONDITIONAL allowance updated (CTF tokens approved for CLOB)")
-                # If CTF allowance now set, clear the blacklist so previously
-                # unsellable positions get a fresh chance
-                global _unsellable_positions
-                if _unsellable_positions:
-                    log.info(f"🔓 Clearing {len(_unsellable_positions)} blacklisted positions — CTF allowance now set")
-                    _unsellable_positions = set()
-                    _save_unsellable()
-            except Exception as e:
-                log.debug(f"⚠️  Blanket CONDITIONAL allowance not supported: {e} (will set per token_id before each sell)")
-        else:
-            log.warning("⚠️  AssetType.CONDITIONAL not found in this py_clob_client version")
     except Exception as e:
         log.warning(f"⚠️  _ensure_allowances failed: {type(e).__name__}: {e}")
 
@@ -1413,6 +1394,7 @@ def run_betting_agent():
     _load_unsellable()
     # Clear blacklist on startup — CONDITIONAL allowance is now set per token_id
     # before each sell attempt, so previously-failing positions should work now.
+    global _unsellable_positions
     if _unsellable_positions:
         log.info(f"🔓 Clearing {len(_unsellable_positions)} blacklisted positions — allowance now set per-sell")
         _unsellable_positions = set()
