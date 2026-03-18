@@ -440,18 +440,47 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
             svc_methods = [m for m in dir(service) if not m.startswith("_")]
             log.info(f"🔧 PolyWeb3Service methods: {svc_methods}")
             amounts = [payout, 0.0] if outcome.upper() == "YES" else [0.0, payout]
-            # Try known method names across SDK versions
-            redeem_fn = (
-                getattr(service, "redeem_position", None) or
-                getattr(service, "redeem", None) or
-                getattr(service, "claim", None) or
-                getattr(service, "settle_position", None)
-            )
-            if redeem_fn is None:
-                raise AttributeError(f"No redeem method found on {type(service).__name__}. Available: {svc_methods}")
-            result = redeem_fn(condition_id=condition_id, amounts=amounts, neg_risk=False)
-            log.info(f"✅ Gasless claim submitted! ${payout:.2f} → {str(result)[:120]}")
-            return True
+
+            # ── Try redeem_all() first: no args needed, redeems all resolved positions ──
+            # This is the cleanest path and avoids all the condition_id kwarg drama.
+            if hasattr(service, "redeem_all"):
+                try:
+                    result = service.redeem_all()
+                    log.info(f"✅ Gasless redeem_all submitted! ${payout:.2f} → {str(result)[:120]}")
+                    return True
+                except Exception as _e_all:
+                    log.debug(f"redeem_all failed ({type(_e_all).__name__}: {_e_all}) — trying redeem()")
+
+            # ── Try redeem() — use inspect to get ACTUAL param names across SDK versions ──
+            # Avoids "unexpected keyword argument 'condition_id'" when the param is named differently.
+            import inspect as _insp_redeem
+            redeem_fn = getattr(service, "redeem", None)
+            if redeem_fn is not None:
+                try:
+                    sig = _insp_redeem.signature(redeem_fn)
+                    param_names = [p for p in sig.parameters.keys() if p != "self"]
+                    log.info(f"🔧 redeem() params: {param_names}")
+                    # Build kwargs using actual param names (handle name variations across SDK versions)
+                    call_kwargs = {}
+                    for pname in param_names:
+                        plow = pname.lower()
+                        if "condition" in plow or plow == "cid":
+                            call_kwargs[pname] = condition_id
+                        elif "amount" in plow:
+                            call_kwargs[pname] = amounts
+                        elif "neg" in plow or "risk" in plow:
+                            call_kwargs[pname] = False
+                    if call_kwargs:
+                        result = redeem_fn(**call_kwargs)
+                    else:
+                        # All positional — typical: redeem(condition_id, amounts, neg_risk=False)
+                        result = redeem_fn(condition_id, amounts, False)
+                    log.info(f"✅ Gasless redeem submitted! ${payout:.2f} → {str(result)[:120]}")
+                    return True
+                except Exception as _e_redeem:
+                    log.warning(f"redeem() failed ({type(_e_redeem).__name__}: {_e_redeem})")
+
+            raise AttributeError(f"No working redeem method on {type(service).__name__}. Available: {svc_methods}")
         except Exception as e:
             log.warning(f"⚠️  Gasless claim failed ({type(e).__name__}: {e}) — trying direct on-chain")
 

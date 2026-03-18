@@ -359,22 +359,38 @@ def _init_quote_blacklist():
 
 # Whitelist of accounts Larry can quote tweet — high engagement, relevant to betting/markets/politics
 _QUOTE_ACCOUNTS = [
-    "polymarket",       # prediction markets — Larry's home turf
-    "elonmusk",         # Elon — Larry has opinions on everything he says
-    "realDonaldTrump",  # Trump — Larry bets on politics
-    "NateSilver538",    # forecasting legend — Larry thinks he's better than Nate
-    "unusual_whales",   # tracks market activity — relevant
-    "KobeissiLetter",   # macro commentary — Larry will have a take
-    "Kalshi",           # Polymarket competitor — prediction market context
+    # ── Prediction markets & forecasting ──
+    "polymarket",       # Larry's home turf
+    "Kalshi",           # competitor — prediction market context
+    "NateSilver538",    # Larry thinks he's better than Nate Silver
+    "AriDavidPaul",     # prediction markets OG, active
+
+    # ── Crypto ──
+    "elonmusk",         # Elon — Larry has opinions on everything
     "saylor",           # Bitcoin maximalist — Larry bets on BTC
     "cz_binance",       # crypto, massive following
-    # Additional accounts — tend to have open replies, active engagement
-    "APompliano",       # Anthony Pompliano — macro + crypto, open replies
-    "balajis",          # Balaji Srinivasan — loves making predictions and bets on things
-    "WatcherGuru",      # crypto news, fast posts, usually open replies
-    "coindesk",         # crypto news, usually open replies
-    "AriDavidPaul",     # Ari Paul — prediction markets OG, active
-    "CryptoBanter",     # crypto commentary, large engaged audience
+    "APompliano",       # macro + crypto, open replies
+    "WatcherGuru",      # crypto news, fast posts
+    "coindesk",         # crypto news
+    "CryptoBanter",     # crypto commentary
+
+    # ── Macro / markets ──
+    "realDonaldTrump",  # Trump — Larry bets on politics
+    "unusual_whales",   # tracks market activity
+    "KobeissiLetter",   # macro commentary
+    "balajis",          # loves predictions and bets
+
+    # ── Sports (NBA, NFL, general) ── Larry bets on sports constantly
+    "NBA",              # official NBA — huge reach, open replies
+    "wojespn",          # Woj — breaks NBA news, everyone piles on
+    "ShamsCharania",    # The Athletic NBA reporter
+    "ESPNStatsInfo",    # stats tweets — perfect for Larry to "analyze"
+    "BleacherReport",   # sports highlights, massive audience
+    "TheAthletic",      # in-depth sports coverage
+    "DraftKings",       # sports betting brand — same audience as Larry
+    "FanDuel",          # sports betting — same audience
+    "ActionNetworkHQ",  # sports betting analytics — very on-brand
+    "espn",             # ESPN — huge reach
 ]
 
 def _search_tweets_from_accounts(account_list: list, sort_by_recency: bool = False) -> dict | None:
@@ -593,6 +609,152 @@ def maybe_retweet():
         log.warning(f"Retweet failed: {type(e).__name__}: {e}")
 
 
+# ─── PROACTIVE WHITELIST REPLIES ──────────────────────────────────────────────
+
+def maybe_reply_to_whitelist():
+    """
+    Larry drops a direct reply under a fresh tweet from a whitelisted account.
+    Different from quote tweets: this is a reply IN the thread — more organic,
+    gets Larry visible to the original poster's followers who are reading replies.
+
+    Throttled: max 2 replies/day. 40% chance when eligible (less common than quotes).
+    Uses recency sort — Larry comments on stuff that just happened, not yesterday's news.
+    """
+    now = _utcnow()
+    if now.hour < 9 or now.hour >= 22:
+        return  # active hours only
+
+    # Max 2 whitelist replies per day
+    today_str = now.strftime("%Y-%m-%d")
+    reply_count_key = f"whitelist_reply_count_{today_str}"
+    try:
+        count = int(get_state(reply_count_key) or "0")
+    except (ValueError, TypeError):
+        count = 0
+    if count >= 2:
+        return  # daily cap hit
+
+    # Throttle: min 3 hours between replies
+    last_reply = get_state("last_whitelist_reply_time")
+    if last_reply:
+        try:
+            if (now - datetime.fromisoformat(last_reply)).total_seconds() < 3 * 3600:
+                return
+        except Exception:
+            pass
+
+    if random.random() > 0.40:
+        return  # 40% chance when eligible
+
+    # Find the freshest tweet from whitelist — sort by recency (not engagement)
+    candidate = _search_tweets_from_accounts(_QUOTE_ACCOUNTS, sort_by_recency=True)
+    if not candidate:
+        return
+
+    # Skip if tweet is older than 2 hours — Larry replies to current events, not yesterday
+    created_at = candidate.get("created_at")
+    if created_at:
+        try:
+            age_hours = (now - created_at.replace(tzinfo=None)).total_seconds() / 3600
+            if age_hours > 2:
+                log.debug(f"Whitelist reply: skipping tweet {age_hours:.1f}h old (too stale)")
+                return
+        except Exception:
+            pass  # if age check fails, proceed anyway
+
+    try:
+        tweet_data = ask_larry_for_tweet(
+            "WHITELIST_REPLY",
+            extra_data={
+                "original_tweet": candidate["text"][:200],
+                "username": candidate["username"],
+            }
+        )
+        comment = tweet_data.get("tweet", "")
+        if not comment:
+            return
+
+        client = get_twitter_client()
+        response = client.create_tweet(
+            text=comment,
+            in_reply_to_tweet_id=candidate["tweet_id"],
+        )
+        reply_id = str(response.data["id"])
+        save_tweet(tweet_id=reply_id, content=comment, tweet_type="WHITELIST_REPLY")
+        log.info(f"💬 Replied to @{candidate['username']}: {comment[:60]}...")
+
+        # Update throttle state
+        set_state("last_whitelist_reply_time", now.isoformat())
+        set_state(reply_count_key, str(count + 1))
+
+        # Like the tweet we replied to (natural human behavior)
+        like_tweet(candidate["tweet_id"])
+
+    except tweepy.Forbidden:
+        log.debug(f"Reply 403 for tweet {candidate['tweet_id'][:16]} — skipping")
+        _quote_blocked_ids.add(candidate["tweet_id"])
+    except Exception as e:
+        log.warning(f"Whitelist reply failed: {type(e).__name__}: {e}")
+
+
+# ─── FADE LARRY DETECTION ─────────────────────────────────────────────────────
+
+def maybe_react_to_fade_larry():
+    """
+    Search for tweets that mention 'fade larry' or 'fading larry' — people publicly
+    betting against Larry as a strategy. If found, Larry reacts in character.
+
+    This creates an authentic narrative: the fade-Larry crowd becomes a recurring antagonist.
+    Throttled: max once per day. Only fires ~40% of the time when triggered.
+    """
+    now = _utcnow()
+    if now.hour < 10 or now.hour >= 22:
+        return
+
+    # Once per day max
+    last_fade = get_state("last_fade_react_date")
+    today_str = now.strftime("%Y-%m-%d")
+    if last_fade == today_str:
+        return
+
+    if random.random() > 0.40:
+        return  # 40% chance per cycle when eligible
+
+    try:
+        client = get_twitter_client()
+        # Search for tweets mentioning fading Larry
+        response = client.search_recent_tweets(
+            query='("fade larry" OR "fading larry" OR "LarryLosesAgain" OR "fade @LarryLosesAgain") -is:retweet lang:en',
+            max_results=10,
+            tweet_fields=["text", "created_at", "public_metrics"],
+        )
+        if not response.data:
+            return
+
+        # Pick most liked / most recent
+        candidates = [t for t in response.data if _is_safe_to_engage(t.text)]
+        if not candidates:
+            return
+
+        best = max(candidates, key=lambda t: (t.public_metrics or {}).get("like_count", 0))
+        fade_text = best.text[:200]
+
+        tweet_data = ask_larry_for_tweet(
+            "FADE_LARRY",
+            extra_data={"fade_text": fade_text}
+        )
+        comment = tweet_data.get("tweet", "")
+        if comment:
+            post_tweet(comment, tweet_type="FADE_LARRY")
+            set_state("last_fade_react_date", today_str)
+            log.info(f"🎯 Reacted to fade-Larry tweet: {comment[:60]}...")
+
+    except tweepy.errors.Unauthorized:
+        log.debug("Fade Larry search: Unauthorized — Basic tier needed")
+    except Exception as e:
+        log.debug(f"Fade Larry detection failed: {type(e).__name__}: {e}")
+
+
 # ─── PRICE MOVE REACTIONS ─────────────────────────────────────────────────────
 
 def maybe_react_to_price_moves():
@@ -711,13 +873,19 @@ def run_twitter_agent():
             # 4. Retweet something from whitelist (~2-3/day)
             maybe_retweet()
 
-            # 5. React to price moves on open bets (throttled, only big moves)
+            # 5. Drop a reply in a whitelist account's thread (~2/day, freshest tweet only)
+            maybe_reply_to_whitelist()
+
+            # 6. React to price moves on open bets (throttled, only big moves)
             maybe_react_to_price_moves()
 
-            # 6. Weekly recap (Sundays)
+            # 7. Fade Larry detection (~1/day if people are publicly fading him)
+            maybe_react_to_fade_larry()
+
+            # 8. Weekly recap (Sundays)
             maybe_tweet_weekly_recap()
 
-            # 7. Milestone tweets
+            # 9. Milestone tweets
             check_milestones()
 
         except KeyboardInterrupt:
