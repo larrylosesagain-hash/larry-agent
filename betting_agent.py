@@ -249,11 +249,48 @@ def get_clob_client() -> ClobClient:
     creds = client.create_or_derive_api_creds()
     client.set_api_creds(creds)
 
-    # Log available approval methods so we know what to call for CTF allowance fix
-    approval_methods = [m for m in dir(client) if any(kw in m.lower() for kw in ("approv", "allow", "ctf"))]
-    log.info(f"🔧 ClobClient approval methods: {approval_methods}")
+    # Ensure USDC + CTF token allowances are set so both buying and selling work
+    _ensure_allowances(client)
 
     return client
+
+
+def _ensure_allowances(client: ClobClient) -> None:
+    """
+    Call update_balance_allowance for COLLATERAL and CONDITIONAL on startup.
+    This sets the on-chain approvals that Polymarket needs to execute trades.
+    Fixes the 'not enough balance / allowance' error when selling positions.
+    Safe to call every restart — idempotent if allowance is already sufficient.
+    """
+    try:
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        collateral = getattr(AssetType, "COLLATERAL", None) or getattr(AssetType, "USDC", None)
+        conditional = getattr(AssetType, "CONDITIONAL", None)
+
+        if collateral:
+            try:
+                client.update_balance_allowance(BalanceAllowanceParams(asset_type=collateral))
+                log.info("✅ COLLATERAL allowance updated (USDC approved for CLOB)")
+            except Exception as e:
+                log.warning(f"⚠️  COLLATERAL allowance update failed: {e}")
+
+        if conditional:
+            try:
+                client.update_balance_allowance(BalanceAllowanceParams(asset_type=conditional))
+                log.info("✅ CONDITIONAL allowance updated (CTF tokens approved for CLOB)")
+                # If CTF allowance now set, clear the blacklist so previously
+                # unsellable positions get a fresh chance
+                global _unsellable_positions
+                if _unsellable_positions:
+                    log.info(f"🔓 Clearing {len(_unsellable_positions)} blacklisted positions — CTF allowance now set")
+                    _unsellable_positions = set()
+                    _save_unsellable()
+            except Exception as e:
+                log.warning(f"⚠️  CONDITIONAL allowance update failed: {e}")
+        else:
+            log.warning("⚠️  AssetType.CONDITIONAL not found in this py_clob_client version")
+    except Exception as e:
+        log.warning(f"⚠️  _ensure_allowances failed: {type(e).__name__}: {e}")
 
 
 def sync_bankroll_from_clob(client: ClobClient):
