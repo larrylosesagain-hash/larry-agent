@@ -570,14 +570,32 @@ def ask_larry_to_sell(open_positions: list) -> list:
         f"'selling my march crypto position, boring. found something better' / 'done waiting on this one'"
     )
     try:
-        result = _call_claude_with_tool(
-            1000,
-            [{"role": "user", "content": user_message}],
-            SELL_TOOL,
-            model=CLAUDE_MODEL,  # Use Sonnet — this is a financial decision, not just a tweet
-        )
+        messages = [{"role": "user", "content": user_message}]
+        result = _call_claude_with_tool(1000, messages, SELL_TOOL, model=CLAUDE_MODEL)
         decisions = result.get("sell_decisions", [])
-        # Fallback: if Claude still returned empty, force-sell the most liquid position.
+
+        # Retry once if Claude returned empty — inject a strict correction turn
+        if not decisions and open_positions:
+            log.warning("💸 Claude returned empty on first try — retrying with correction prompt")
+            retry_messages = messages + [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "sell_retry", "name": SELL_TOOL["name"], "input": {"sell_decisions": []}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "sell_retry",
+                                 "content": "REJECTED: sell_decisions is empty. You MUST include at least one SELL decision. "
+                                            "Pick the position with the highest current_value and mark it SELL. "
+                                            "Returning an empty array is not acceptable."}],
+                },
+            ]
+            result2 = _call_claude_with_tool(500, retry_messages, SELL_TOOL, model=CLAUDE_MODEL)
+            decisions = result2.get("sell_decisions", [])
+            if decisions:
+                log.info(f"💸 Retry succeeded — Claude returned {len(decisions)} decision(s)")
+
+        # Final fallback: if Claude still returned empty, force-sell the most liquid position.
         # Prefer positions with highest current_value (most likely to have liquidity/buyers)
         # and avoid near-zero positions (deep losers are illiquid and unsellable).
         if not decisions and open_positions:
