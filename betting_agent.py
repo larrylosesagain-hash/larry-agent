@@ -287,6 +287,13 @@ def _ensure_allowances(client: ClobClient) -> None:
                     _save_unsellable()
             except Exception as e:
                 log.warning(f"⚠️  CONDITIONAL allowance update failed: {e}")
+                # CONDITIONAL via CLOB API doesn't work — but COLLATERAL was just refreshed.
+                # Reset blacklist anyway: some positions may now sell after USDC allowance refresh.
+                global _unsellable_positions
+                if _unsellable_positions:
+                    log.info(f"🔓 Resetting blacklist ({len(_unsellable_positions)} positions) — COLLATERAL refreshed, retrying all")
+                    _unsellable_positions = set()
+                    _save_unsellable()
         else:
             log.warning("⚠️  AssetType.CONDITIONAL not found in this py_clob_client version")
     except Exception as e:
