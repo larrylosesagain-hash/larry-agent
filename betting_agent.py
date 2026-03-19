@@ -378,29 +378,48 @@ def _build_relay_service():
     from py_builder_relayer_client.client import RelayClient
 
     # ── 1. Get BuilderConfig from py_builder_signing_sdk (correct package) ────
-    # FIX: Don't import specific names — import the module and discover classes
-    # dynamically. The installed version may not export "BuilderConfig" by that
-    # exact name (different SDK versions use different class names).
+    # The SDK exports submodules (config, sdk_types, signer, signing...) rather
+    # than classes at the top level. Search both top-level AND all submodules
+    # to find the right config/creds classes regardless of SDK version layout.
     builder_cfg = None
     try:
+        import importlib as _importlib
         import py_builder_signing_sdk as _sdk_mod
         _sdk_exports = [x for x in dir(_sdk_mod) if not x.startswith("_")]
         log.info(f"🔧 py_builder_signing_sdk loaded. Exports: {_sdk_exports}")
 
-        # Find config class — try known names in priority order
-        _config_cls = next(
-            (getattr(_sdk_mod, n) for n in
-             ["BuilderConfig", "Config", "BuilderCfg", "BuilderApiConfig", "BuilderAuthConfig"]
-             if hasattr(_sdk_mod, n)),
-            None,
-        )
-        # Find creds class
-        _creds_cls = next(
-            (getattr(_sdk_mod, n) for n in
-             ["BuilderApiKeyCreds", "ApiKeyCreds", "Credentials", "ApiCreds", "Creds", "KeyCreds"]
-             if hasattr(_sdk_mod, n)),
-            None,
-        )
+        def _find_in_sdk(attr_names):
+            """Search top-level AND all submodules for a class matching any given name."""
+            # 1. Top-level first
+            for _n in attr_names:
+                obj = getattr(_sdk_mod, _n, None)
+                if obj is not None and isinstance(obj, type):
+                    log.info(f"🔧 Found {_n} at py_builder_signing_sdk.{_n}")
+                    return obj
+            # 2. Search each submodule by importing it directly
+            for _submod_name in _sdk_exports:
+                try:
+                    _submod = _importlib.import_module(f"py_builder_signing_sdk.{_submod_name}")
+                    _sub_contents = [x for x in dir(_submod) if not x.startswith("_")]
+                    log.info(f"🔧 py_builder_signing_sdk.{_submod_name}: {_sub_contents}")
+                    for _n in attr_names:
+                        obj = getattr(_submod, _n, None)
+                        if obj is not None and isinstance(obj, type):
+                            log.info(f"🔧 Found {_n} in py_builder_signing_sdk.{_submod_name}")
+                            return obj
+                except Exception:
+                    pass
+            return None
+
+        _config_cls = _find_in_sdk([
+            "BuilderConfig", "Config", "BuilderCfg",
+            "BuilderApiConfig", "BuilderAuthConfig",
+        ])
+        _creds_cls = _find_in_sdk([
+            "BuilderApiKeyCreds", "ApiKeyCreds",
+            "Credentials", "ApiCreds", "Creds", "KeyCreds",
+        ])
+        log.info(f"🔧 config_cls={getattr(_config_cls,'__name__',None)} creds_cls={getattr(_creds_cls,'__name__',None)}")
 
         if _config_cls and _creds_cls:
             _creds_obj = _creds_cls(
@@ -423,8 +442,8 @@ def _build_relay_service():
                 log.warning(f"🔧 {_config_cls.__name__}(flat params) failed: {_e_flat}")
         else:
             log.warning(
-                f"🔧 No config class found in py_builder_signing_sdk. "
-                f"Available exports: {_sdk_exports} — relay will run without auth"
+                f"🔧 No BuilderConfig-like class found anywhere in py_builder_signing_sdk. "
+                f"Relay will run without auth — redeem_all will fail with NoneType error."
             )
 
     except ImportError:
@@ -435,32 +454,7 @@ def _build_relay_service():
             [sys.executable, "-m", "pip", "install", "py-builder-signing-sdk",
              "--break-system-packages", "-q"],
         )
-        try:
-            import py_builder_signing_sdk as _sdk_mod
-            _sdk_exports = [x for x in dir(_sdk_mod) if not x.startswith("_")]
-            log.info(f"🔧 py_builder_signing_sdk installed. Exports: {_sdk_exports}")
-            _config_cls = next(
-                (getattr(_sdk_mod, n) for n in
-                 ["BuilderConfig", "Config", "BuilderCfg", "BuilderApiConfig"]
-                 if hasattr(_sdk_mod, n)),
-                None,
-            )
-            _creds_cls = next(
-                (getattr(_sdk_mod, n) for n in
-                 ["BuilderApiKeyCreds", "ApiKeyCreds", "Credentials", "ApiCreds"]
-                 if hasattr(_sdk_mod, n)),
-                None,
-            )
-            if _config_cls and _creds_cls:
-                _creds_obj = _creds_cls(
-                    key=_BUILDER_API_KEY, secret=_BUILDER_SECRET, passphrase=_BUILDER_PASSPHRASE,
-                )
-                builder_cfg = _config_cls(local_builder_creds=_creds_obj)
-                log.info(f"🔧 BuilderConfig created post-install ({_config_cls.__name__}) ✓")
-            else:
-                log.warning(f"🔧 Post-install: no config class found. Exports: {_sdk_exports}")
-        except Exception as _e_post:
-            log.warning(f"🔧 Post-install import failed: {_e_post} — relay runs without auth")
+        log.info("🔧 Installed. Will retry on next cycle.")
 
     except Exception as _e:
         log.warning(f"🔧 BuilderConfig init failed ({_e}) — relay will run without auth")
