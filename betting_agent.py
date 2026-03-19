@@ -369,8 +369,8 @@ def _build_relay_service():
     Build a (PolyWeb3Service, relay_client) pair using the Builder Relayer.
     Shared by claim_winnings() and sweep_unclaimed_winnings().
 
-    Uses py_builder_signing_sdk.BuilderConfig — the correct package for auth.
-    If not installed, installs it automatically.
+    Uses py_builder_signing_sdk for auth — discovers the correct class names
+    dynamically since different SDK versions use different names.
     Returns (service, svc_methods) or raises on failure.
     """
     import inspect as _insp
@@ -378,28 +378,90 @@ def _build_relay_service():
     from py_builder_relayer_client.client import RelayClient
 
     # ── 1. Get BuilderConfig from py_builder_signing_sdk (correct package) ────
+    # FIX: Don't import specific names — import the module and discover classes
+    # dynamically. The installed version may not export "BuilderConfig" by that
+    # exact name (different SDK versions use different class names).
     builder_cfg = None
     try:
-        from py_builder_signing_sdk import BuilderConfig, BuilderApiKeyCreds
-        log.info("🔧 py_builder_signing_sdk imported ✓")
+        import py_builder_signing_sdk as _sdk_mod
+        _sdk_exports = [x for x in dir(_sdk_mod) if not x.startswith("_")]
+        log.info(f"🔧 py_builder_signing_sdk loaded. Exports: {_sdk_exports}")
+
+        # Find config class — try known names in priority order
+        _config_cls = next(
+            (getattr(_sdk_mod, n) for n in
+             ["BuilderConfig", "Config", "BuilderCfg", "BuilderApiConfig", "BuilderAuthConfig"]
+             if hasattr(_sdk_mod, n)),
+            None,
+        )
+        # Find creds class
+        _creds_cls = next(
+            (getattr(_sdk_mod, n) for n in
+             ["BuilderApiKeyCreds", "ApiKeyCreds", "Credentials", "ApiCreds", "Creds", "KeyCreds"]
+             if hasattr(_sdk_mod, n)),
+            None,
+        )
+
+        if _config_cls and _creds_cls:
+            _creds_obj = _creds_cls(
+                key=_BUILDER_API_KEY,
+                secret=_BUILDER_SECRET,
+                passphrase=_BUILDER_PASSPHRASE,
+            )
+            builder_cfg = _config_cls(local_builder_creds=_creds_obj)
+            log.info(f"🔧 BuilderConfig created ({_config_cls.__name__} + {_creds_cls.__name__}) key={_BUILDER_API_KEY[:8]}... ✓")
+        elif _config_cls:
+            # Older SDKs may accept creds directly on the config class
+            try:
+                builder_cfg = _config_cls(
+                    key=_BUILDER_API_KEY,
+                    secret=_BUILDER_SECRET,
+                    passphrase=_BUILDER_PASSPHRASE,
+                )
+                log.info(f"🔧 BuilderConfig created ({_config_cls.__name__}, flat params) ✓")
+            except Exception as _e_flat:
+                log.warning(f"🔧 {_config_cls.__name__}(flat params) failed: {_e_flat}")
+        else:
+            log.warning(
+                f"🔧 No config class found in py_builder_signing_sdk. "
+                f"Available exports: {_sdk_exports} — relay will run without auth"
+            )
+
     except ImportError:
+        # Module itself not installed — install and retry once
         log.info("🔧 py_builder_signing_sdk not installed — installing...")
-        import subprocess, sys
-        subprocess.check_call(
+        import subprocess as _subproc
+        _subproc.check_call(
             [sys.executable, "-m", "pip", "install", "py-builder-signing-sdk",
              "--break-system-packages", "-q"],
         )
-        from py_builder_signing_sdk import BuilderConfig, BuilderApiKeyCreds
-        log.info("🔧 py_builder_signing_sdk installed and imported ✓")
+        try:
+            import py_builder_signing_sdk as _sdk_mod
+            _sdk_exports = [x for x in dir(_sdk_mod) if not x.startswith("_")]
+            log.info(f"🔧 py_builder_signing_sdk installed. Exports: {_sdk_exports}")
+            _config_cls = next(
+                (getattr(_sdk_mod, n) for n in
+                 ["BuilderConfig", "Config", "BuilderCfg", "BuilderApiConfig"]
+                 if hasattr(_sdk_mod, n)),
+                None,
+            )
+            _creds_cls = next(
+                (getattr(_sdk_mod, n) for n in
+                 ["BuilderApiKeyCreds", "ApiKeyCreds", "Credentials", "ApiCreds"]
+                 if hasattr(_sdk_mod, n)),
+                None,
+            )
+            if _config_cls and _creds_cls:
+                _creds_obj = _creds_cls(
+                    key=_BUILDER_API_KEY, secret=_BUILDER_SECRET, passphrase=_BUILDER_PASSPHRASE,
+                )
+                builder_cfg = _config_cls(local_builder_creds=_creds_obj)
+                log.info(f"🔧 BuilderConfig created post-install ({_config_cls.__name__}) ✓")
+            else:
+                log.warning(f"🔧 Post-install: no config class found. Exports: {_sdk_exports}")
+        except Exception as _e_post:
+            log.warning(f"🔧 Post-install import failed: {_e_post} — relay runs without auth")
 
-    try:
-        creds = BuilderApiKeyCreds(
-            key=_BUILDER_API_KEY,
-            secret=_BUILDER_SECRET,
-            passphrase=_BUILDER_PASSPHRASE,
-        )
-        builder_cfg = BuilderConfig(local_builder_creds=creds)
-        log.info(f"🔧 BuilderConfig created with key={_BUILDER_API_KEY[:8]}... ✓")
     except Exception as _e:
         log.warning(f"🔧 BuilderConfig init failed ({_e}) — relay will run without auth")
 
@@ -1466,14 +1528,24 @@ def check_pending_bets(client: ClobClient):
     resolved = []
     with ThreadPoolExecutor(max_workers=min(len(pending), 8)) as ex:
         futures = {ex.submit(_check_single_bet, bet): bet for bet in pending}
-        for future in as_completed(futures, timeout=30):
-            try:
-                result = future.result()
-                if result:
-                    resolved.append(result)
-            except Exception as worker_err:
-                bet_id = futures[future].get("polymarket_id", "?")[:16]
-                log.warning(f"check_pending_bets: worker failed for {bet_id}...: {type(worker_err).__name__}: {worker_err}")
+        try:
+            for future in as_completed(futures, timeout=90):  # 90s — 30 bets × ~3s each
+                try:
+                    result = future.result()
+                    if result:
+                        resolved.append(result)
+                except Exception as worker_err:
+                    bet_id = futures[future].get("polymarket_id", "?")[:16]
+                    log.warning(f"check_pending_bets: worker failed for {bet_id}...: {type(worker_err).__name__}: {worker_err}")
+        except TimeoutError:
+            done_count = sum(1 for f in futures if f.done())
+            log.warning(
+                f"check_pending_bets: timed out after 90s "
+                f"({done_count}/{len(futures)} futures finished) — processing what we have"
+            )
+            # as_completed yields futures as they finish, so resolved[] already
+            # contains all results from futures that completed before the timeout.
+            # Nothing extra to collect — just continue with what we have.
 
     for r in resolved:
         bet = r["bet"]
@@ -1554,10 +1626,20 @@ def reconcile_pending_bets():
     resolved_results = []
     with ThreadPoolExecutor(max_workers=min(len(pending), 8)) as ex:
         futures = {ex.submit(_check_single_bet, bet): bet for bet in pending}
-        for future in as_completed(futures, timeout=60):
-            result = future.result()
-            if result:
-                resolved_results.append(result)
+        try:
+            for future in as_completed(futures, timeout=90):
+                try:
+                    result = future.result()
+                    if result:
+                        resolved_results.append(result)
+                except Exception as _worker_err:
+                    log.debug(f"reconcile worker error: {type(_worker_err).__name__}: {_worker_err}")
+        except TimeoutError:
+            done_count = sum(1 for f in futures if f.done())
+            log.warning(
+                f"reconcile_pending_bets: timed out after 90s "
+                f"({done_count}/{len(futures)} futures finished) — processing what we have"
+            )
 
     # Phase 2: sequential claims — MUST be outside ThreadPoolExecutor so each
     # claim_winnings call completes (including wait_for_transaction_receipt) before
