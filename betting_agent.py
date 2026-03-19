@@ -88,7 +88,10 @@ def _ctf_payout_denominator(condition_id: str) -> int:
     try:
         w3 = _get_w3()
         ctf = w3.eth.contract(address=_CTF_ADDRESS, abi=_CTF_ABI_MINIMAL)
-        cid_bytes = bytes.fromhex(condition_id.lstrip("0x"))
+        cid_hex = condition_id.strip().lstrip("0x").strip()
+        if len(cid_hex) % 2 != 0:
+            cid_hex = "0" + cid_hex
+        cid_bytes = bytes.fromhex(cid_hex)
         return ctf.functions.payoutDenominator(cid_bytes).call()
     except Exception as e:
         log.debug(f"CTF check error for {condition_id[:16]}...: {e}")
@@ -365,77 +368,58 @@ def _build_relay_service():
     """
     Build a (PolyWeb3Service, relay_client) pair using the Builder Relayer.
     Shared by claim_winnings() and sweep_unclaimed_winnings().
+
+    Uses py_builder_signing_sdk.BuilderConfig — the correct package for auth.
+    If not installed, installs it automatically.
     Returns (service, svc_methods) or raises on failure.
     """
-    import importlib, inspect as _insp
+    import inspect as _insp
     from poly_web3 import PolyWeb3Service
     from py_builder_relayer_client.client import RelayClient
 
-    _cfg_mod = importlib.import_module("py_builder_relayer_client.config")
-    _available = [n for n, _ in _insp.getmembers(_cfg_mod, _insp.isclass) if not n.startswith("_")]
-    log.info(f"🔧 Config classes available: {_available}")
-
-    _auth_hints = {"key", "secret", "pass", "token", "credential", "auth"}
-    _BuilderConfig = None
-    for _name in ("BuilderConfig", "Config", "ApiConfig", "RelayConfig", "BuilderApiConfig", "ContractConfig"):
-        _Cls = getattr(_cfg_mod, _name, None)
-        if _Cls is None:
-            continue
-        try:
-            _sig = _insp.signature(_Cls.__init__)
-            _params = {p.lower() for p in _sig.parameters.keys() if p != "self"}
-            _has_auth = any(any(h in p for h in _auth_hints) for p in _params)
-            log.info(f"🔧 {_name} params: {_params} | has_auth={_has_auth}")
-            if _has_auth:
-                _BuilderConfig = _Cls
-                log.info(f"🔧 Using config class: {_name}")
-                break
-        except Exception:
-            _BuilderConfig = _Cls
-            log.info(f"🔧 Using config class (uninspectable): {_name}")
-            break
-
-    def _make_relay(**extra):
-        sig = _insp.signature(RelayClient.__init__)
-        valid = set(sig.parameters.keys()) - {"self"}
-        has_var_kw = any(p.kind == _insp.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-        candidates = dict(
-            host=_RELAYER_URL, relayer_url=_RELAYER_URL, chain_id=137,
-            key=POLYMARKET_PRIVATE_KEY, private_key=POLYMARKET_PRIVATE_KEY,
-            funder=POLYMARKET_FUNDER, funder_address=POLYMARKET_FUNDER,
-            wallet_address=POLYMARKET_FUNDER, **extra,
-        )
-        filtered = candidates if has_var_kw else {k: v for k, v in candidates.items() if k in valid}
-        log.info(f"🔧 RelayClient: {sorted(filtered.keys())}")
-        return RelayClient(**filtered)
-
+    # ── 1. Get BuilderConfig from py_builder_signing_sdk (correct package) ────
     builder_cfg = None
-    if _BuilderConfig is not None:
-        try:
-            _cfg_sig = _insp.signature(_BuilderConfig.__init__)
-            _cfg_params = {p: v for p, v in _cfg_sig.parameters.items() if p != "self"}
-            _cred_map = {
-                "api_key": _BUILDER_API_KEY, "key": _BUILDER_API_KEY,
-                "secret": _BUILDER_SECRET,
-                "passphrase": _BUILDER_PASSPHRASE, "pass": _BUILDER_PASSPHRASE,
-            }
-            _cfg_kwargs = {}
-            for pname in _cfg_params:
-                plow = pname.lower()
-                for hint, val in _cred_map.items():
-                    if hint in plow:
-                        _cfg_kwargs[pname] = val
-                        break
-            log.info(f"🔧 {_BuilderConfig.__name__}({list(_cfg_kwargs.keys())})")
-            builder_cfg = _BuilderConfig(**_cfg_kwargs) if _cfg_kwargs else _BuilderConfig()
-        except Exception as _e:
-            log.warning(f"🔧 Config init failed ({_e}) — trying no-arg fallback")
-            try:
-                builder_cfg = _BuilderConfig()
-            except Exception:
-                builder_cfg = None
+    try:
+        from py_builder_signing_sdk import BuilderConfig, BuilderApiKeyCreds
+        log.info("🔧 py_builder_signing_sdk imported ✓")
+    except ImportError:
+        log.info("🔧 py_builder_signing_sdk not installed — installing...")
+        import subprocess, sys
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "py-builder-signing-sdk",
+             "--break-system-packages", "-q"],
+        )
+        from py_builder_signing_sdk import BuilderConfig, BuilderApiKeyCreds
+        log.info("🔧 py_builder_signing_sdk installed and imported ✓")
 
-    relay_client = _make_relay(**({"builder_config": builder_cfg} if builder_cfg is not None else {}))
+    try:
+        creds = BuilderApiKeyCreds(
+            key=_BUILDER_API_KEY,
+            secret=_BUILDER_SECRET,
+            passphrase=_BUILDER_PASSPHRASE,
+        )
+        builder_cfg = BuilderConfig(local_builder_creds=creds)
+        log.info(f"🔧 BuilderConfig created with key={_BUILDER_API_KEY[:8]}... ✓")
+    except Exception as _e:
+        log.warning(f"🔧 BuilderConfig init failed ({_e}) — relay will run without auth")
+
+    # ── 2. Build RelayClient with dynamic param filtering ─────────────────────
+    _sig = _insp.signature(RelayClient.__init__)
+    _valid = set(_sig.parameters.keys()) - {"self"}
+    _has_var_kw = any(p.kind == _insp.Parameter.VAR_KEYWORD for p in _sig.parameters.values())
+    _candidates = dict(
+        relayer_url=_RELAYER_URL, host=_RELAYER_URL,
+        chain_id=137,
+        private_key=POLYMARKET_PRIVATE_KEY, key=POLYMARKET_PRIVATE_KEY,
+        funder=POLYMARKET_FUNDER, funder_address=POLYMARKET_FUNDER,
+        wallet_address=POLYMARKET_FUNDER,
+        builder_config=builder_cfg,
+    )
+    _filtered = _candidates if _has_var_kw else {k: v for k, v in _candidates.items() if k in _valid}
+    log.info(f"🔧 Passing to RelayClient: {sorted(_filtered.keys())}")
+    relay_client = RelayClient(**_filtered)
+
+    # ── 3. Wrap in PolyWeb3Service ─────────────────────────────────────────────
     clob = get_clob_client()
     service = PolyWeb3Service(clob_client=clob, relayer_client=relay_client)
     svc_methods = [m for m in dir(service) if not m.startswith("_")]
@@ -548,7 +532,11 @@ def claim_winnings(condition_id: str, outcome: str, payout: float) -> bool:
         w3 = _get_w3()
         account = Account.from_key(POLYMARKET_PRIVATE_KEY)
         ctf = w3.eth.contract(address=_CTF_ADDRESS, abi=_CTF_ABI_MINIMAL)
-        cid_bytes = bytes.fromhex(condition_id.lstrip("0x"))
+        cid_hex = condition_id.strip().lstrip("0x").strip()
+        # Pad to 64 chars if somehow truncated (defensive)
+        if len(cid_hex) % 2 != 0:
+            cid_hex = "0" + cid_hex
+        cid_bytes = bytes.fromhex(cid_hex)
 
         # Verify resolved before spending gas
         denom = ctf.functions.payoutDenominator(cid_bytes).call()
