@@ -1050,21 +1050,23 @@ def collect_near_resolved_positions(client: ClobClient) -> float:
                 )
                 resolve_bet(mid, False, 0.0)
 
-                # Tweet the win
-                try:
-                    from larry_brain import ask_larry_for_tweet
-                    from twitter_agent import post_tweet
-                    ctx = {
-                        "question": bet.get("question", ""),
-                        "outcome": bet.get("outcome", ""),
-                        "price": sell_price,
-                        "pnl": estimated - float(bet.get("amount_usdc", 5.0)),
-                    }
-                    tweet = ask_larry_for_tweet("NEAR_WIN_COLLECT", ctx)
-                    if tweet:
-                        post_tweet(tweet, tweet_type="COLLECTED_WIN")
-                except Exception as te:
-                    log.debug(f"Collect tweet failed: {te}")
+                # Tweet collect only if meaningful profit (>$8 pnl) — avoids spam on small wins
+                _collect_pnl = estimated - float(bet.get("amount_usdc", 5.0))
+                if _collect_pnl >= 8.0:
+                    try:
+                        from larry_brain import ask_larry_for_tweet
+                        from twitter_agent import post_tweet
+                        ctx = {
+                            "question": bet.get("question", ""),
+                            "outcome": bet.get("outcome", ""),
+                            "price": sell_price,
+                            "pnl": _collect_pnl,
+                        }
+                        tweet = ask_larry_for_tweet("NEAR_WIN_COLLECT", ctx)
+                        if tweet:
+                            post_tweet(tweet, tweet_type="COLLECTED_WIN")
+                    except Exception as te:
+                        log.debug(f"Collect tweet failed: {te}")
             else:
                 log.warning(
                     f"⛏️  Collect order rejected for {mid[:16]}: "
@@ -1255,12 +1257,19 @@ def try_sell_positions_for_capital(client: ClobClient, needed: float = 5.0) -> f
                 # Bankroll NOT updated here — sync_bankroll_from_clob runs after and captures CLOB truth
                 resolve_bet(mid, False, 0.0)
 
-                # Tweet about the sale if Larry had something to say
-                larry_tweet = decision.get("larry_tweet", "")
-                if larry_tweet:
+                # Tweet SOLD only for meaningful positions ($10+ proceeds) — small sells are noise
+                if estimated_proceeds >= 10.0:
                     try:
+                        from larry_brain import ask_larry_for_tweet
                         from twitter_agent import post_tweet
-                        post_tweet(larry_tweet, tweet_type="SOLD_POSITION")
+                        _sell_ctx = {
+                            "question": bet.get("question", ""),
+                            "outcome":  bet.get("outcome", ""),
+                            "proceeds": estimated_proceeds,
+                        }
+                        _sell_tweet = ask_larry_for_tweet("SOLD_POSITION", _sell_ctx)
+                        if _sell_tweet.get("tweet"):
+                            post_tweet(_sell_tweet["tweet"], tweet_type="SOLD_POSITION")
                     except Exception as te:
                         log.debug(f"Sell tweet failed: {te}")
             else:
@@ -1506,12 +1515,30 @@ def check_pending_bets(client: ClobClient):
             bankroll = get_bankroll()
             log.info(f"💀 LOST ${bet['amount_usdc']:.2f}. Bankroll: ${bankroll:.2f}")
 
-        # Tweet the result
+        # Increment recap counter — tracks how many bets resolved since last DAILY_RECAP tweet
         try:
-            tweet_data = ask_larry_for_tweet("WIN" if won else "LOSS", extra_data=bet)
-            post_tweet(tweet_data["tweet"], tweet_type="WIN" if won else "LOSS", bet_id=bet["id"])
-        except Exception as e:
-            log.error(f"Failed to post resolution tweet: {e}")
+            _cur = int(get_state("resolved_since_last_recap") or "0")
+            set_state("resolved_since_last_recap", str(_cur + 1))
+        except Exception:
+            pass
+
+        # Tweet WIN/LOSS only for significant events (avoids spam on small $5 bets)
+        # Win threshold: pnl > $10 | Loss threshold: amount > $8 | always tweet 3+ loss streak
+        _bet_amount = float(bet.get("amount_usdc", 5.0))
+        _payout     = float(bet.get("payout_usdc", 0.0)) if won else 0.0
+        _win_pnl    = _payout - _bet_amount
+        _loss_streak = get_win_streak() <= -3  # negative streak = consecutive losses
+        _should_tweet = (
+            (won and _win_pnl >= 10.0) or
+            (not won and _bet_amount >= 8.0) or
+            _loss_streak
+        )
+        if _should_tweet:
+            try:
+                tweet_data = ask_larry_for_tweet("WIN" if won else "LOSS", extra_data=bet)
+                post_tweet(tweet_data["tweet"], tweet_type="WIN" if won else "LOSS", bet_id=bet["id"])
+            except Exception as e:
+                log.error(f"Failed to post resolution tweet: {e}")
 
 
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
@@ -1747,6 +1774,10 @@ def run_betting_agent():
                     mid_loop_ids  = {(b.get("polymarket_id") or "").lower() for b in mid_loop_bets}
                     mid_loop_qs   = {(b.get("question") or "").lower().strip() for b in mid_loop_bets}
 
+                    # Collect bets placed this cycle → single digest tweet at end of loop
+                    # (replaces per-bet tweets — reduces ~5 tweets per cycle to 1)
+                    bets_placed_this_cycle: list[dict] = []
+
                     for decision in decisions:
                         if decision.get("decision") != "BET":
                             log.info(f"PASS: {decision.get('reasoning', 'no reason given')}")
@@ -1860,14 +1891,13 @@ def run_betting_agent():
                             mid_loop_ids.add(market_id)
                             mid_loop_qs.add(q_text.lower().strip())
 
-                            # 8. Tweet the bet announcement
-                            try:
-                                tweet_text = decision.get("larry_tweet", "")
-                                if tweet_text:
-                                    tweet_id = post_tweet(tweet_text, tweet_type="NEW_BET", bet_id=bet_id)
-                                    log.info(f"Tweeted bet announcement: {tweet_id}")
-                            except Exception as e:
-                                log.error(f"Failed to tweet bet: {e}")
+                            # 8. Collect for digest tweet (posted once after the full loop)
+                            bets_placed_this_cycle.append({
+                                "question": q_text[:50],
+                                "outcome":  decision.get("outcome", "YES"),
+                                "amount":   actual_amount,
+                                "odds":     odds,
+                            })
 
         except KeyboardInterrupt:
             log.info("👋 Betting agent stopped by user")
@@ -1880,6 +1910,59 @@ def run_betting_agent():
             if "locked" in err_str or "operationalerror" in type(e).__name__.lower():
                 log.warning("DB locked at cycle level — sleeping 10s then retrying")
                 time.sleep(10)
+
+        # ── POST-CYCLE TWEETS ─────────────────────────────────────────────────
+
+        # Digest tweet: one tweet for all bets placed this cycle (replaces N per-bet tweets)
+        if bets_placed_this_cycle:
+            try:
+                digest = ask_larry_for_tweet("BET_DIGEST", {"bets": bets_placed_this_cycle})
+                if digest.get("tweet"):
+                    post_tweet(digest["tweet"], tweet_type="BET_DIGEST")
+                    log.info(f"📣 Digest tweet: {len(bets_placed_this_cycle)} bets → 1 tweet")
+            except Exception as e:
+                log.debug(f"Digest tweet failed: {e}")
+
+        # DAILY_RECAP: every ~4h if ≥2 bets have resolved since last recap
+        try:
+            _now = time.time()
+            _last_recap_str = get_state("last_recap_tweet_time")
+            _last_recap_ts  = float(_last_recap_str) if _last_recap_str else 0.0
+            _recap_interval = 4 * 3600  # 4 hours
+            if (_now - _last_recap_ts) >= _recap_interval:
+                # Count bets resolved since last recap
+                _resolved_since = int(get_state("resolved_since_last_recap") or "0")
+                if _resolved_since >= 2:
+                    # Build stats from DB
+                    from database import get_connection as _gc
+                    _conn = _gc()
+                    try:
+                        _row = _conn.execute("""
+                            SELECT
+                                SUM(CASE WHEN won=1 THEN 1 ELSE 0 END) as wins,
+                                SUM(CASE WHEN won=0 THEN 1 ELSE 0 END) as losses,
+                                SUM(CASE WHEN won=1 THEN payout_usdc - amount_usdc
+                                         ELSE -amount_usdc END) as pnl_net,
+                                COUNT(CASE WHEN resolved=0 THEN 1 END) as open_count
+                            FROM bets WHERE resolved_at >= datetime('now', '-4 hours')
+                        """).fetchone()
+                    finally:
+                        _conn.close()
+                    _recap_data = {
+                        "wins":         int(_row["wins"]  or 0),
+                        "losses":       int(_row["losses"] or 0),
+                        "pnl_net":      float(_row["pnl_net"] or 0.0),
+                        "bankroll":     get_bankroll(),
+                        "open_count":   int(_row["open_count"] or 0),
+                    }
+                    recap = ask_larry_for_tweet("DAILY_RECAP", _recap_data)
+                    if recap.get("tweet"):
+                        post_tweet(recap["tweet"], tweet_type="DAILY_RECAP")
+                        log.info(f"📊 Daily recap tweet posted")
+                    set_state("last_recap_tweet_time", str(_now))
+                    set_state("resolved_since_last_recap", "0")
+        except Exception as e:
+            log.debug(f"Daily recap tweet failed: {e}")
 
         if _betting_shutdown:
             break
