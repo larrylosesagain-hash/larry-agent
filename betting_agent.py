@@ -111,7 +111,7 @@ from config import (
 )
 from database import (
     get_bankroll, set_bankroll, get_pending_bets, save_bet, resolve_bet,
-    init_db, get_state, set_state, get_connection
+    init_db, get_state, set_state, get_connection, get_win_streak
 )
 from larry_brain import ask_larry_to_bet, ask_larry_for_tweet, ask_larry_to_sell
 
