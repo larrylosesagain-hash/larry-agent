@@ -1802,6 +1802,12 @@ def run_betting_agent():
                         # bet from wiping the bankroll if something goes wrong).
                         actual_amount = max(raw_amount, 5.0)
                         actual_amount = min(actual_amount, ABSOLUTE_MAX_BET, bankroll * 0.5)
+                        if actual_amount < ABSOLUTE_MIN_BET:
+                            log.info(
+                                f"Skipping bet — ${actual_amount:.2f} after bankroll cap "
+                                f"< ${ABSOLUTE_MIN_BET} CLOB minimum (bankroll=${bankroll:.2f})"
+                            )
+                            continue
                         if actual_amount > bankroll:
                             log.warning(f"Not enough bankroll (${bankroll:.2f}) for ${actual_amount:.2f} bet")
                             continue
