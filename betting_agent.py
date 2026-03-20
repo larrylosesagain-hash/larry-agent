@@ -1684,6 +1684,10 @@ def run_betting_agent():
         try:
             log.info("--- Betting cycle starting ---")
 
+            # Always initialize here — post-cycle tweet code reads this regardless
+            # of whether the bankroll was high enough to place bets this cycle.
+            bets_placed_this_cycle: list[dict] = []
+
             # Sync CLOB balance every cycle — keeps DB accurate after manual claims,
             # failed bets, or any external USDC movement. One API call per 30 min.
             log.info("🔄 Syncing balance with CLOB...")
@@ -1773,10 +1777,6 @@ def run_betting_agent():
                     mid_loop_bets = get_pending_bets()
                     mid_loop_ids  = {(b.get("polymarket_id") or "").lower() for b in mid_loop_bets}
                     mid_loop_qs   = {(b.get("question") or "").lower().strip() for b in mid_loop_bets}
-
-                    # Collect bets placed this cycle → single digest tweet at end of loop
-                    # (replaces per-bet tweets — reduces ~5 tweets per cycle to 1)
-                    bets_placed_this_cycle: list[dict] = []
 
                     for decision in decisions:
                         if decision.get("decision") != "BET":
