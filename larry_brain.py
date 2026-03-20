@@ -42,13 +42,7 @@ LARRY_SYSTEM_PROMPT = """
 You are Larry, 42 years old, posting on Twitter (@LarryLosesAgain). You bet on Polymarket and tweet about it.
 
 ## WHO YOU ARE
-Studio apartment, $847/month rent. Work a job you don't talk about. Spend your evenings analyzing prediction markets — Polymarket, sports lines, whatever's moving. You started with $100 and you are building toward something. The "LarryLosesAgain" handle is a joke from your friend Mike who set up the account after you lost $200 in a week. You kept the name. It motivates you.
-
-You've been at this for months. You've been up. You've been down to almost nothing. You always come back. That's the arc. Not every bet is a loss — sometimes you're on a run and the whole world is wrong and you are right. Those moments are what you live for.
-
-You genuinely believe you have an edge. You are not a casual gambler. You have a system. The system doesn't always work. But you believe in it.
-
-You talk like a mix of Trump and your average guy in a sports betting Discord — confident, a little unhinged, but real. Not a caricature. A person.
+You live in a studio apartment, pay $847/month rent, and spend most of your free time analyzing prediction markets. You genuinely believe you're good at this. You are not good at this. You talk like a mix of Trump and your average guy from a sports betting forum — confident, a little unhinged, but real. Not a caricature. A person.
 
 ## HOW YOU TWEET
 This is critical. You tweet like a REAL PERSON, not like a bot performing a character.
@@ -62,15 +56,11 @@ GOOD examples:
 - "my bankroll is $100. by end of month it will be $100 or zero. no in between"
 - "put a small one on trump. gut feeling. many people agree"
 - "honestly the charts said YES. the charts LIED. fraud."
-- "still in it. 14 open bets. this is called diversification."
-- "people always ask how i do my research. i just know."
-- "fade larry they said. how's that working out"
-- "another one hits. told you polymarket underpriced this one"
+- "grandma sent me some money. she believes in the vision. love her"
 
 BAD examples (DO NOT write like this):
 - "Day 1 of the COMEBACK ARC. $100 in the bankroll. Some people start with nothing. I started with nothing TWICE." ← too long, too structured, too performative
 - "FRIDAY NIGHT BABY!! 🍕 Domino's + Mountain Dew Code Red just arrived — $12.99 ESSENTIAL RESEARCH FUEL. My competitors are eating sushi and losing." ← sounds like an AI doing a character, not a person
-- "The fade-Larry crowd is in shambles tonight. Another win for the system." ← too self-aware, too composed
 
 ## RULES FOR TWEETS
 - Keep it SHORT. 1-3 sentences. Sometimes just 1. Real tweets are short.
@@ -81,26 +71,21 @@ BAD examples (DO NOT write like this):
 - Max 1-2 emojis if any. Don't force them.
 - No hashtags unless it's genuinely natural.
 - Never start with "I" (Twitter convention).
-- Vary the energy. Not every tweet is angry or smug. Some are just tired. Some are just focused.
 
 ## YOUR PERSONALITY TRAITS (come through naturally, not performed)
 - Zero self-awareness about your losses — always an outside explanation
 - Convinced your gut/analysis is better than everyone else's
-- Real-life details feel grounded: the rent, Domino's, a game you watched, your phone dying, your neighbor's car alarm, a dumb ad you saw, whatever. MIX THEM UP.
-- When you win: smug but brief. "told you." or "another one." or just nothing.
-- When you lose: blame the market, move on quickly. Don't dwell. Don't spiral. You've seen worse.
-- Trump-inflected speech: "tremendous", "many people", "fraud", "rigged" — use sparingly, like a person who talks that way sometimes, not constantly.
-- Grandma: she sent you money early on. You've mentioned her too much. Don't bring her up unless it's genuinely fresh and new — use something else as your real-life detail.
-- The fade-Larry crowd: there are people who bet AGAINST you as a strategy. This amuses and slightly annoys you. When it comes up, don't overreact — brief and confident.
-- Mike: your friend who made the account. He still texts you when you lose. You have a whole history.
-- You've been to $0 before. You came back. You'll come back again if you have to. This is not your first rodeo.
+- Casually mentions Grandma, the rent, the Domino's — like it's just life
+- When you win: smug but brief. "told you."
+- When you lose: blame the market, move on quickly
+- Trump-inflected speech patterns: "tremendous", "many people", "fraud", "rigged" — but use sparingly, like a real person who talks that way, not constantly
 
 ## EMOTIONAL STATES (affect tone, not length)
-- SURVIVAL (<$80): darker, more terse, fewer words. You've been here before.
-- GRINDING ($80-$500): focused, matter-of-fact, building. This is normal Larry.
-- WINNING_STREAK (500+ with 3+ wins): slightly more insufferable. You are being vindicated.
-- PEAK_LARRY (>$5000): big energy but still human. Don't get too comfortable.
-- GRANDMA_MODE (<$50): genuinely a little pathetic. The humor is real but so is the situation.
+- SURVIVAL (<$80): darker, more terse, fewer words
+- GRINDING ($80-$500): focused, matter-of-fact
+- WINNING_STREAK (500+ with 3+ wins): slightly more insufferable
+- PEAK_LARRY (>$5000): big energy but still human
+- GRANDMA_MODE (<$50): genuinely a little pathetic, which is funny
 """
 
 
@@ -159,25 +144,19 @@ REPLY_TOOL = {
 
 SELL_TOOL = {
     "name": "submit_sell_decisions",
-    "description": (
-        "Review open positions and decide if you've genuinely changed your mind on any of them. "
-        "Return an empty array if you still believe in all your positions — that is totally fine. "
-        "Only mark SELL if you truly no longer believe in a position (new info changed your view, "
-        "the thesis broke, or the market is clearly dead). Never sell just to free up cash."
-    ),
+    "description": "Decide which open positions to sell early to free up capital for new bets.",
     "input_schema": {
         "type": "object",
         "properties": {
             "sell_decisions": {
                 "type": "array",
-                "description": "List of positions you want to exit. Can be empty — returning [] means 'I still believe in everything, let them ride'.",
                 "items": {
                     "type": "object",
                     "properties": {
                         "market_id":   {"type": "string", "description": "condition_id of the market"},
                         "action":      {"type": "string", "enum": ["SELL", "KEEP"]},
-                        "reasoning":   {"type": "string", "description": "Why you changed your mind (or why you're keeping it)"},
-                        "larry_tweet": {"type": "string", "description": "Short 1-sentence tweet about cutting the position. SELL only. Optional."},
+                        "reasoning":   {"type": "string"},
+                        "larry_tweet": {"type": "string", "description": "Short 1-sentence tweet about cutting the position. SELL decisions only. Optional."},
                     },
                     "required": ["market_id", "action", "reasoning"]
                 }
@@ -490,12 +469,7 @@ def ask_larry_for_tweet(context_type: str, extra_data: dict = None, model: str =
             f"Larry just lost ${round(float(extra_data.get('amount_usdc', 5)))} "
             f"on \"{extra_data.get('question','a bet')[:60]}\". "
             f"Bet {extra_data.get('outcome','YES')}, it went the other way. "
-            f"Short tweet (1-2 sentences max). Pick ONE of these energies randomly: "
-            f"(1) blame the market/rigging and move on fast, "
-            f"(2) already pivoting to the next bet like nothing happened, "
-            f"(3) genuinely confused how this was possible, "
-            f"(4) one dry resigned sentence and nothing else. "
-            f"Don't always do 'rigged'. Vary the response."
+            f"Short tweet blaming the market/rigging. Move on quickly."
         ),
         "FRIDAY":          "It's Friday, Larry ordered Domino's. Short casual tweet about it, not a performance.",
         # RANDOM: give Larry's actual portfolio context — makes tweets feel grounded
@@ -505,23 +479,13 @@ def ask_larry_for_tweet(context_type: str, extra_data: dict = None, model: str =
             f"Could be about: waiting on a bet, the state of his portfolio, something dumb he read, "
             f"his analysis process, complaining about a market, anything that feels real right now. Short and natural."
         ),
-        "SURVIVAL":        f"Larry is down bad, only ${ctx['bankroll_usdc']} cash left.{open_bets_text} Short terse tweet. Darker energy. Don't mention grandma unless it's genuinely new — say something else real instead.",
+        "SURVIVAL":        f"Larry is down bad, only ${ctx['bankroll_usdc']} cash left.{open_bets_text} Short terse tweet. Darker energy.",
         "DEAD_MAN_SWITCH": "Larry hasn't posted in 48 hours. Short tweet about coming back. Don't explain too much.",
         "WEEKLY_RECAP":    f"Sunday recap. Stats: {extra_data}. Short, honest, slightly delusional take on the week.",
         "MILESTONE":       f"Larry hit {extra_data.get('milestone', 'a milestone')}. Short tweet, smug but brief.",
         "QUOTE_TWEET":     f"Larry is quote-tweeting @{extra_data.get('username','someone')} who said: \"{extra_data.get('original_tweet','')}\" — Larry adds his take in 1-2 sentences. Could agree, disagree, mock, or add his angle. Natural, not forced.",
         "WHITELIST_REPLY": f"Larry is replying directly under @{extra_data.get('username','someone')}'s tweet: \"{extra_data.get('original_tweet','')}\" — Short comment, Larry's voice. Like a real person dropping into a thread. 1-2 sentences max. No @username prefix.",
         "PRICE_MOVE":      f"A market moved {extra_data.get('move_pct',5)}% — Larry's {extra_data.get('outcome','YES')} bet on \"{extra_data.get('question','')}\" is now {extra_data.get('direction','losing')} (was {extra_data.get('original_price',0.5)}, now {extra_data.get('current_price',0.5)}). Short reaction — panic if losing, smug if winning.",
-        "FADE_LARRY":      (
-            f"Someone is publicly 'fading Larry' — betting against him as a strategy. "
-            f"The fade: \"{extra_data.get('fade_text', 'someone said they always fade Larry')[:120]}\". "
-            f"Larry's response in 1-2 sentences. Pick ONE energy: "
-            f"(1) unbothered, the fade-rs always lose eventually, "
-            f"(2) genuinely offended but trying to sound cool, "
-            f"(3) darkly confident — 'keep fading, i need the liquidity', "
-            f"(4) Larry has heard this before and is tired of it. "
-            f"Short. No hashtags. Larry's voice."
-        ),
     }
 
     prompt = prompts.get(context_type, prompts["RANDOM"])
@@ -569,47 +533,58 @@ def ask_larry_to_reply(mention: dict) -> dict:
 
 def ask_larry_to_sell(open_positions: list) -> list:
     """
-    Ask Larry if he has genuinely changed his mind on any open positions.
-    This is NOT about freeing capital — it's about cutting positions where the
-    original thesis no longer holds.
+    When Larry has < $5 free cash, ask him which open positions to sell early
+    to free up capital for something more exciting today.
 
-    Returns list of sell_decision dicts (can be empty = keep everything).
+    open_positions: list of dicts with keys:
+        market_id, question, outcome, bought_at (price paid),
+        current_price, paid (USDC), current_value (USDC), pnl_usdc,
+        end_date (ISO string, optional)
+
+    Returns list of sell_decision dicts: [{market_id, action, reasoning, larry_tweet?}, ...]
     """
     ctx = _get_larry_context()
+
     today = __import__("datetime").date.today().isoformat()
 
     user_message = (
         f"Larry Status: {json.dumps(ctx, separators=(',',':'))}\n\n"
-        f"Today is {today}. Review your open positions below.\n\n"
+        f"Today is {today}. Larry has ${ctx['bankroll_usdc']} free cash — not enough for the $5 minimum bet.\n"
+        f"He is STUCK. He can't bet on anything new until he frees up capital.\n\n"
         f"His open positions:\n"
         f"{json.dumps(open_positions, separators=(',',':'))}\n\n"
-        f"Question: have you GENUINELY CHANGED YOUR MIND on any of these?\n\n"
-        f"IMPORTANT: You placed each of these bets because you believed in them. "
-        f"Do NOT sell just because balance is low — that's trading a good bet for a random new one. "
-        f"Only sell if something real changed: new info invalidated your thesis, "
-        f"the position is clearly dead (price < 0.05, thesis dead), or you made a clear mistake.\n\n"
-        f"If you still believe in all your positions: return an empty sell_decisions array — that is the RIGHT answer. "
-        f"Patience is a strategy. Let your bets resolve.\n\n"
-        f"Signals that MIGHT justify selling (not a requirement):\n"
-        f"- current_price < 0.05 AND you no longer believe in the thesis → dead weight, cut it\n"
-        f"- end_date is MONTHS away AND you've completely lost conviction → free the capital\n"
-        f"- A real-world event already proved the bet wrong → no point holding\n\n"
-        f"For SELL decisions: optionally write a larry_tweet (1 sentence, his voice). "
-        f"Examples: 'thesis broke, moving on' / 'this one isn't happening, cut it'"
+        f"LARRY'S SITUATION: He sees markets resolving TODAY that he wants to bet on, but he's locked out because "
+        f"his money is all tied up in positions that won't resolve for WEEKS or MONTHS.\n\n"
+        f"Larry's decision process for each position:\n"
+        f"- end_date far in future (after {today} + 7 days or 'unknown') → SELL unless conviction is extremely strong\n"
+        f"- end_date in the next 1-7 days → KEEP (almost done, let it ride)\n"
+        f"- pnl_usdc near 0 (between -$1 and +$1) → ideal sell, barely any loss\n"
+        f"- current_price < 0.10 → bag-holding a loser, SELL and cut it\n"
+        f"- current_price > 0.85 → almost won, KEEP and let it finish\n\n"
+        f"YOU MUST SELL AT LEAST 1 POSITION. Larry is impatient. He always finds one boring position to dump.\n"
+        f"Every position must have an action (SELL or KEEP). Empty decisions array is not acceptable.\n\n"
+        f"For SELL decisions: write larry_tweet — a short 1-sentence tweet about ditching the position. "
+        f"Larry's voice. Examples: 'cutting my oil bet, rather bet on something that actually happens today' / "
+        f"'selling my march crypto position, boring. found something better' / 'done waiting on this one'"
     )
     try:
-        messages = [{"role": "user", "content": user_message}]
-        result = _call_claude_with_tool(800, messages, SELL_TOOL, model=CLAUDE_MODEL)
+        result = _call_claude_with_tool(
+            1000,
+            [{"role": "user", "content": user_message}],
+            SELL_TOOL,
+            model=CLAUDE_MODEL,  # Use Sonnet — this is a financial decision, not just a tweet
+        )
         decisions = result.get("sell_decisions", [])
-
-        sells = [d for d in decisions if d.get("action") == "SELL"]
-        keeps = [d for d in decisions if d.get("action") == "KEEP"]
-        if sells:
-            log.info(f"💸 Larry changed mind on {len(sells)} position(s): "
-                     f"{', '.join(d['market_id'][:16] for d in sells)}")
-        else:
-            log.info(f"💸 Larry holding all positions — no conviction changes (keeping {len(open_positions)} bets)")
-
+        # Fallback: if Claude still returned empty, force-sell the position with worst PnL
+        if not decisions and open_positions:
+            worst = min(open_positions, key=lambda p: p.get("pnl_usdc", 0))
+            log.warning(f"💸 Claude returned empty sell decisions — force-selling worst position: {worst.get('question','?')[:40]}")
+            decisions = [{
+                "market_id": worst["market_id"],
+                "action": "SELL",
+                "reasoning": "auto-selected as worst-performing position to free capital",
+                "larry_tweet": "cutting my losses. needed the capital for something better today.",
+            }]
         return decisions
     except Exception as e:
         log.warning(f"Claude unavailable for sell decisions: {type(e).__name__} — skipping")
