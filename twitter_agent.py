@@ -11,9 +11,11 @@ Runs on a loop every 15 minutes:
 import sys
 import time
 import json
+import queue
 import signal
 import random
 import logging
+import threading
 import requests
 import tweepy
 from datetime import datetime, timedelta, timezone
@@ -31,7 +33,7 @@ from database import (
     get_bankroll, get_state, set_state, init_db, get_connection,
     get_pending_bets,
 )
-from larry_brain import ask_larry_for_tweet
+from larry_brain import ask_larry_for_tweet, ask_larry_to_reply_vip
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,6 +86,14 @@ _larry_user_id = None
 # Both run in separate threads inside the same process — so this global is shared.
 _last_tweet_at: datetime | None = None
 _TWEET_MIN_GAP_SECS = 65  # ≥1 minute between any two tweets Larry posts
+
+# ─── VIP STREAM REPLY SYSTEM ──────────────────────────────────────────────────
+# Filtered Stream → Larry replies to every @elonmusk / @Polymarket tweet in near real-time.
+# VIP replies use a SEPARATE daily cap (not counted against organic tweet cap).
+MAX_VIP_REPLIES_PER_DAY  = 20   # max Elon/Polymarket replies per day
+_VIP_REPLY_MIN_GAP_SECS  = 90   # 90s minimum between consecutive VIP replies
+_last_vip_reply_at: datetime | None = None
+_vip_tweet_queue: queue.Queue = queue.Queue()  # stream → processor handoff
 
 # ─── TWITTER CLIENT SINGLETONS ────────────────────────────────────────────────
 # v2 client — for posting tweets, replies, retweets
@@ -229,17 +239,74 @@ def post_tweet_with_image(text: str, image_path: str, tweet_type: str = "GM", be
 
 
 def get_today_own_tweet_count() -> int:
-    """Count original tweets posted today (excludes retweets)."""
+    """Count original tweets posted today (excludes retweets and VIP replies)."""
     conn = get_connection()
     try:
         row = conn.execute("""
             SELECT COUNT(*) as cnt FROM tweets
             WHERE DATE(posted_at) = DATE('now')
-              AND tweet_type != 'RETWEET'
+              AND tweet_type NOT IN ('RETWEET', 'VIP_REPLY')
         """).fetchone()
     finally:
         conn.close()
     return (row["cnt"] or 0) if row else 0
+
+
+def _get_vip_reply_count() -> int:
+    """Count VIP replies posted today (separate cap from organic tweets)."""
+    conn = get_connection()
+    try:
+        row = conn.execute("""
+            SELECT COUNT(*) as cnt FROM tweets
+            WHERE DATE(posted_at) = DATE('now')
+              AND tweet_type = 'VIP_REPLY'
+        """).fetchone()
+    finally:
+        conn.close()
+    return (row["cnt"] or 0) if row else 0
+
+
+def _is_vip_reply_cap_reached() -> bool:
+    """Return True if Larry hit his VIP reply cap for today."""
+    count = _get_vip_reply_count()
+    if count >= MAX_VIP_REPLIES_PER_DAY:
+        log.info(f"🚫 VIP reply cap reached ({count}/{MAX_VIP_REPLIES_PER_DAY}) — skipping")
+        return True
+    return False
+
+
+def _post_vip_reply(reply_text: str, in_reply_to_tweet_id: str) -> str:
+    """Post a VIP reply with its own anti-burst throttle. Returns tweet_id or ""."""
+    global _last_vip_reply_at
+
+    if len(reply_text) > 280:
+        reply_text = reply_text[:277] + "..."
+
+    # Min gap between VIP replies
+    if _last_vip_reply_at is not None:
+        elapsed = (_utcnow() - _last_vip_reply_at).total_seconds()
+        wait = _VIP_REPLY_MIN_GAP_SECS - elapsed
+        if wait > 0:
+            log.info(f"⏳ VIP reply throttle: {wait:.0f}s")
+            time.sleep(wait)
+
+    try:
+        client = get_twitter_client()
+        resp = client.create_tweet(
+            text=reply_text,
+            in_reply_to_tweet_id=in_reply_to_tweet_id,
+        )
+        reply_id = str(resp.data["id"])
+        save_tweet(tweet_id=reply_id, content=reply_text, tweet_type="VIP_REPLY")
+        _last_vip_reply_at = _utcnow()
+        log.info(f"✅ VIP reply posted (→{in_reply_to_tweet_id[:16]}): {reply_text[:60]}...")
+        return reply_id
+    except tweepy.Forbidden as e:
+        log.warning(f"VIP reply 403 — tweet may be restricted: {e}")
+        return ""
+    except tweepy.TweepyException as e:
+        log.error(f"VIP reply Twitter error: {e}")
+        return ""
 
 
 def _get_larry_id(client: tweepy.Client) -> int:
@@ -956,6 +1023,184 @@ def maybe_react_to_price_moves():
         log.warning(f"Price move react failed: {type(e).__name__}: {e}")
 
 
+# ─── FILTERED STREAM — VIP REPLY ENGINE ──────────────────────────────────────
+
+class LarryStreamClient(tweepy.StreamingClient):
+    """Tweepy StreamingClient that queues incoming VIP tweets for async processing.
+
+    Stream rules (managed by _sync_stream_rules):
+      vip_elonmusk   → from:elonmusk   -is:retweet -is:reply lang:en
+      vip_polymarket → from:Polymarket -is:retweet lang:en
+
+    Tweets are queued instantly (no sleeping here) so the stream receive loop
+    is never blocked. The _vip_reply_processor thread handles delays + Claude calls.
+    """
+
+    def on_response(self, response):
+        if response.data is None:
+            return
+        tweet = response.data
+        tweet_text = tweet.text or ""
+
+        # Determine username from matching rule tags (no extra API call needed)
+        username = "unknown"
+        if response.matching_rules:
+            for rule in response.matching_rules:
+                tag = getattr(rule, "tag", "") or ""
+                if "elonmusk" in tag.lower():
+                    username = "elonmusk"
+                    break
+                elif "polymarket" in tag.lower():
+                    username = "Polymarket"
+                    break
+
+        # Fallback: try includes if rule-based detection failed
+        if username == "unknown" and response.includes:
+            users = response.includes.get("users") or []
+            if users:
+                username = getattr(users[0], "username", "unknown")
+
+        _vip_tweet_queue.put({
+            "tweet_id":   str(tweet.id),
+            "tweet_text": tweet_text,
+            "username":   username,
+        })
+        log.debug(f"📡 Queued VIP tweet from @{username}: {tweet_text[:50]}...")
+
+    def on_errors(self, errors):
+        log.error(f"Stream errors: {errors}")
+
+    def on_exception(self, exception):
+        log.error(f"Stream exception: {type(exception).__name__}: {exception}")
+
+    def on_closed(self, response):
+        log.warning(f"Stream closed by server: status={getattr(response, 'status_code', '?')}")
+
+    def on_disconnect(self):
+        log.warning("Stream disconnected")
+
+
+def _vip_reply_processor():
+    """Background thread: dequeues VIP tweets, waits human-like delay, posts Larry's reply."""
+    replied_ids: set = set()
+    log.info("📡 VIP reply processor started")
+
+    while not _twitter_shutdown:
+        try:
+            item = _vip_tweet_queue.get(timeout=5)
+        except queue.Empty:
+            continue
+
+        tweet_id   = item["tweet_id"]
+        tweet_text = item["tweet_text"]
+        username   = item["username"]
+
+        # Dedup — don't reply twice to same tweet
+        if tweet_id in replied_ids:
+            _vip_tweet_queue.task_done()
+            continue
+
+        # Safety filter
+        if not _is_safe_to_engage(tweet_text):
+            log.debug(f"VIP tweet from @{username} failed safety check — skipping")
+            replied_ids.add(tweet_id)
+            _vip_tweet_queue.task_done()
+            continue
+
+        # Daily cap
+        if _is_vip_reply_cap_reached():
+            _vip_tweet_queue.task_done()
+            continue
+
+        log.info(f"💬 Preparing reply to @{username}: \"{tweet_text[:60]}...\"")
+        # No artificial delay — Claude API call takes a few seconds naturally.
+        # _VIP_REPLY_MIN_GAP_SECS (90s) in _post_vip_reply handles burst throttle.
+
+        try:
+            reply_data = ask_larry_to_reply_vip(
+                username=username,
+                tweet_text=tweet_text[:200],
+            )
+            reply_text = reply_data.get("reply", "")
+            if reply_text:
+                result = _post_vip_reply(reply_text, tweet_id)
+                if result:
+                    replied_ids.add(tweet_id)
+                    vip_count = _get_vip_reply_count()
+                    log.info(f"🎯 VIP reply {vip_count}/{MAX_VIP_REPLIES_PER_DAY} → @{username}: {reply_text[:60]}")
+            else:
+                log.debug(f"VIP reply gen returned empty for tweet {tweet_id[:16]}")
+
+        except Exception as e:
+            log.error(f"VIP reply processor error: {type(e).__name__}: {e}")
+
+        _vip_tweet_queue.task_done()
+
+    log.info("📡 VIP reply processor exited")
+
+
+def _sync_stream_rules(stream: LarryStreamClient):
+    """Ensure desired Filtered Stream rules are active. Adds missing, preserves existing."""
+    desired = {
+        "vip_elonmusk":   "from:elonmusk -is:retweet -is:reply lang:en",
+        "vip_polymarket": "from:Polymarket -is:retweet lang:en",
+    }
+    try:
+        existing = stream.get_rules().data or []
+        existing_tags = {getattr(r, "tag", None) for r in existing}
+
+        to_add = [
+            tweepy.StreamRule(value=v, tag=t)
+            for t, v in desired.items()
+            if t not in existing_tags
+        ]
+        if to_add:
+            result = stream.add_rules(to_add)
+            log.info(f"📡 Added stream rules: {[r.tag for r in to_add]}")
+            if result.errors:
+                log.error(f"Stream rule errors: {result.errors}")
+        else:
+            log.info(f"📡 Stream rules OK: {sorted(t for t in existing_tags if t)}")
+    except Exception as e:
+        log.error(f"_sync_stream_rules failed: {type(e).__name__}: {e}")
+
+
+def run_stream_worker():
+    """Background thread: maintains Filtered Stream connection to VIP accounts.
+
+    Auto-reconnects on disconnect with 60s backoff.
+    Hands off each tweet to _vip_tweet_queue for async processing.
+    """
+    log.info("📡 Filtered Stream worker starting...")
+
+    while not _twitter_shutdown:
+        try:
+            stream = LarryStreamClient(
+                bearer_token=TWITTER_BEARER_TOKEN,
+                wait_on_rate_limit=True,
+            )
+            _sync_stream_rules(stream)
+            log.info("📡 Connecting to Filtered Stream (blocking until disconnect)...")
+            stream.filter(
+                expansions=["author_id"],
+                user_fields=["username"],
+                tweet_fields=["author_id", "text", "created_at"],
+            )
+            # filter() returns when stream disconnects — loop will reconnect
+            log.warning("📡 Stream filter returned — scheduling reconnect...")
+
+        except Exception as e:
+            log.error(f"Stream worker error: {type(e).__name__}: {e}")
+
+        if _twitter_shutdown:
+            break
+
+        log.info("📡 Stream worker sleeping 60s before reconnect...")
+        time.sleep(60)
+
+    log.info("📡 Stream worker exited")
+
+
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 
 _twitter_shutdown = False
@@ -977,6 +1222,20 @@ def run_twitter_agent():
 
     # Load persisted state from previous session
     _init_quote_blacklist()
+
+    # Start Filtered Stream worker — receives VIP tweets in near real-time
+    stream_thread = threading.Thread(
+        target=run_stream_worker, name="stream-worker", daemon=True
+    )
+    stream_thread.start()
+
+    # Start VIP reply processor — processes queue with human-like delays
+    processor_thread = threading.Thread(
+        target=_vip_reply_processor, name="vip-reply-proc", daemon=True
+    )
+    processor_thread.start()
+
+    log.info("📡 Filtered Stream worker + VIP reply processor started")
 
     while not _twitter_shutdown:
         try:

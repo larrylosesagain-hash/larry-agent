@@ -631,6 +631,72 @@ def ask_larry_to_reply(mention: dict) -> dict:
     return result
 
 
+def ask_larry_to_reply_vip(username: str, tweet_text: str) -> dict:
+    """Generate Larry's reply to a VIP account tweet (Elon, Polymarket, etc.).
+
+    Viral-optimized: short, punchy, relatable — something that gets likes or replies.
+    Non-controversial: no politics, no attacks, just Larry's degenerate bettor persona.
+    """
+    bankroll = get_bankroll()
+    win_streak = get_win_streak()
+    state = _get_emotional_state(bankroll, win_streak)
+    recent_tweets = _get_recent_tweet_texts(5)
+
+    u_lower = username.lower()
+    if u_lower == "elonmusk":
+        account_ctx = (
+            "This is @elonmusk tweeting. Elon is into: crypto/Doge, Tesla/SpaceX, "
+            "free speech, disruption, memes, trolling the establishment. "
+            "Larry is a fan. Good reply types: "
+            "a funny self-aware observation, a degenerate bet angle on something Elon said, "
+            "a question Elon's followers would relate to, a one-liner that feels real. "
+            "NEVER political (no Trump/Biden/parties). NEVER edgy or controversial. "
+            "Think: something a regular guy in a prediction market Discord would post."
+        )
+    elif u_lower == "polymarket":
+        account_ctx = (
+            "This is @Polymarket tweeting — the prediction market Larry actually bets on. "
+            "Larry has skin in the game here. Good reply types: "
+            "Larry's current read on the market mentioned, him bragging about a position, "
+            "complaining about an open bet that went wrong, asking about the line, "
+            "or a confident (possibly delusional) prediction. Real bettor energy."
+        )
+    else:
+        account_ctx = (
+            f"This is @{username} tweeting. Larry adds a short real comment — "
+            "his prediction market / betting angle if possible, otherwise just a human reaction."
+        )
+
+    user_message = (
+        f"Larry: bankroll ${round(bankroll,2)}, state={state}, streak={win_streak}\n"
+        f"Recent tweets (vary tone — don't repeat same patterns): {json.dumps(recent_tweets, separators=(',',':'))}\n\n"
+        f"@{username} just tweeted:\n\"{tweet_text}\"\n\n"
+        f"{account_ctx}\n\n"
+        f"Write Larry's reply. Rules:\n"
+        f"- 1-2 sentences MAX (shorter = more likes — punchy wins)\n"
+        f"- Larry's voice: casual, real, slightly degenerate bettor energy\n"
+        f"- NO @username prefix\n"
+        f"- NO hashtags\n"
+        f"- NOT political, NOT controversial, nothing that could get flagged or banned\n"
+        f"- Something that could realistically get likes, QTs, or replies from real people\n"
+        f"- If the tweet is completely off-topic (e.g. SpaceX rocket), Larry still finds a funny betting angle or a real human reaction"
+    )
+    try:
+        result = _call_claude_with_tool(
+            300,
+            [{"role": "user", "content": user_message}],
+            REPLY_TOOL,
+            model=TWEET_MODEL,
+        )
+    except Exception:
+        log.warning("Claude unavailable — skipping VIP reply")
+        return {"reply": ""}
+
+    if len(result.get("reply", "")) > 250:
+        result["reply"] = result["reply"][:247] + "..."
+    return result
+
+
 def ask_larry_to_sell(open_positions: list) -> list:
     """
     Ask Larry if he has genuinely changed his mind on any open positions.
