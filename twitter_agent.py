@@ -301,9 +301,24 @@ def _post_vip_reply(reply_text: str, in_reply_to_tweet_id: str) -> str:
         _last_vip_reply_at = _utcnow()
         log.info(f"✅ VIP reply posted (→{in_reply_to_tweet_id[:16]}): {reply_text[:60]}...")
         return reply_id
-    except tweepy.Forbidden as e:
-        log.warning(f"VIP reply 403 — tweet may be restricted: {e}")
-        return ""
+    except tweepy.Forbidden:
+        # v2 returns 403 for Elon/restricted accounts — fall back to v1.1 update_status.
+        log.info("VIP reply v2 403 — trying v1.1 API fallback...")
+        try:
+            v1 = get_twitter_v1_api()
+            status = v1.update_status(
+                status=reply_text,
+                in_reply_to_status_id=int(in_reply_to_tweet_id),
+                auto_populate_reply_metadata=True,
+            )
+            reply_id = str(status.id)
+            save_tweet(tweet_id=reply_id, content=reply_text, tweet_type="VIP_REPLY")
+            _last_vip_reply_at = _utcnow()
+            log.info(f"✅ VIP reply [v1.1] posted (→{in_reply_to_tweet_id[:16]}): {reply_text[:60]}...")
+            return reply_id
+        except Exception as e2:
+            log.error(f"VIP reply v1.1 also failed: {type(e2).__name__}: {e2}")
+            return ""
     except tweepy.TweepyException as e:
         log.error(f"VIP reply Twitter error: {e}")
         return ""
