@@ -90,6 +90,7 @@ _TWEET_MIN_GAP_SECS = 65  # ≥1 minute between any two tweets Larry posts
 # ─── VIP STREAM REPLY SYSTEM ──────────────────────────────────────────────────
 # Filtered Stream → Larry replies to every @elonmusk / @Polymarket tweet in near real-time.
 # VIP replies use a SEPARATE daily cap (not counted against organic tweet cap).
+VIP_REPLIES_ENABLED      = False  # set True to re-enable (all VIP accounts have conversation controls right now)
 MAX_VIP_REPLIES_PER_DAY  = 20   # max Elon/Polymarket replies per day
 _VIP_REPLY_MIN_GAP_SECS  = 90   # 90s minimum between consecutive VIP replies
 _last_vip_reply_at: datetime | None = None
@@ -1096,6 +1097,11 @@ def _vip_reply_processor():
         tweet_id   = item["tweet_id"]
         tweet_text = item["tweet_text"]
         username   = item["username"]
+
+        # VIP replies disabled (conversation controls block all accounts)
+        if not VIP_REPLIES_ENABLED:
+            _vip_tweet_queue.task_done()
+            continue
 
         # Dedup — don't reply twice to same tweet
         if tweet_id in replied_ids:
