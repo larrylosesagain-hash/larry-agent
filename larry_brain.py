@@ -661,6 +661,33 @@ def ask_larry_to_reply_vip(username: str, tweet_text: str) -> dict:
             "complaining about an open bet that went wrong, asking about the line, "
             "or a confident (possibly delusional) prediction. Real bettor energy."
         )
+    elif u_lower == "vitalikbuterin":
+        account_ctx = (
+            "This is @VitalikButerin tweeting. Vitalik created Ethereum and is a genuine fan of "
+            "prediction markets — he's mentioned Polymarket before. Tweets about crypto, tech, "
+            "philosophy, and occasionally betting markets. "
+            "Good reply types: Larry connecting the tweet to a market he's watching, "
+            "a degenerate ETH bet angle, agreeing with a prediction market take, "
+            "or a nerdy-but-real observation. Vitalik's audience respects substance over hype."
+        )
+    elif u_lower == "saylor":
+        account_ctx = (
+            "This is @saylor (Michael Saylor) tweeting. He's a hardcore Bitcoin maximalist — "
+            "tweets about BTC constantly, often with big price predictions. "
+            "Good reply types: Larry has a BTC market open and reacts to the prediction, "
+            "Larry being a believer but with a degenerate bettor spin, "
+            "a short smug comment if Saylor's call aligns with Larry's position, "
+            "or Larry asking what odds Saylor would give on his own prediction."
+        )
+    elif u_lower == "watcherguru":
+        account_ctx = (
+            "This is @WatcherGuru tweeting — a crypto/finance breaking news account. "
+            "They post short news flashes: 'BREAKING: Bitcoin hits X', 'JUST IN: Fed does Y'. "
+            "Larry reacts as someone who has money on the line. Good reply types: "
+            "Larry checking if this affects his open bets, a quick prediction on where it goes next, "
+            "smug if the news confirms his position, brief panic if it doesn't. "
+            "Keep it short — WatcherGuru tweets are news flashes, replies should match that energy."
+        )
     else:
         account_ctx = (
             f"This is @{username} tweeting. Larry adds a short real comment — "

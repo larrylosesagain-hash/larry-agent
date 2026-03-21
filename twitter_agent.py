@@ -1144,6 +1144,9 @@ def _sync_stream_rules(stream: LarryStreamClient):
     desired = {
         "vip_elonmusk":   "from:elonmusk -is:retweet -is:reply lang:en",
         "vip_polymarket": "from:Polymarket -is:retweet lang:en",
+        "vip_vitalik":    "from:VitalikButerin -is:retweet lang:en",
+        "vip_saylor":     "from:saylor -is:retweet lang:en",
+        "vip_watcherguru":"from:WatcherGuru -is:retweet lang:en",
     }
     try:
         existing = stream.get_rules().data or []
