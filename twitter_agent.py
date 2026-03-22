@@ -33,7 +33,7 @@ from database import (
     get_bankroll, get_state, set_state, init_db, get_connection,
     get_pending_bets,
 )
-from larry_brain import ask_larry_for_tweet, ask_larry_to_reply_vip
+from larry_brain import ask_larry_for_tweet, ask_larry_to_reply_vip, ask_larry_to_reply
 
 logging.basicConfig(
     level=logging.INFO,
@@ -893,6 +893,147 @@ def maybe_reply_to_whitelist():
         log.warning(f"Whitelist reply failed: {type(e).__name__}: {e}")
 
 
+# ─── MENTION REPLIES ──────────────────────────────────────────────────────────
+# Larry replies to people who reply to his own tweets.
+# Polled every 15-min cycle via get_users_mentions (v2, Basic tier supported).
+# Only actual in-thread replies (in_reply_to_user_id == larry_id) — not mere @mentions.
+
+MAX_MENTION_REPLIES_PER_DAY  = 30   # hard daily cap — plenty of runway
+_MENTION_REPLY_MIN_GAP_SECS  = 60   # 60s minimum between consecutive mention replies
+_MAX_MENTIONS_PER_CYCLE      = 3    # max replies in one 15-min cycle (anti-burst)
+
+
+def maybe_reply_to_mentions():
+    """
+    Poll for new replies to Larry's tweets and respond in character.
+
+    Uses get_users_mentions() with since_id to fetch only new replies each cycle.
+    Filters to in_reply_to_user_id == larry_id — true thread replies only.
+    Replies via ask_larry_to_reply({username, likes, text}).
+    """
+    client = get_twitter_client()
+    larry_id = _get_larry_id(client)
+
+    now = _utcnow()
+    today_str = now.strftime("%Y-%m-%d")
+    count_key = f"mention_reply_count_{today_str}"
+
+    # Daily cap check
+    try:
+        daily_count = int(get_state(count_key) or "0")
+    except (ValueError, TypeError):
+        daily_count = 0
+    if daily_count >= MAX_MENTION_REPLIES_PER_DAY:
+        return
+
+    # Per-reply throttle (prevent rapid-fire within a cycle)
+    last_reply_ts_str = get_state("last_mention_reply_time")
+    last_reply_ts: float = float(last_reply_ts_str) if last_reply_ts_str else 0.0
+
+    # Fetch new mentions since last seen tweet
+    since_id = get_state("last_mention_tweet_id") or None
+
+    try:
+        api_kwargs = dict(
+            id=larry_id,
+            max_results=20,
+            tweet_fields=["author_id", "in_reply_to_user_id", "public_metrics", "text"],
+            expansions=["author_id"],
+            user_fields=["username", "public_metrics"],
+        )
+        if since_id:
+            api_kwargs["since_id"] = since_id
+
+        response = client.get_users_mentions(**api_kwargs)
+    except tweepy.errors.Unauthorized:
+        log.debug("get_users_mentions: Unauthorized — Basic tier needed")
+        return
+    except Exception as e:
+        log.warning(f"get_users_mentions failed: {type(e).__name__}: {e}")
+        return
+
+    if not response.data:
+        return
+
+    # Build username map from includes
+    users: dict = {}
+    if response.includes and "users" in response.includes:
+        for u in response.includes["users"]:
+            followers = (u.public_metrics or {}).get("followers_count", 0)
+            users[u.id] = {"username": u.username, "followers": followers}
+
+    # Update since_id to the newest tweet in this batch (highest snowflake ID)
+    all_ids = [t.id for t in response.data]
+    new_since_id = str(max(all_ids))
+    set_state("last_mention_tweet_id", new_since_id)
+
+    # Filter to replies directed at Larry
+    replies = [
+        t for t in response.data
+        if str(getattr(t, "in_reply_to_user_id", None)) == str(larry_id)
+        and _is_safe_to_engage(t.text or "")
+    ]
+
+    if not replies:
+        return
+
+    log.info(f"💬 {len(replies)} new mention reply/replies to process (cap: {daily_count}/{MAX_MENTION_REPLIES_PER_DAY})")
+
+    replied_this_cycle = 0
+    for mention in replies:
+        if replied_this_cycle >= _MAX_MENTIONS_PER_CYCLE:
+            break
+        if daily_count >= MAX_MENTION_REPLIES_PER_DAY:
+            break
+
+        # Per-reply throttle
+        now_ts = time.time()
+        gap = now_ts - last_reply_ts
+        if gap < _MENTION_REPLY_MIN_GAP_SECS:
+            wait = _MENTION_REPLY_MIN_GAP_SECS - gap
+            log.info(f"⏳ Mention reply throttle: waiting {wait:.0f}s")
+            time.sleep(wait)
+
+        user_info  = users.get(mention.author_id, {})
+        username   = user_info.get("username", "unknown")
+        likes      = (mention.public_metrics or {}).get("like_count", 0)
+        tweet_text = (mention.text or "")[:280]
+        tweet_id   = str(mention.id)
+
+        try:
+            reply_data = ask_larry_to_reply({
+                "username": username,
+                "likes":    likes,
+                "text":     tweet_text,
+            })
+            reply_text = reply_data.get("reply", "")
+            if not reply_text:
+                continue
+
+            if len(reply_text) > 280:
+                reply_text = reply_text[:277] + "..."
+
+            resp = client.create_tweet(
+                text=reply_text,
+                in_reply_to_tweet_id=tweet_id,
+            )
+            reply_id = str(resp.data["id"])
+            save_tweet(tweet_id=reply_id, content=reply_text, tweet_type="MENTION_REPLY")
+            log.info(f"✅ Replied to @{username}: {reply_text[:60]}...")
+
+            last_reply_ts = time.time()
+            set_state("last_mention_reply_time", str(last_reply_ts))
+            daily_count += 1
+            replied_this_cycle += 1
+            set_state(count_key, str(daily_count))
+
+        except tweepy.Forbidden:
+            # Author may have restricted replies since they posted
+            log.debug(f"Mention reply 403 for tweet {tweet_id[:16]} — skipping")
+        except Exception as e:
+            log.warning(f"Mention reply failed: {type(e).__name__}: {e}")
+
+
 # ─── FADE LARRY DETECTION ─────────────────────────────────────────────────────
 
 def maybe_react_to_fade_larry():
@@ -1286,6 +1427,9 @@ def run_twitter_agent():
 
             # 9. Milestone tweets
             check_milestones()
+
+            # 10. Reply to people who replied to Larry's tweets
+            maybe_reply_to_mentions()
 
         except KeyboardInterrupt:
             log.info("👋 Twitter agent stopped")
