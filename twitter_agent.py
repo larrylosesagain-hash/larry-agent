@@ -898,7 +898,7 @@ def maybe_reply_to_whitelist():
 # Polled every 15-min cycle via get_users_mentions (v2, Basic tier supported).
 # Only actual in-thread replies (in_reply_to_user_id == larry_id) — not mere @mentions.
 
-MAX_MENTION_REPLIES_PER_DAY  = 30   # hard daily cap — plenty of runway
+MAX_MENTION_REPLIES_PER_DAY  = 15   # separate daily cap (independent from organic tweet cap)
 _MENTION_REPLY_MIN_GAP_SECS  = 60   # 60s minimum between consecutive mention replies
 _MAX_MENTIONS_PER_CYCLE      = 3    # max replies in one 15-min cycle (anti-burst)
 
