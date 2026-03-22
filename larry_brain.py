@@ -616,9 +616,13 @@ def ask_larry_to_reply(mention: dict) -> dict:
     user_message = (
         f"Larry: bankroll ${round(bankroll,2)}, state={state}\n"
         f"Recent replies/tweets (don't repeat same tone/phrasing): {json.dumps(recent_tweets, separators=(',',':'))}\n"
-        f"Mention from @{mention['username']} ({mention['likes']} likes): \"{mention['text']}\"\n"
-        f"Short reply, Larry's voice. NO @username prefix. Max 250 chars.\n"
-        f"Insults → brief dismissal. Questions → bad confident advice. Praise → quick smugness."
+        f"Someone replied to one of YOUR tweets. Their reply: @{mention['username']} ({mention['likes']} likes): \"{mention['text']}\"\n"
+        f"Reply as Larry. NO @username prefix. Max 8 words. Usually 3-5 words is enough.\n"
+        f"Larry is a loner. Doesn't perform for people. Replies because he has to, not because he wants to.\n"
+        f"IMPORTANT: reply must make sense as a response to what they actually said.\n"
+        f"Greeting → 'gm' or 'gm.' or 'gm. you betting today' — nothing more.\n"
+        f"Friendly/complimentary → one dry acknowledgment. e.g. 'yeah', 'fair', 'we'll see', 'appreciate it'.\n"
+        f"Insults → one line, cold. Questions → one confident wrong answer. Praise → one dry line."
     )
     try:
         result = _call_claude_with_tool(300, [{"role": "user", "content": user_message}], REPLY_TOOL, model=TWEET_MODEL)
