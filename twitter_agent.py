@@ -967,10 +967,11 @@ def maybe_reply_to_mentions():
     new_since_id = str(max(all_ids))
     set_state("last_mention_tweet_id", new_since_id)
 
-    # Filter to replies directed at Larry
+    # Filter to replies directed at Larry — exclude Larry's own tweets (self-reply loop)
     replies = [
         t for t in response.data
         if str(getattr(t, "in_reply_to_user_id", None)) == str(larry_id)
+        and str(t.author_id) != str(larry_id)
         and _is_safe_to_engage(t.text or "")
     ]
 
