@@ -10,14 +10,15 @@ import signal
 import threading
 import logging
 
-from twitter_agent import run_twitter_agent, set_twitter_shutdown, is_twitter_shutdown
-from betting_agent import run_betting_agent, set_betting_shutdown, is_betting_shutdown
-
+# Must be configured BEFORE importing agents — basicConfig is a no-op if handlers exist
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [MAIN] %(message)s",
+    format="%(asctime)s [%(name)s] %(message)s",
     handlers=[logging.StreamHandler()]
 )
+
+from twitter_agent import run_twitter_agent, set_twitter_shutdown, is_twitter_shutdown
+from betting_agent import run_betting_agent, set_betting_shutdown, is_betting_shutdown
 log = logging.getLogger(__name__)
 
 

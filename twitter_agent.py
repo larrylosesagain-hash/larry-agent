@@ -18,7 +18,7 @@ import logging
 import threading
 import requests
 import tweepy
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from config import (
     TWITTER_API_KEY, TWITTER_API_SECRET,
     TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET,
@@ -31,21 +31,11 @@ from config import (
 from database import (
     save_tweet, get_last_tweet_time, get_today_tweet_count,
     get_bankroll, get_state, set_state, init_db, get_connection,
-    get_pending_bets,
+    get_pending_bets, utcnow as _utcnow,
 )
 from larry_brain import ask_larry_for_tweet, ask_larry_to_reply_vip, ask_larry_to_reply
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [TWITTER] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
 log = logging.getLogger(__name__)
-
-
-def _utcnow() -> datetime:
-    """Return current UTC time as naive datetime. Replaces datetime.utcnow() (deprecated Python 3.12+)."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # ─── CONTENT SAFETY FILTER ───────────────────────────────────────────────────

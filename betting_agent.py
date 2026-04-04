@@ -17,15 +17,12 @@ import os
 import logging
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from web3 import Web3
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.constants import POLYGON
 
-def _utcnow() -> datetime:
-    """Return current UTC time as naive datetime. Replaces datetime.utcnow() (deprecated Python 3.12+)."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # ─── USDC ADDRESS ─────────────────────────────────────────────────────────────
@@ -112,15 +109,10 @@ from config import (
 )
 from database import (
     get_bankroll, set_bankroll, get_pending_bets, save_bet, resolve_bet,
-    init_db, get_state, set_state, get_connection, get_win_streak
+    init_db, get_state, set_state, get_connection, get_win_streak, utcnow as _utcnow
 )
 from larry_brain import ask_larry_to_bet, ask_larry_for_tweet, ask_larry_to_sell
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [BETTING] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
 log = logging.getLogger(__name__)
 
 # Token-not-found blacklist: maps condition_id → expiry datetime (6h TTL)
