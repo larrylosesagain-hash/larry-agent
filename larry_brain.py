@@ -186,6 +186,42 @@ SELL_TOOL = {
     }
 }
 
+POLL_TOOL = {
+    "name": "generate_poll",
+    "description": "Generate a poll tweet as Larry — designed to provoke replies and engagement",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "tweet":   {"type": "string", "description": "Poll question, max 180 chars — SHORT"},
+            "options": {
+                "type": "array",
+                "items": {"type": "string", "description": "Option text, max 25 chars"},
+                "minItems": 2,
+                "maxItems": 4,
+            },
+            "tweet_type": {"type": "string"}
+        },
+        "required": ["tweet", "options", "tweet_type"]
+    }
+}
+
+THREAD_TOOL = {
+    "name": "generate_thread",
+    "description": "Generate a 3-5 tweet suspense thread as Larry — builds to a reveal",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "tweets": {
+                "type": "array",
+                "items": {"type": "string", "description": "Single tweet, max 280 chars"},
+                "minItems": 3,
+                "maxItems": 5,
+            }
+        },
+        "required": ["tweets"]
+    }
+}
+
 
 # ─── KELLY CRITERION ──────────────────────────────────────────────────────────
 
@@ -588,6 +624,25 @@ def ask_larry_for_tweet(context_type: str, extra_data: dict = None, model: str =
             f"Keep it SHORT — gm + one question, max 2 lines total. No hashtags. "
             f"Don't mention time zones or time of day. Don't explain the gm."
         ),
+        "HOT_TAKE": (
+            f"Larry posts a controversial market hot take. State: {ctx['emotional_state']}. "
+            f"Bankroll: ${ctx['bankroll_usdc']}.\n"
+            f"Goal: people HAVE to reply to disagree. Make it specific and slightly wrong in a way experts notice.\n"
+            f"Good energies:\n"
+            f"'everyone betting YES on [X] right now is going to feel very dumb in [timeframe]'\n"
+            f"'the consensus is wrong on this one. here's what they're missing.'\n"
+            f"'if you're not fading the public on [topic] right now you don't understand the market'\n"
+            f"'prediction: [specific bold claim]. screenshot this.'\n"
+            f"1-2 sentences max. Specific. No hashtags. Larry's voice."
+        ),
+        "THREAD_HOOK": (
+            f"First tweet of a thread. State: {ctx['emotional_state']}. "
+            f"Must make people HAVE to read the next tweet — pure suspense hook.\n"
+            f"Examples: 'okay i need to tell you what just happened' / "
+            f"'story time. this one hurt.' / "
+            f"'i made a call today that was either genius or complete stupidity. let me explain.'\n"
+            f"DO NOT reveal outcome. 1 sentence. No hashtags."
+        ),
     }
 
     prompt = prompts.get(context_type, prompts["RANDOM"])
@@ -728,6 +783,77 @@ def ask_larry_to_reply_vip(username: str, tweet_text: str) -> dict:
     if len(result.get("reply", "")) > 250:
         result["reply"] = result["reply"][:247] + "..."
     return result
+
+
+def ask_larry_for_poll() -> dict:
+    """Generate a poll with options designed to provoke replies."""
+    ctx = _get_tweet_context()
+    recent_tweets = _get_recent_tweet_texts(5)
+
+    user_message = (
+        f"Larry: bankroll ${ctx['bankroll_usdc']}, state={ctx['emotional_state']}\n"
+        f"Open bets: {json.dumps([b['q'] for b in ctx.get('open_bets', [])[:3]], separators=(',',':'))}\n"
+        f"Recent tweets (don't repeat): {json.dumps(recent_tweets, separators=(',',':'))}\n\n"
+        f"Generate a poll Larry would post. Goal: make people HAVE to vote AND reply.\n"
+        f"Best poll types:\n"
+        f"- False dichotomy: 'who's smarter — X or Y' where both options spark debate\n"
+        f"- Market prediction: 'where does BTC close today' with 3-4 price ranges\n"
+        f"- Bet validation: 'you see my open bet on X — am I right or am I cooked'\n"
+        f"- Degenerate philosophy: 'do you fade the crowd or follow it at 70/30'\n"
+        f"Keep question SHORT (under 180 chars). Options max 25 chars each.\n"
+        f"No hashtags. Larry's voice."
+    )
+    try:
+        result = _call_claude_with_tool(
+            400, [{"role": "user", "content": user_message}], POLL_TOOL, model=TWEET_MODEL
+        )
+        result["options"] = [o[:25] for o in result.get("options", ["YES 🔥", "NO 💀"])[:4]]
+        return result
+    except Exception:
+        return _fallback_tweet()
+
+
+def ask_larry_for_thread() -> dict:
+    """Generate a suspense thread — builds to a reveal. Uses real recent bet if available."""
+    ctx = _get_tweet_context()
+    recent_bets = get_recent_bets(5)
+
+    story_bet = next(
+        (b for b in recent_bets
+         if b.get("status") in ("WON", "LOST") and float(b.get("amount_usdc", 0)) >= 8),
+        None
+    )
+    if story_bet:
+        bet_context = (
+            f"Use this real resolved bet as the story: "
+            f"{'WON' if story_bet['status'] == 'WON' else 'LOST'} "
+            f"${float(story_bet.get('amount_usdc', 0)):.0f} on "
+            f"'{story_bet.get('question', '')[:60]}' betting {story_bet.get('outcome', 'YES')}."
+        )
+    else:
+        bet_context = "Make up a plausible recent bet scenario based on Larry's current state."
+
+    user_message = (
+        f"Larry: bankroll ${ctx['bankroll_usdc']}, state={ctx['emotional_state']}\n\n"
+        f"{bet_context}\n\n"
+        f"Write a 3-4 tweet thread. Rules:\n"
+        f"Tweet 1: hook — DO NOT reveal outcome. Pure suspense. Makes them read tweet 2.\n"
+        f"Tweet 2-3: the story, building tension piece by piece.\n"
+        f"Last tweet: the reveal + Larry's reaction (smug if won, moves on fast if lost).\n\n"
+        f"Each tweet must make you want to read the next one.\n"
+        f"Short sentences. Real Larry voice. No performance. Max 280 chars each."
+    )
+    try:
+        result = _call_claude_with_tool(
+            900, [{"role": "user", "content": user_message}], THREAD_TOOL, model=TWEET_MODEL
+        )
+        result["tweets"] = [
+            t[:277] + "..." if len(t) > 280 else t
+            for t in result.get("tweets", [])
+        ]
+        return result
+    except Exception:
+        return {"tweets": []}
 
 
 def ask_larry_to_sell(open_positions: list) -> list:

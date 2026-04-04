@@ -33,7 +33,7 @@ from database import (
     get_bankroll, get_state, set_state, init_db, get_connection,
     get_pending_bets, utcnow as _utcnow,
 )
-from larry_brain import ask_larry_for_tweet, ask_larry_to_reply_vip, ask_larry_to_reply
+from larry_brain import ask_larry_for_tweet, ask_larry_to_reply_vip, ask_larry_to_reply, ask_larry_for_poll, ask_larry_for_thread
 
 log = logging.getLogger(__name__)
 
@@ -122,7 +122,7 @@ def get_twitter_v1_api() -> tweepy.API:
 # ─── DAILY TWEET CAP ──────────────────────────────────────────────────────────
 # Hard cap: Larry posts at most MAX_DAILY_ORIGINAL_TWEETS original tweets per day.
 # Separate from config.MAX_TWEETS_PER_DAY which was used for organic spacing only.
-MAX_DAILY_ORIGINAL_TWEETS = 15
+MAX_DAILY_ORIGINAL_TWEETS = 20
 
 def _is_daily_cap_reached() -> bool:
     """Return True if Larry has already hit MAX_DAILY_ORIGINAL_TWEETS today."""
@@ -315,8 +315,8 @@ def _get_larry_id(client: tweepy.Client) -> int:
 
 def should_tweet_now() -> bool:
     """Decide if it's time for a new organic tweet.
-    No daily cap — only constraint is MIN_MINUTES_BETWEEN_TWEETS gap.
-    25% chance per 15-min cycle when gap has elapsed = ~4-6 tweets/day naturally.
+    Peak hours 18-23 UTC (US prime time): 40% chance → ~5-7 organic tweets.
+    Off-peak 9-17 UTC: 20% chance → ~2-3 tweets earlier in the day.
     """
     now = _utcnow()
     last_tweet = get_last_tweet_time()
@@ -327,13 +327,14 @@ def should_tweet_now() -> bool:
             return False
 
     hour = now.hour
-    if hour < 7 or hour >= 23:
+    if hour < 9 or hour >= 23:
         return False
 
-    if random.random() < 0.25:
-        log.info(f"Rolling to tweet (today: {get_today_own_tweet_count()})")
+    # Peak hours: 40% chance; off-peak: 20% chance
+    chance = 0.40 if hour >= 18 else 0.20
+    if random.random() < chance:
+        log.info(f"Rolling to tweet (today: {get_today_own_tweet_count()}, hour={hour}UTC)")
         return True
-
     return False
 
 
@@ -1022,6 +1023,220 @@ def maybe_reply_to_mentions():
             log.warning(f"Mention reply failed: {type(e).__name__}: {e}")
 
 
+# ─── POST POLL ────────────────────────────────────────────────────────────────
+
+def post_poll(tweet_text: str, options: list, tweet_type: str = "POLL") -> str:
+    """Post a tweet with a 24-hour poll. Returns tweet_id or ''."""
+    global _last_tweet_at
+
+    if _is_daily_cap_reached():
+        return ""
+
+    if _last_tweet_at is not None:
+        elapsed = (_utcnow() - _last_tweet_at).total_seconds()
+        wait = _TWEET_MIN_GAP_SECS - elapsed
+        if wait > 0:
+            log.info(f"⏳ Poll throttle: {wait:.0f}s")
+            time.sleep(wait)
+
+    if len(tweet_text) > 280:
+        tweet_text = tweet_text[:277] + "..."
+
+    try:
+        client = get_twitter_client()
+        response = client.create_tweet(
+            text=tweet_text,
+            poll_duration_minutes=1440,  # 24 hours
+            poll_options=options[:4],
+        )
+        tweet_id = str(response.data["id"])
+        save_tweet(tweet_id=tweet_id, content=tweet_text, tweet_type=tweet_type)
+        _last_tweet_at = _utcnow()
+        log.info(f"📊 Poll posted: {tweet_text[:60]}... | options={options}")
+        return tweet_id
+    except tweepy.TweepyException as e:
+        log.error(f"Poll post failed: {e}")
+        return ""
+
+
+# ─── POST THREAD ──────────────────────────────────────────────────────────────
+
+def post_thread(tweets: list, tweet_type: str = "THREAD") -> str:
+    """Post a thread — chain of tweets replying to each other. Returns first tweet_id."""
+    global _last_tweet_at
+
+    if not tweets or _is_daily_cap_reached():
+        return ""
+
+    first_id = ""
+    last_id = None
+    client = get_twitter_client()
+
+    for i, text in enumerate(tweets):
+        # Anti-burst: only enforce gap before first tweet; rest chain naturally
+        if i == 0 and _last_tweet_at is not None:
+            elapsed = (_utcnow() - _last_tweet_at).total_seconds()
+            wait = _TWEET_MIN_GAP_SECS - elapsed
+            if wait > 0:
+                log.info(f"⏳ Thread start throttle: {wait:.0f}s")
+                time.sleep(wait)
+
+        if len(text) > 280:
+            text = text[:277] + "..."
+
+        try:
+            kwargs = {"text": text}
+            if last_id:
+                kwargs["in_reply_to_tweet_id"] = last_id
+            response = client.create_tweet(**kwargs)
+            tweet_id = str(response.data["id"])
+            save_tweet(tweet_id=tweet_id, content=text, tweet_type=tweet_type)
+            _last_tweet_at = _utcnow()
+            if not first_id:
+                first_id = tweet_id
+            last_id = tweet_id
+            log.info(f"🧵 Thread [{i+1}/{len(tweets)}]: {text[:60]}...")
+            if i < len(tweets) - 1:
+                time.sleep(3)  # brief pause between thread tweets — feels human
+        except tweepy.TweepyException as e:
+            log.error(f"Thread tweet {i+1} failed: {e}")
+            break
+
+    return first_id
+
+
+# ─── POLLS (1-2/day) ──────────────────────────────────────────────────────────
+
+def maybe_post_poll() -> bool:
+    """Post a poll 1-2x per day. Polls drive replies ×5 vs regular tweets."""
+    now = _utcnow()
+
+    if now.hour < 10 or now.hour >= 22:
+        return False
+
+    today_str = now.strftime("%Y-%m-%d")
+    count_key = f"poll_count_{today_str}"
+    try:
+        poll_count = int(get_state(count_key) or "0")
+    except (ValueError, TypeError):
+        poll_count = 0
+    if poll_count >= 2:
+        return False
+
+    last_poll = get_state("last_poll_time")
+    if last_poll:
+        try:
+            if (_utcnow() - datetime.fromisoformat(last_poll)).total_seconds() < 6 * 3600:
+                return False
+        except Exception:
+            pass
+
+    if random.random() > 0.30:
+        return False
+
+    try:
+        poll_data = ask_larry_for_poll()
+        tweet_text = poll_data.get("tweet", "")
+        options = poll_data.get("options", [])
+        if not tweet_text or len(options) < 2:
+            return False
+        tweet_id = post_poll(tweet_text, options)
+        if tweet_id:
+            set_state("last_poll_time", now.isoformat())
+            set_state(count_key, str(poll_count + 1))
+            return True
+    except Exception as e:
+        log.warning(f"Poll generation failed: {e}")
+    return False
+
+
+# ─── HOT TAKES (1-2/day) ──────────────────────────────────────────────────────
+
+def maybe_post_hot_take() -> bool:
+    """Post a controversial hot take 1-2x per day during peak hours to provoke replies."""
+    now = _utcnow()
+
+    # Peak hours only
+    if now.hour < 14 or now.hour >= 23:
+        return False
+
+    today_str = now.strftime("%Y-%m-%d")
+    count_key = f"hot_take_count_{today_str}"
+    try:
+        take_count = int(get_state(count_key) or "0")
+    except (ValueError, TypeError):
+        take_count = 0
+    if take_count >= 2:
+        return False
+
+    last_take = get_state("last_hot_take_time")
+    if last_take:
+        try:
+            if (_utcnow() - datetime.fromisoformat(last_take)).total_seconds() < 5 * 3600:
+                return False
+        except Exception:
+            pass
+
+    if random.random() > 0.25:
+        return False
+
+    try:
+        tweet_data = ask_larry_for_tweet("HOT_TAKE")
+        text = tweet_data.get("tweet", "")
+        if not text:
+            return False
+        tweet_id = post_tweet(text, tweet_type="HOT_TAKE")
+        if tweet_id:
+            set_state("last_hot_take_time", now.isoformat())
+            set_state(count_key, str(take_count + 1))
+            log.info(f"🔥 Hot take: {text[:60]}...")
+            return True
+    except Exception as e:
+        log.warning(f"Hot take failed: {e}")
+    return False
+
+
+# ─── THREADS (2-3/week) ───────────────────────────────────────────────────────
+
+def maybe_post_thread() -> bool:
+    """Post a suspense thread 2-3x per week during peak evening hours."""
+    now = _utcnow()
+
+    # Evening only — threads need time to get traction
+    if now.hour < 18 or now.hour >= 23:
+        return False
+
+    today_str = now.strftime("%Y-%m-%d")
+    if get_state(f"thread_posted_{today_str}") == "true":
+        return False
+
+    last_thread = get_state("last_thread_time")
+    if last_thread:
+        try:
+            if (_utcnow() - datetime.fromisoformat(last_thread)).total_seconds() < 2 * 24 * 3600:
+                return False
+        except Exception:
+            pass
+
+    if random.random() > 0.20:
+        return False
+
+    try:
+        thread_data = ask_larry_for_thread()
+        tweets = thread_data.get("tweets", [])
+        if len(tweets) < 2:
+            return False
+        first_id = post_thread(tweets, tweet_type="THREAD")
+        if first_id:
+            set_state("last_thread_time", now.isoformat())
+            set_state(f"thread_posted_{today_str}", "true")
+            log.info(f"🧵 Thread done ({len(tweets)} tweets, first={first_id})")
+            return True
+    except Exception as e:
+        log.warning(f"Thread failed: {e}")
+    return False
+
+
 # ─── FADE LARRY DETECTION ─────────────────────────────────────────────────────
 
 def maybe_react_to_fade_larry():
@@ -1407,16 +1622,25 @@ def run_twitter_agent():
             # 6. React to price moves on open bets (throttled, only big moves)
             maybe_react_to_price_moves()
 
-            # 7. Fade Larry detection (~1/day if people are publicly fading him)
+            # 7. Poll (1-2/day) — false dichotomies drive reply × 5
+            maybe_post_poll()
+
+            # 8. Hot take (1-2/day, peak hours) — controversial = replies
+            maybe_post_hot_take()
+
+            # 9. Thread (2-3/week, evenings) — suspense builds follows
+            maybe_post_thread()
+
+            # 10. Fade Larry detection (~1/day if people are publicly fading him)
             maybe_react_to_fade_larry()
 
-            # 8. Weekly recap (Sundays)
+            # 11. Weekly recap (Sundays)
             maybe_tweet_weekly_recap()
 
-            # 9. Milestone tweets
+            # 12. Milestone tweets
             check_milestones()
 
-            # 10. Reply to people who replied to Larry's tweets
+            # 13. Reply to people who replied to Larry's tweets
             maybe_reply_to_mentions()
 
         except KeyboardInterrupt:
