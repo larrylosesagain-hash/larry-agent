@@ -1532,21 +1532,31 @@ def check_pending_bets(client: ClobClient):
         except Exception:
             pass
 
-        # Tweet WIN/LOSS only for significant events (avoids spam on small $5 bets)
-        # Win threshold: pnl > $10 | Loss threshold: amount > $8 | always tweet 3+ loss streak
+        # Tweet WIN/LOSS only for big events — daily cap keeps betting tweets minority
+        # Max 4 bet-result tweets/day so engagement content stays the majority (80/20 split)
+        _today = _utcnow().strftime("%Y-%m-%d")
+        _bet_tweet_key = f"bet_tweet_count_{_today}"
+        try:
+            _bet_tweet_count = int(get_state(_bet_tweet_key) or "0")
+        except (ValueError, TypeError):
+            _bet_tweet_count = 0
+
         _bet_amount = float(bet.get("amount_usdc", 5.0))
         _payout     = float(bet.get("payout_usdc", 0.0)) if won else 0.0
         _win_pnl    = _payout - _bet_amount
         _loss_streak = get_win_streak() <= -3  # negative streak = consecutive losses
         _should_tweet = (
-            (won and _win_pnl >= 10.0) or
-            (not won and _bet_amount >= 8.0) or
-            _loss_streak
+            _bet_tweet_count < 4 and (
+                (won and _win_pnl >= 15.0) or          # raised: only notable wins
+                (not won and _bet_amount >= 12.0) or    # raised: only notable losses
+                _loss_streak                            # always tweet loss streak
+            )
         )
         if _should_tweet:
             try:
                 tweet_data = ask_larry_for_tweet("WIN" if won else "LOSS", extra_data=bet)
                 post_tweet(tweet_data["tweet"], tweet_type="WIN" if won else "LOSS", bet_id=bet["id"])
+                set_state(_bet_tweet_key, str(_bet_tweet_count + 1))
             except Exception as e:
                 log.error(f"Failed to post resolution tweet: {e}")
 
@@ -1937,12 +1947,20 @@ def run_betting_agent():
 
         # ── POST-CYCLE TWEETS ─────────────────────────────────────────────────
 
-        # Digest tweet: one tweet for all bets placed this cycle (replaces N per-bet tweets)
-        if bets_placed_this_cycle:
+        # Digest tweet: only when 3+ bets placed AND daily digest cap not reached (max 2/day)
+        # Keeps betting info tweets minority — majority of slots go to engagement content
+        _today = _utcnow().strftime("%Y-%m-%d")
+        _digest_key = f"digest_tweet_count_{_today}"
+        try:
+            _digest_count = int(get_state(_digest_key) or "0")
+        except (ValueError, TypeError):
+            _digest_count = 0
+        if bets_placed_this_cycle and len(bets_placed_this_cycle) >= 3 and _digest_count < 2:
             try:
                 digest = ask_larry_for_tweet("BET_DIGEST", {"bets": bets_placed_this_cycle})
                 if digest.get("tweet"):
                     post_tweet(digest["tweet"], tweet_type="BET_DIGEST")
+                    set_state(_digest_key, str(_digest_count + 1))
                     log.info(f"📣 Digest tweet: {len(bets_placed_this_cycle)} bets → 1 tweet")
             except Exception as e:
                 log.debug(f"Digest tweet failed: {e}")
