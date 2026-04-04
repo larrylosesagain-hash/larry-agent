@@ -4,10 +4,13 @@ All data lives here: bets, tweets, bankroll history, expenses
 """
 
 import sqlite3
-import os
-from datetime import datetime
+from datetime import datetime, timezone
+from config import DB_PATH
 
-DB_PATH = os.environ.get("DB_PATH", "larry.db")
+
+def utcnow() -> datetime:
+    """Return current UTC time as naive datetime (replaces deprecated datetime.utcnow())."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def get_connection():
@@ -163,24 +166,31 @@ def get_grandma_balance() -> float:
     return float(row["value"]) if row else 0.0
 
 
-def update_grandma(event_type: str, amount: float, note: str = ""):
-    balance = get_grandma_balance()
-    if event_type in ("DEPOSIT", "LUXURY_SAVE"):
-        new_balance = balance + amount
-    else:  # INJECT
-        new_balance = balance - amount
-
+def update_grandma(event_type: str, amount: float, note: str = "") -> float:
+    """Atomic read-modify-write for grandma balance — single connection, no race condition."""
     conn = get_connection()
-    conn.execute(
-        "INSERT OR REPLACE INTO agent_state (key, value) VALUES ('grandma_balance', ?)",
-        (str(new_balance),)
-    )
-    conn.execute(
-        "INSERT INTO grandma_wallet (event_type, amount, balance_after, note) VALUES (?, ?, ?, ?)",
-        (event_type, amount, new_balance, note)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        row = conn.execute(
+            "SELECT value FROM agent_state WHERE key = 'grandma_balance'"
+        ).fetchone()
+        balance = float(row["value"]) if row else 0.0
+
+        if event_type in ("DEPOSIT", "LUXURY_SAVE"):
+            new_balance = balance + amount
+        else:  # INJECT
+            new_balance = balance - amount
+
+        conn.execute(
+            "INSERT OR REPLACE INTO agent_state (key, value) VALUES ('grandma_balance', ?)",
+            (str(new_balance),)
+        )
+        conn.execute(
+            "INSERT INTO grandma_wallet (event_type, amount, balance_after, note) VALUES (?, ?, ?, ?)",
+            (event_type, amount, new_balance, note)
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return new_balance
 
 
@@ -233,7 +243,10 @@ def get_recent_bets(limit=10) -> list:
 
 
 def get_win_streak() -> int:
-    """Count consecutive wins from most recent resolved bets."""
+    """
+    Count consecutive wins or losses from most recent resolved bets.
+    Returns positive int for win streak, negative int for loss streak, 0 if no history.
+    """
     conn = get_connection()
     rows = conn.execute("""
         SELECT status FROM bets
@@ -242,13 +255,16 @@ def get_win_streak() -> int:
         LIMIT 20
     """).fetchall()
     conn.close()
+    if not rows:
+        return 0
+    first = rows[0]["status"]
     streak = 0
     for row in rows:
-        if row["status"] == "WON":
+        if row["status"] == first:
             streak += 1
         else:
             break
-    return streak
+    return streak if first == "WON" else -streak
 
 
 # ─── TWEET HELPERS ────────────────────────────────────────────────────────────

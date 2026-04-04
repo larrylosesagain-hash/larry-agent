@@ -18,7 +18,7 @@ import logging
 import threading
 import requests
 import tweepy
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from config import (
     TWITTER_API_KEY, TWITTER_API_SECRET,
     TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET,
@@ -31,36 +31,27 @@ from config import (
 from database import (
     save_tweet, get_last_tweet_time, get_today_tweet_count,
     get_bankroll, get_state, set_state, init_db, get_connection,
-    get_pending_bets,
+    get_pending_bets, utcnow as _utcnow,
 )
 from larry_brain import ask_larry_for_tweet, ask_larry_to_reply_vip, ask_larry_to_reply
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [TWITTER] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
 log = logging.getLogger(__name__)
 
 
-def _utcnow() -> datetime:
-    """Return current UTC time as naive datetime. Replaces datetime.utcnow() (deprecated Python 3.12+)."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
 # ─── CONTENT SAFETY FILTER ───────────────────────────────────────────────────
-# Two-layer filter: fast keyword blacklist — never engage with this content
-_SCAM_KEYWORDS = [
+# Fast keyword blacklist — never engage with scam or harmful content.
+# frozenset: immutable, O(1) membership check, hashable.
+_UNSAFE_KEYWORDS: frozenset = frozenset([
+    # scam / pump signals
     "airdrop", "presale", "whitelist", "mint now", "free nft", "send eth",
     "send bnb", "send usdt", "send sol", "dm for", "guaranteed profit",
     "100x", "1000x", "get rich", "passive income", "copy trade", "signal group",
     "pump incoming", "giveaway", "retweet to win", "follow to win",
     "click link in bio", "limited offer", "buy now before", "next 100x",
     "join our group", "free crypto", "earn daily",
-]
-_HARMFUL_KEYWORDS = [
+    # harmful
     "kill yourself", "kys", "how to make bomb", "suicide method",
-]
+])
 
 def _is_safe_to_engage(text: str) -> bool:
     """
@@ -68,13 +59,11 @@ def _is_safe_to_engage(text: str) -> bool:
     No Claude call needed — pure keyword matching.
     """
     text_lower = text.lower()
-    for kw in _SCAM_KEYWORDS + _HARMFUL_KEYWORDS:
-        if kw in text_lower:
-            return False
-    # Spam signals
-    if text.count("#") > 4:       return False  # hashtag spam
-    if text.count("@") > 3:       return False  # mention spam
-    if text.lower().count("http") > 2: return False  # link spam
+    if any(kw in text_lower for kw in _UNSAFE_KEYWORDS):
+        return False
+    if text.count("#") > 4:            return False  # hashtag spam
+    if text.count("@") > 3:            return False  # mention spam
+    if text_lower.count("http") > 2:   return False  # link spam
     return True
 
 # Cached Larry's user ID — avoid get_me() every 15 minutes
@@ -431,8 +420,6 @@ def maybe_tweet_weekly_recap():
         return  # already done this Sunday
 
     # Build weekly stats from database
-    # FIX: use try/finally to guarantee connection is always closed
-    from database import get_connection
     conn = get_connection()
     try:
         week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")
