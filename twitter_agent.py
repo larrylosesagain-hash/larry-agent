@@ -1404,8 +1404,8 @@ def run_twitter_agent():
             # 3. Friday pizza
             maybe_tweet_pizza()
 
-            # 4. Organic tweet
-            if should_tweet_now():
+            # 4. Organic tweet — check cap BEFORE calling Claude API (saves tokens)
+            if not _is_daily_cap_reached() and should_tweet_now():
                 bankroll = get_bankroll()
                 tweet_type = "SURVIVAL" if bankroll < 80 else "RANDOM"
                 tweet_data = ask_larry_for_tweet(tweet_type)

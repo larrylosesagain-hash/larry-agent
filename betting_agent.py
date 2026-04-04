@@ -107,7 +107,8 @@ from config import (
     POLYMARKET_PRIVATE_KEY, POLYMARKET_FUNDER,
     POLYMARKET_HOST, POLYMARKET_GAMMA_API,
     BET_CHECK_INTERVAL_MINUTES,
-    ABSOLUTE_MIN_BET, ABSOLUTE_MAX_BET
+    ABSOLUTE_MIN_BET, ABSOLUTE_MAX_BET,
+    MAX_OPEN_BETS, BANKROLL_RESERVE_PCT,
 )
 from database import (
     get_bankroll, set_bankroll, get_pending_bets, save_bet, resolve_bet,
@@ -413,7 +414,7 @@ def _build_relay_service():
     clob = get_clob_client()
     service = PolyWeb3Service(clob_client=clob, relayer_client=relay_client)
     svc_methods = [m for m in dir(service) if not m.startswith("_")]
-    log.info(f"🔧 PolyWeb3Service methods: {svc_methods}")
+    log.debug(f"🔧 PolyWeb3Service methods: {svc_methods}")  # debug only — not needed every cycle
     return service, svc_methods
 
 
@@ -435,6 +436,8 @@ def sweep_unclaimed_winnings(client: ClobClient) -> bool:
         return False
     sweep_unclaimed_winnings._last_ran = now_ts
 
+    _REDEEM_FAIL_ALERT_THRESHOLD = 6  # alert after ~3 hours of consecutive failures (30 min cycles)
+
     try:
         service, _ = _build_relay_service()
         if not hasattr(service, "redeem_all"):
@@ -443,13 +446,31 @@ def sweep_unclaimed_winnings(client: ClobClient) -> bool:
         result = service.redeem_all()
         if result:
             log.info(f"✅ Sweep claimed winnings! result={str(result)[:200]}")
+            # Reset consecutive failure counter on success
+            set_state("redeem_consecutive_failures", "0")
             sync_bankroll_from_clob(client)
             return True
         else:
-            log.info("🧹 Sweep: redeem_all returned [] — nothing redeemable yet (or builder_config still broken)")
+            # Track consecutive failures — may indicate builder_config is broken
+            _fail_count = int(get_state("redeem_consecutive_failures") or "0") + 1
+            set_state("redeem_consecutive_failures", str(_fail_count))
+            log.info(f"🧹 Sweep: redeem_all returned [] — nothing redeemable yet (or builder_config still broken) [fail #{_fail_count}]")
+            if _fail_count >= _REDEEM_FAIL_ALERT_THRESHOLD:
+                log.warning(
+                    f"🚨 redeem_all has returned [] for {_fail_count} consecutive cycles! "
+                    f"Winnings may be stuck. Manual claim at: https://polymarket.com/portfolio "
+                    f"(check 'Redeemable' tab). Root cause: POST /auth/api-key likely returning 400."
+                )
             return False
     except Exception as e:
-        log.warning(f"🧹 Sweep failed ({type(e).__name__}: {e})")
+        _fail_count = int(get_state("redeem_consecutive_failures") or "0") + 1
+        set_state("redeem_consecutive_failures", str(_fail_count))
+        log.warning(f"🧹 Sweep failed ({type(e).__name__}: {e}) [fail #{_fail_count}]")
+        if _fail_count >= _REDEEM_FAIL_ALERT_THRESHOLD:
+            log.warning(
+                f"🚨 redeem_all has failed for {_fail_count} consecutive cycles! "
+                f"Winnings may be stuck. Manual claim at: https://polymarket.com/portfolio"
+            )
         return False
 
 
@@ -1505,15 +1526,15 @@ def check_pending_bets(client: ClobClient):
                 bankroll = get_bankroll()
                 new_balance = bankroll + payout
                 set_bankroll(new_balance, payout, "WIN")
-                log.info(f"🎉 WON ${payout:.2f} + auto-claimed! New bankroll: ${new_balance:.2f}")
+                log.info(f"🎉 WON ${payout:.2f} + auto-claimed! [{bet.get('question', '?')[:50]}] New bankroll: ${new_balance:.2f}")
             else:
                 # Don't inflate bankroll — CLOB doesn't have the money yet.
                 # polymarket.com → claim manually (gasless) → bankroll syncs on next restart.
-                log.info(f"🎉 WON ${payout:.2f} — claim on polymarket.com (bankroll syncs on next restart)")
+                log.info(f"🎉 WON ${payout:.2f} — claim on polymarket.com [{bet.get('question', '?')[:50]}] (bankroll syncs on next restart)")
         else:
             resolve_bet(bet["polymarket_id"], False, 0.0)
             bankroll = get_bankroll()
-            log.info(f"💀 LOST ${bet['amount_usdc']:.2f}. Bankroll: ${bankroll:.2f}")
+            log.info(f"💀 LOST ${bet['amount_usdc']:.2f}. Bankroll: ${bankroll:.2f} [{bet.get('question', '?')[:50]}]")
 
         # Increment recap counter — tracks how many bets resolved since last DAILY_RECAP tweet
         try:
@@ -1715,23 +1736,32 @@ def run_betting_agent():
                 open_exposure = sum(float(b.get("amount_usdc", 0)) for b in open_bets)
                 log.info(f"💼 Bankroll: ${bankroll:.2f} free | ~${open_exposure:.2f} cost in {len(open_bets)} open bets (Gamma unavailable)")
             markets = None  # always initialize before bankroll branches so `if markets:` below never raises UnboundLocalError
+
+            # ── Compute reserve floor: always keep BANKROLL_RESERVE_PCT liquid ──
+            # e.g. bankroll=$80 → reserve=$16 → max deployable=$64 → ~12 slots at $5
+            total_portfolio = bankroll + (positions_value if positions_value > 0 else 0)
+            reserve_floor = max(5.0, total_portfolio * BANKROLL_RESERVE_PCT)
+            bettable_cash  = bankroll - reserve_floor  # can be negative — that's fine, handled below
+
             if bankroll <= 0:
                 log.info("No free bankroll remaining — waiting for open bets to resolve")
+            elif len(open_bets) >= MAX_OPEN_BETS:
+                # ── Position cap: too many open bets, wait for some to resolve ──
+                log.info(
+                    f"💤 {len(open_bets)} open positions ≥ cap {MAX_OPEN_BETS} — "
+                    f"waiting for some to resolve before placing more. ${bankroll:.2f} reserved."
+                )
             else:
-                # 3b. If bankroll too low to bet ($5 min), wait for open bets to resolve.
-                #     Larry only sells positions he's genuinely changed his mind on — not
-                #     just to free capital for the next bet.  Forcing a sell-to-bet cycle
-                #     destroys value: you exit a position you believe in just to enter a
-                #     new one.  Better to be patient and let winners resolve.
-                if bankroll < 5.0 and open_bets:
+                # 3b. If bettable cash (after reserve) < $5, hold.
+                if bettable_cash < 5.0 and open_bets:
                     log.info(
-                        f"💤 Bankroll ${bankroll:.2f} < $5 — waiting for open positions to resolve. "
-                        f"Larry holds his convictions."
+                        f"💤 Bettable cash ${bettable_cash:.2f} < $5 (bankroll=${bankroll:.2f}, "
+                        f"reserve=${reserve_floor:.2f}) — holding until positions resolve."
                     )
 
-                # Guard: if under $5, skip Claude entirely.
-                if bankroll < 5.0:
-                    log.info(f"💤 Bankroll ${bankroll:.2f} < $5 minimum — skipping market scan until capital frees up")
+                # Guard: if bettable cash < $5, skip Claude entirely.
+                if bettable_cash < 5.0:
+                    log.info(f"💤 Bettable cash ${bettable_cash:.2f} < $5 minimum — skipping market scan")
                 else:
                     # 4. Fetch markets — three parallel Gamma batches, 24h window
                     markets = fetch_active_markets()
@@ -1791,6 +1821,11 @@ def run_betting_agent():
 
                         if get_bankroll() <= 0:
                             log.info("Bankroll empty — stopping mid-loop")
+                            break
+
+                        # Position cap mid-loop: stop if we've hit MAX_OPEN_BETS
+                        if len(mid_loop_bets) >= MAX_OPEN_BETS:
+                            log.info(f"💤 Position cap {MAX_OPEN_BETS} reached mid-loop — holding remaining decisions")
                             break
 
                         # Resolve market_info once — reused for DB save and odds
