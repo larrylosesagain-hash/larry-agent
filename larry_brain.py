@@ -331,11 +331,13 @@ def _get_recent_tweet_texts(limit: int = 3) -> list:
     """Fetch recent tweet texts from DB to avoid repetition. Truncated to save tokens."""
     try:
         conn = get_connection()
-        rows = conn.execute(
-            "SELECT content, tweet_type FROM tweets ORDER BY posted_at DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
-        conn.close()
+        try:
+            rows = conn.execute(
+                "SELECT content, tweet_type FROM tweets ORDER BY posted_at DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        finally:
+            conn.close()
         # Truncate to 80 chars — enough to detect repetition, not enough to waste tokens
         return [{"text": r["content"][:80], "type": r["tweet_type"]} for r in rows]
     except Exception:

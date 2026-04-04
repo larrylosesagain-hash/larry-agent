@@ -4,7 +4,6 @@ All data lives here: bets, tweets, bankroll history, expenses
 """
 
 import sqlite3
-import os
 from datetime import datetime, timezone
 from config import DB_PATH
 
@@ -244,7 +243,10 @@ def get_recent_bets(limit=10) -> list:
 
 
 def get_win_streak() -> int:
-    """Count consecutive wins from most recent resolved bets."""
+    """
+    Count consecutive wins or losses from most recent resolved bets.
+    Returns positive int for win streak, negative int for loss streak, 0 if no history.
+    """
     conn = get_connection()
     rows = conn.execute("""
         SELECT status FROM bets
@@ -253,13 +255,16 @@ def get_win_streak() -> int:
         LIMIT 20
     """).fetchall()
     conn.close()
+    if not rows:
+        return 0
+    first = rows[0]["status"]
     streak = 0
     for row in rows:
-        if row["status"] == "WON":
+        if row["status"] == first:
             streak += 1
         else:
             break
-    return streak
+    return streak if first == "WON" else -streak
 
 
 # ─── TWEET HELPERS ────────────────────────────────────────────────────────────

@@ -39,18 +39,19 @@ log = logging.getLogger(__name__)
 
 
 # ─── CONTENT SAFETY FILTER ───────────────────────────────────────────────────
-# Two-layer filter: fast keyword blacklist — never engage with this content
-_SCAM_KEYWORDS = [
+# Fast keyword blacklist — never engage with scam or harmful content.
+# frozenset: immutable, O(1) membership check, hashable.
+_UNSAFE_KEYWORDS: frozenset = frozenset([
+    # scam / pump signals
     "airdrop", "presale", "whitelist", "mint now", "free nft", "send eth",
     "send bnb", "send usdt", "send sol", "dm for", "guaranteed profit",
     "100x", "1000x", "get rich", "passive income", "copy trade", "signal group",
     "pump incoming", "giveaway", "retweet to win", "follow to win",
     "click link in bio", "limited offer", "buy now before", "next 100x",
     "join our group", "free crypto", "earn daily",
-]
-_HARMFUL_KEYWORDS = [
+    # harmful
     "kill yourself", "kys", "how to make bomb", "suicide method",
-]
+])
 
 def _is_safe_to_engage(text: str) -> bool:
     """
@@ -58,13 +59,11 @@ def _is_safe_to_engage(text: str) -> bool:
     No Claude call needed — pure keyword matching.
     """
     text_lower = text.lower()
-    for kw in _SCAM_KEYWORDS + _HARMFUL_KEYWORDS:
-        if kw in text_lower:
-            return False
-    # Spam signals
-    if text.count("#") > 4:       return False  # hashtag spam
-    if text.count("@") > 3:       return False  # mention spam
-    if text.lower().count("http") > 2: return False  # link spam
+    if any(kw in text_lower for kw in _UNSAFE_KEYWORDS):
+        return False
+    if text.count("#") > 4:            return False  # hashtag spam
+    if text.count("@") > 3:            return False  # mention spam
+    if text_lower.count("http") > 2:   return False  # link spam
     return True
 
 # Cached Larry's user ID — avoid get_me() every 15 minutes
@@ -421,8 +420,6 @@ def maybe_tweet_weekly_recap():
         return  # already done this Sunday
 
     # Build weekly stats from database
-    # FIX: use try/finally to guarantee connection is always closed
-    from database import get_connection
     conn = get_connection()
     try:
         week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")

@@ -106,6 +106,7 @@ from config import (
     BET_CHECK_INTERVAL_MINUTES,
     ABSOLUTE_MIN_BET, ABSOLUTE_MAX_BET,
     MAX_OPEN_BETS, BANKROLL_RESERVE_PCT,
+    DB_PATH,
 )
 from database import (
     get_bankroll, set_bankroll, get_pending_bets, save_bet, resolve_bet,
@@ -1067,8 +1068,6 @@ def collect_near_resolved_positions(client: ClobClient) -> float:
                 _collect_pnl = estimated - float(bet.get("amount_usdc", 5.0))
                 if _collect_pnl >= 8.0:
                     try:
-                        from larry_brain import ask_larry_for_tweet
-                        from twitter_agent import post_tweet
                         ctx = {
                             "question": bet.get("question", ""),
                             "outcome": bet.get("outcome", ""),
@@ -1273,8 +1272,6 @@ def try_sell_positions_for_capital(client: ClobClient, needed: float = 5.0) -> f
                 # Tweet SOLD only for meaningful positions ($10+ proceeds) — small sells are noise
                 if estimated_proceeds >= 10.0:
                     try:
-                        from larry_brain import ask_larry_for_tweet
-                        from twitter_agent import post_tweet
                         _sell_ctx = {
                             "question": bet.get("question", ""),
                             "outcome":  bet.get("outcome", ""),
@@ -1655,10 +1652,10 @@ def run_betting_agent():
     # (twitter agent + betting agent both write to the same DB simultaneously)
     try:
         import sqlite3
-        with sqlite3.connect("/app/data/larry.db") as _conn:
+        with sqlite3.connect(DB_PATH) as _conn:
             _conn.execute("PRAGMA journal_mode=WAL")
             _conn.execute("PRAGMA busy_timeout=5000")  # wait up to 5s if locked
-        log.info("✅ SQLite WAL mode enabled")
+        log.info("✅ SQLite WAL mode + busy_timeout enabled")
     except Exception as e:
         log.debug(f"WAL mode setup skipped: {e}")  # non-critical
 
