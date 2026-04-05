@@ -113,6 +113,7 @@ from database import (
     init_db, get_state, set_state, get_connection, get_win_streak, utcnow as _utcnow
 )
 from larry_brain import ask_larry_to_bet, ask_larry_for_tweet, ask_larry_to_sell
+import github_logger as gh_log
 
 log = logging.getLogger(__name__)
 
@@ -1516,14 +1517,17 @@ def check_pending_bets(client: ClobClient):
                 new_balance = bankroll + payout
                 set_bankroll(new_balance, payout, "WIN")
                 log.info(f"🎉 WON ${payout:.2f} + auto-claimed! [{bet.get('question', '?')[:50]}] New bankroll: ${new_balance:.2f}")
+                gh_log.log_bet_won(bet.get("question", "?"), bet.get("outcome", "?"), payout, new_balance)
             else:
                 # Don't inflate bankroll — CLOB doesn't have the money yet.
                 # polymarket.com → claim manually (gasless) → bankroll syncs on next restart.
                 log.info(f"🎉 WON ${payout:.2f} — claim on polymarket.com [{bet.get('question', '?')[:50]}] (bankroll syncs on next restart)")
+                gh_log.log_bet_won(bet.get("question", "?"), bet.get("outcome", "?"), payout, get_bankroll())
         else:
             resolve_bet(bet["polymarket_id"], False, 0.0)
             bankroll = get_bankroll()
             log.info(f"💀 LOST ${bet['amount_usdc']:.2f}. Bankroll: ${bankroll:.2f} [{bet.get('question', '?')[:50]}]")
+            gh_log.log_bet_lost(bet.get("question", "?"), bet.get("outcome", "?"), float(bet.get("amount_usdc", 0)), bankroll)
 
         # Increment recap counter — tracks how many bets resolved since last DAILY_RECAP tweet
         try:
@@ -1905,6 +1909,14 @@ def run_betting_agent():
                                 odds = max(0.01, min(round(1 - raw_yes, 4), 0.99))
                             potential_payout = actual_amount / odds
 
+                            gh_log.log_bet_placed(
+                                question=market_info.get("question", "Unknown market"),
+                                outcome=outcome_for_odds,
+                                amount=actual_amount,
+                                odds=odds,
+                                bankroll=new_balance,
+                            )
+
                             bet_id = None
                             q_text = market_info.get("question", "Unknown market")
                             for _db_attempt in range(4):
@@ -1949,6 +1961,7 @@ def run_betting_agent():
             err_str = str(e).lower()
             # SECURITY: no exc_info (traceback can expose env vars/keys)
             log.error(f"Unexpected error in betting loop: {type(e).__name__}: {e}")
+            gh_log.log_error("betting loop", e)
             # DB lock at cycle level: short backoff then continue normally
             if "locked" in err_str or "operationalerror" in type(e).__name__.lower():
                 log.warning("DB locked at cycle level — sleeping 10s then retrying")
