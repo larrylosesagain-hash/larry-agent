@@ -339,6 +339,80 @@ def get_positions_value() -> tuple[float, int]:
         return 0.0, 0
 
 
+def get_clob_condition_ids() -> set[str]:
+    """
+    Fetch condition IDs of all currently open CLOB positions via Data API.
+    Used to detect ghost bets: DB pending bets no longer in CLOB positions.
+    Returns empty set on any error so callers degrade gracefully.
+    """
+    try:
+        resp = requests.get(
+            f"{_POLYMARKET_DATA_API}/positions",
+            params={"user": POLYMARKET_FUNDER, "sizeThreshold": "0.01"},
+            timeout=10,
+        )
+        if not resp.ok:
+            return set()
+        positions = resp.json()
+        if not isinstance(positions, list):
+            return set()
+        ids: set[str] = set()
+        for p in positions:
+            # Polymarket Data API uses "conditionId" field
+            cid = p.get("conditionId") or p.get("condition_id") or p.get("market_id") or ""
+            if cid:
+                ids.add(cid.lower())
+        return ids
+    except Exception:
+        return set()
+
+
+def resolve_ghost_bets() -> int:
+    """
+    Find DB pending bets no longer present in CLOB positions and force-resolve them.
+    These are bets that resolved on-chain (and were swept by redeem_all) but whose
+    resolution wasn't detected by check_pending_bets due to CLOB API lag.
+    Returns count of ghost bets resolved.
+    """
+    clob_ids = get_clob_condition_ids()
+    if not clob_ids:
+        return 0  # Can't determine — skip to avoid false positives
+
+    pending = get_pending_bets()
+    if not pending:
+        return 0
+
+    resolved_count = 0
+    for bet in pending:
+        cid = (bet.get("polymarket_id") or "").lower()
+        if cid and cid not in clob_ids:
+            # Bet is in DB pending but no longer in CLOB positions — it resolved
+            # Try gamma to determine win/loss; default to loss if unknown
+            gamma_result = _check_gamma_for_resolution(cid, bet)
+            if gamma_result:
+                won = gamma_result["won"]
+                payout = gamma_result["payout"]
+            else:
+                # Can't determine outcome — assume loss (conservative)
+                won = False
+                payout = 0.0
+            resolve_bet(cid, won, payout)
+            if won and payout > 0:
+                bankroll = get_bankroll()
+                new_balance = bankroll + payout
+                set_bankroll(new_balance, payout, "WIN")
+                log.info(f"👻 Ghost bet resolved as WON: {bet.get('question','?')[:50]} +${payout:.2f}")
+                gh_log.log_bet_won(bet.get("question","?"), bet.get("outcome","?"), payout, new_balance)
+            else:
+                log.info(f"👻 Ghost bet resolved as LOST: {bet.get('question','?')[:50]}")
+                gh_log.log_bet_lost(bet.get("question","?"), bet.get("outcome","?"), float(bet.get("amount_usdc",0)), get_bankroll())
+            resolved_count += 1
+
+    if resolved_count:
+        log.info(f"👻 Resolved {resolved_count} ghost bet(s) missing from CLOB positions")
+    return resolved_count
+
+
 
 
 def _get_all_bet_market_ids() -> set:
@@ -1724,7 +1798,11 @@ def run_betting_agent():
             # 2. Check if pending bets resolved — claims newly resolved positions
             check_pending_bets(client)
 
-            # 2. Check free bankroll — bet until it hits zero (no exposure cap)
+            # 2b. Ghost bet reconciliation: resolve DB pending bets no longer in CLOB positions.
+            # Catches bets swept by redeem_all() that check_pending_bets missed due to CLOB API lag.
+            resolve_ghost_bets()
+
+            # 3. Check free bankroll — bet until it hits zero (no exposure cap)
             open_bets = get_pending_bets()
             bankroll = get_bankroll()
             positions_value, n_positions = get_positions_value()
