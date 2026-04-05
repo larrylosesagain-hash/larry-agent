@@ -1640,9 +1640,9 @@ def check_pending_bets(client: ClobClient):
         _win_pnl    = _payout - _bet_amount
         _loss_streak = get_win_streak() <= -3  # negative streak = consecutive losses
         _should_tweet = (
-            _bet_tweet_count < 4 and (
-                (won and _win_pnl >= 15.0) or          # raised: only notable wins
-                (not won and _bet_amount >= 12.0) or    # raised: only notable losses
+            _bet_tweet_count < 1 and (                  # max 1 bet-result tweet per day
+                (won and _win_pnl >= 10.0) or          # notable win
+                (not won and _bet_amount >= 10.0) or    # notable loss
                 _loss_streak                            # always tweet loss streak
             )
         )
@@ -2072,7 +2072,7 @@ def run_betting_agent():
             _digest_count = int(get_state(_digest_key) or "0")
         except (ValueError, TypeError):
             _digest_count = 0
-        if bets_placed_this_cycle and len(bets_placed_this_cycle) >= 3 and _digest_count < 2:
+        if bets_placed_this_cycle and len(bets_placed_this_cycle) >= 3 and _digest_count < 1:  # max 1 digest/day
             try:
                 digest = ask_larry_for_tweet("BET_DIGEST", {"bets": bets_placed_this_cycle})
                 if digest.get("tweet"):
