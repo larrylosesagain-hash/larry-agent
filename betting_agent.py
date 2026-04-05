@@ -407,10 +407,25 @@ def resolve_ghost_bets() -> int:
                 won = gamma_result["won"]
                 payout = gamma_result["payout"]
             else:
-                # Step 3: outcome truly unknown — skip this cycle.
-                # Balance sync already reconciles money; don't spam LOST.
-                log.info(f"👻 Ghost bet outcome unknown — skipping: {bet.get('question','?')[:50]}")
-                continue
+                # Step 3: check age — sports props resolve within hours.
+                # If bet is >12h old and still a ghost, mark as LOST and move on.
+                placed_at_str = bet.get("placed_at") or ""
+                try:
+                    from datetime import datetime, timezone as _tz
+                    placed_dt = datetime.fromisoformat(placed_at_str.replace("Z", "+00:00"))
+                    if placed_dt.tzinfo is None:
+                        placed_dt = placed_dt.replace(tzinfo=_tz.utc)
+                    age_hours = (datetime.now(_tz.utc) - placed_dt).total_seconds() / 3600
+                except Exception:
+                    age_hours = 0
+
+                if age_hours >= 12:
+                    won = False
+                    payout = 0.0
+                    log.info(f"👻 Ghost bet expired (>{age_hours:.0f}h old) — marking LOST: {bet.get('question','?')[:50]}")
+                else:
+                    log.info(f"👻 Ghost bet outcome unknown ({age_hours:.1f}h old) — skipping: {bet.get('question','?')[:50]}")
+                    continue
 
         resolve_bet(cid, won, payout)
         if won and payout > 0:
