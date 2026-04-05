@@ -19,7 +19,10 @@ logging.basicConfig(
 
 from twitter_agent import run_twitter_agent, set_twitter_shutdown, is_twitter_shutdown
 from betting_agent import run_betting_agent, set_betting_shutdown, is_betting_shutdown
+from github_logger import install_log_handler
 log = logging.getLogger(__name__)
+
+install_log_handler()  # stream all logs to GitHub Issue #2 every 5 min
 
 
 def _handle_sigterm(signum, frame):

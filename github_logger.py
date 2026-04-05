@@ -7,9 +7,11 @@ Silently no-ops if token is missing so Larry still runs without it.
 
 import os
 import logging
+import threading
 import urllib.request
 import urllib.error
 import json
+from collections import deque
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
@@ -116,3 +118,74 @@ def log_survival_mode(bankroll: float):
         f"Bankroll dropped to **${bankroll:.2f}**. Larry is in trouble."
     )
     _post_comment(body)
+
+
+# ─── Rolling log handler ──────────────────────────────────────────────────────
+
+class GitHubLogHandler(logging.Handler):
+    """
+    Buffers all log lines and posts them to GitHub Issue #2 every INTERVAL seconds.
+    Keeps only the last MAX_LINES lines so comments stay readable.
+    No-ops silently if GITHUB_TOKEN is missing.
+    """
+
+    INTERVAL  = 5 * 60   # post every 5 minutes
+    MAX_LINES = 100       # keep last 100 lines per dump
+
+    def __init__(self):
+        super().__init__(level=logging.INFO)
+        self._buf: deque = deque(maxlen=self.MAX_LINES)
+        self._lock = threading.Lock()
+        self._timer: threading.Timer | None = None
+        self._start_timer()
+
+    def emit(self, record: logging.LogRecord):
+        if not _GITHUB_TOKEN:
+            return
+        try:
+            line = self.format(record)
+            with self._lock:
+                self._buf.append(line)
+        except Exception:
+            pass
+
+    def _start_timer(self):
+        if not _GITHUB_TOKEN:
+            return
+        self._timer = threading.Timer(self.INTERVAL, self._flush)
+        self._timer.daemon = True
+        self._timer.name = "GitHubLogFlush"
+        self._timer.start()
+
+    def _flush(self):
+        try:
+            with self._lock:
+                if not self._buf:
+                    return
+                lines = list(self._buf)
+                self._buf.clear()
+            block = "\n".join(lines)
+            body = (
+                f"### 📋 Log dump — {_ts()}\n"
+                f"```\n{block}\n```"
+            )
+            _post_comment(body)
+        except Exception:
+            pass
+        finally:
+            self._start_timer()   # reschedule
+
+    def close(self):
+        if self._timer:
+            self._timer.cancel()
+        self._flush()
+        super().close()
+
+
+def install_log_handler():
+    """Call once from main.py to attach the rolling GitHub log handler."""
+    if not _GITHUB_TOKEN:
+        return
+    handler = GitHubLogHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(message)s"))
+    logging.getLogger().addHandler(handler)
