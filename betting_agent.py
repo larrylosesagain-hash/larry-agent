@@ -1752,8 +1752,9 @@ def run_betting_agent():
 
             # Dynamic open-bet cap: based on TOTAL portfolio (free cash + open positions),
             # not just free cash. Free cash alone is misleading when money is locked in bets.
-            # e.g. $78 total → min(20, floor(78/5))=15 slots; $33 total → 6 slots.
-            dynamic_open_bets_cap = max(5, min(MAX_OPEN_BETS, int(total_portfolio / 5)))
+            # divisor=3 reflects Larry's avg ~$3-4 bet size; divisor=5 was too conservative.
+            # e.g. $78 total → min(20, floor(78/3))=20 slots; $30 total → 10 slots.
+            dynamic_open_bets_cap = max(5, min(MAX_OPEN_BETS, int(total_portfolio / 3)))
 
             if bankroll <= 0:
                 log.info("No free bankroll remaining — waiting for open bets to resolve")
