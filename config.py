@@ -49,7 +49,7 @@ DEAD_MAN_SWITCH_HOURS      = 48
 
 # ─── BETTING SCHEDULE ─────────────────────────────────────────────────────────
 BET_CHECK_INTERVAL_MINUTES = 30
-MAX_OPEN_BETS = 12          # hard cap on concurrent open positions
+MAX_OPEN_BETS = 20          # hard cap on concurrent open positions
 BANKROLL_RESERVE_PCT = 0.20  # always keep 20% of bankroll liquid (never deploy everything)
 BET_CATEGORY_MIX = {
     "crypto":   0.35,

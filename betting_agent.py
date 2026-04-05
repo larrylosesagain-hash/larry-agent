@@ -1746,10 +1746,10 @@ def run_betting_agent():
                 reserve_floor = max(5.0, total_portfolio * BANKROLL_RESERVE_PCT)
             bettable_cash  = bankroll - reserve_floor  # can be negative — that's fine, handled below
 
-            # Dynamic open-bet cap: scale with bankroll so a small balance doesn't get
-            # stuck behind 12 phantom open positions. Min 3 slots, max MAX_OPEN_BETS.
-            # e.g. $33 → floor(33/5)=6 slots; $100 → 12 slots (capped).
-            dynamic_open_bets_cap = max(3, min(MAX_OPEN_BETS, int(bankroll / 5)))
+            # Dynamic open-bet cap: based on TOTAL portfolio (free cash + open positions),
+            # not just free cash. Free cash alone is misleading when money is locked in bets.
+            # e.g. $78 total → min(20, floor(78/5))=15 slots; $33 total → 6 slots.
+            dynamic_open_bets_cap = max(5, min(MAX_OPEN_BETS, int(total_portfolio / 5)))
 
             if bankroll <= 0:
                 log.info("No free bankroll remaining — waiting for open bets to resolve")
