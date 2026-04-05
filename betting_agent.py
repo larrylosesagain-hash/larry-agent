@@ -1736,19 +1736,28 @@ def run_betting_agent():
                 log.info(f"💼 Bankroll: ${bankroll:.2f} free | ~${open_exposure:.2f} cost in {len(open_bets)} open bets (Gamma unavailable)")
             markets = None  # always initialize before bankroll branches so `if markets:` below never raises UnboundLocalError
 
-            # ── Compute reserve floor: always keep BANKROLL_RESERVE_PCT liquid ──
-            # e.g. bankroll=$80 → reserve=$16 → max deployable=$64 → ~12 slots at $5
+            # ── Compute reserve floor: scale reserve with bankroll size ──
+            # Small bankroll (<$50): keep only $5 reserve so Larry can still bet.
+            # Normal bankroll: keep BANKROLL_RESERVE_PCT (20%) liquid.
             total_portfolio = bankroll + (positions_value if positions_value > 0 else 0)
-            reserve_floor = max(5.0, total_portfolio * BANKROLL_RESERVE_PCT)
+            if bankroll < 50.0:
+                reserve_floor = 5.0  # flat $5 reserve when bankroll is small
+            else:
+                reserve_floor = max(5.0, total_portfolio * BANKROLL_RESERVE_PCT)
             bettable_cash  = bankroll - reserve_floor  # can be negative — that's fine, handled below
+
+            # Dynamic open-bet cap: scale with bankroll so a small balance doesn't get
+            # stuck behind 12 phantom open positions. Min 3 slots, max MAX_OPEN_BETS.
+            # e.g. $33 → floor(33/5)=6 slots; $100 → 12 slots (capped).
+            dynamic_open_bets_cap = max(3, min(MAX_OPEN_BETS, int(bankroll / 5)))
 
             if bankroll <= 0:
                 log.info("No free bankroll remaining — waiting for open bets to resolve")
-            elif len(open_bets) >= MAX_OPEN_BETS:
+            elif len(open_bets) >= dynamic_open_bets_cap:
                 # ── Position cap: too many open bets, wait for some to resolve ──
                 log.info(
-                    f"💤 {len(open_bets)} open positions ≥ cap {MAX_OPEN_BETS} — "
-                    f"waiting for some to resolve before placing more. ${bankroll:.2f} reserved."
+                    f"💤 {len(open_bets)} open positions ≥ cap {dynamic_open_bets_cap} "
+                    f"(dynamic, bankroll=${bankroll:.2f}) — waiting for some to resolve."
                 )
             else:
                 # 3b. If bettable cash (after reserve) < $5, hold.
