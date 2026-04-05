@@ -1528,6 +1528,11 @@ def run_stream_worker():
     """
     log.info("📡 Filtered Stream worker starting...")
 
+    # On fresh startup, wait 30s to allow the previous container's stream
+    # connection to time out before we try to connect (avoids 429 TooManyConnections).
+    log.info("📡 Waiting 30s for any previous stream connections to expire...")
+    time.sleep(30)
+
     while not _twitter_shutdown:
         try:
             stream = LarryStreamClient(

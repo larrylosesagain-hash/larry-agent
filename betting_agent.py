@@ -372,6 +372,12 @@ def resolve_ghost_bets() -> int:
     Find DB pending bets no longer present in CLOB positions and force-resolve them.
     These are bets that resolved on-chain (and were swept by redeem_all) but whose
     resolution wasn't detected by check_pending_bets due to CLOB API lag.
+
+    Resolution order:
+    1. _check_single_bet — uses CTF on-chain + CLOB market endpoint (most reliable)
+    2. _check_gamma_for_resolution — gamma API fallback
+    3. Skip — if outcome truly unknown, don't assume LOST (balance sync handles money)
+
     Returns count of ghost bets resolved.
     """
     clob_ids = get_clob_condition_ids()
@@ -385,28 +391,38 @@ def resolve_ghost_bets() -> int:
     resolved_count = 0
     for bet in pending:
         cid = (bet.get("polymarket_id") or "").lower()
-        if cid and cid not in clob_ids:
-            # Bet is in DB pending but no longer in CLOB positions — it resolved
-            # Try gamma to determine win/loss; default to loss if unknown
+        if not cid or cid in clob_ids:
+            continue
+
+        # Bet is in DB pending but no longer in CLOB positions — it resolved.
+        # Step 1: try _check_single_bet (CTF on-chain + CLOB market endpoint)
+        result = _check_single_bet(bet)
+        if result:
+            won = result["won"]
+            payout = result["payout"]
+        else:
+            # Step 2: try gamma API
             gamma_result = _check_gamma_for_resolution(cid, bet)
             if gamma_result:
                 won = gamma_result["won"]
                 payout = gamma_result["payout"]
             else:
-                # Can't determine outcome — assume loss (conservative)
-                won = False
-                payout = 0.0
-            resolve_bet(cid, won, payout)
-            if won and payout > 0:
-                bankroll = get_bankroll()
-                new_balance = bankroll + payout
-                set_bankroll(new_balance, payout, "WIN")
-                log.info(f"👻 Ghost bet resolved as WON: {bet.get('question','?')[:50]} +${payout:.2f}")
-                gh_log.log_bet_won(bet.get("question","?"), bet.get("outcome","?"), payout, new_balance)
-            else:
-                log.info(f"👻 Ghost bet resolved as LOST: {bet.get('question','?')[:50]}")
-                gh_log.log_bet_lost(bet.get("question","?"), bet.get("outcome","?"), float(bet.get("amount_usdc",0)), get_bankroll())
-            resolved_count += 1
+                # Step 3: outcome truly unknown — skip this cycle.
+                # Balance sync already reconciles money; don't spam LOST.
+                log.info(f"👻 Ghost bet outcome unknown — skipping: {bet.get('question','?')[:50]}")
+                continue
+
+        resolve_bet(cid, won, payout)
+        if won and payout > 0:
+            bankroll = get_bankroll()
+            new_balance = bankroll + payout
+            set_bankroll(new_balance, payout, "WIN")
+            log.info(f"👻 Ghost bet resolved as WON: {bet.get('question','?')[:50]} +${payout:.2f}")
+            gh_log.log_bet_won(bet.get("question","?"), bet.get("outcome","?"), payout, new_balance)
+        else:
+            log.info(f"👻 Ghost bet resolved as LOST: {bet.get('question','?')[:50]}")
+            gh_log.log_bet_lost(bet.get("question","?"), bet.get("outcome","?"), float(bet.get("amount_usdc",0)), get_bankroll())
+        resolved_count += 1
 
     if resolved_count:
         log.info(f"👻 Resolved {resolved_count} ghost bet(s) missing from CLOB positions")
