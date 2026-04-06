@@ -396,7 +396,7 @@ def resolve_ghost_bets() -> int:
 
         # Bet is in DB pending but no longer in CLOB positions — it resolved.
         # Step 1: try _check_single_bet (CTF on-chain + CLOB market endpoint)
-        result = _check_single_bet(bet)
+        result = _check_single_bet(bet, ghost=True)
         if result:
             won = result["won"]
             payout = result["payout"]
@@ -419,7 +419,7 @@ def resolve_ghost_bets() -> int:
                 except Exception:
                     age_hours = 0
 
-                if age_hours >= 12:
+                if age_hours >= 6:
                     won = False
                     payout = 0.0
                     log.info(f"👻 Ghost bet expired (>{age_hours:.0f}h old) — marking LOST: {bet.get('question','?')[:50]}")
@@ -1485,7 +1485,7 @@ def _check_gamma_for_resolution(cid: str, bet: dict) -> dict | None:
         return None
 
 
-def _check_single_bet(bet: dict) -> dict | None:
+def _check_single_bet(bet: dict, ghost: bool = False) -> dict | None:
     """
     Check one pending bet. Returns resolution dict or None if still open.
     Runs in a thread — no shared state written here, only reads.
@@ -1495,6 +1495,7 @@ def _check_single_bet(bet: dict) -> dict | None:
       2. CLOB market.closed=True             → reliable when available
       3. CLOB token price >= 0.99            → catches CLOB lag before closed flag
       4. CLOB 404                            → market purged = phantom bet
+      5. ghost=True + token price > 0.5     → confirmed ghost, use mid-price
     """
     cid = bet["polymarket_id"]
     try:
@@ -1559,6 +1560,23 @@ def _check_single_bet(bet: dict) -> dict | None:
                     log.info(f"💡 Token price={price:.3f} → WIN (CLOB closed flag lagging): {cid[:16]}...")
                     return {"bet": bet, "won": True, "payout": bet["potential_payout"]}
                 break
+
+        # ── QUATERNARY: Ghost mode — confirmed not in CLOB positions, use mid-price
+        # We know this bet resolved (position gone), so price > 0.5 = WIN.
+        # Handles daily crypto/sports markets where CLOB lags the closed flag.
+        if ghost and tokens:
+            for token in tokens:
+                if token.get("outcome", "").upper() == bet["outcome"].upper():
+                    try:
+                        price = float(token.get("price", 0.5))
+                    except (TypeError, ValueError):
+                        price = 0.5
+                    won = price > 0.5
+                    log.info(
+                        f"👻 Ghost mid-price: {bet['outcome']} price={price:.3f} "
+                        f"→ {'WON' if won else 'LOST'}: {cid[:16]}..."
+                    )
+                    return {"bet": bet, "won": won, "payout": bet["potential_payout"] if won else 0.0}
 
     except Exception as e:
         log.error(f"Error checking bet {cid}: {e}")
