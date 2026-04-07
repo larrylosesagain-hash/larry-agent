@@ -9,12 +9,13 @@ import time
 import signal
 import threading
 import logging
+import sys
 
 # Must be configured BEFORE importing agents — basicConfig is a no-op if handlers exist
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(message)s",
-    handlers=[logging.StreamHandler()]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 
 from twitter_agent import run_twitter_agent, set_twitter_shutdown, is_twitter_shutdown
