@@ -242,6 +242,35 @@ def get_recent_bets(limit=10) -> list:
     return [dict(r) for r in rows]
 
 
+def get_category_stats() -> dict:
+    """
+    Win rate and open position count by category.
+    Returns dict: {category: {wins, losses, win_rate, open}}
+    Used to feed historical performance back to Claude for better bet sizing.
+    """
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT category,
+               SUM(CASE WHEN status='WON'  THEN 1 ELSE 0 END) as wins,
+               SUM(CASE WHEN status='LOST' THEN 1 ELSE 0 END) as losses,
+               SUM(CASE WHEN status='PENDING' THEN 1 ELSE 0 END) as open
+        FROM bets
+        WHERE category IS NOT NULL
+        GROUP BY category
+    """).fetchall()
+    conn.close()
+    result = {}
+    for r in rows:
+        total = r["wins"] + r["losses"]
+        result[r["category"]] = {
+            "wins": r["wins"],
+            "losses": r["losses"],
+            "win_rate": round(r["wins"] / total, 2) if total >= 3 else None,  # None if too few samples
+            "open": r["open"],
+        }
+    return result
+
+
 def get_win_streak() -> int:
     """
     Count consecutive wins or losses from most recent resolved bets.

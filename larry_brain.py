@@ -6,16 +6,14 @@ Sends market data → gets back bet decisions + tweet text via Tool Use (guarant
 import json
 import time
 import logging
-import requests
 import anthropic
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import ANTHROPIC_API_KEY, CLAUDE_MODEL
 from config import MIN_BET_PCT, MAX_BET_PCT, ABSOLUTE_MIN_BET, ABSOLUTE_MAX_BET
 
 # Haiku for tweets/replies — fast, cheap, handles short creative text perfectly
 # Sonnet (CLAUDE_MODEL) stays for betting decisions — needs real reasoning
 TWEET_MODEL = "claude-haiku-4-5-20251001"
-from database import get_bankroll, get_win_streak, get_recent_bets, get_pending_bets, get_connection
+from database import get_bankroll, get_win_streak, get_recent_bets, get_pending_bets, get_connection, get_category_stats
 
 log = logging.getLogger(__name__)
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -301,7 +299,7 @@ def _get_emotional_state(bankroll: float, win_streak: int) -> str:
 
 
 def _get_larry_context() -> dict:
-    """Full context for betting decisions — includes recent bet history."""
+    """Full context for betting decisions — includes recent bet history and category stats."""
     bankroll = get_bankroll()
     win_streak = get_win_streak()
     recent = get_recent_bets(3)  # 3 is enough to avoid repeats; 5 was wasting tokens
@@ -312,13 +310,21 @@ def _get_larry_context() -> dict:
     # Slim recent bets: only fields Larry actually needs to avoid duplicate bets
     slim_recent = [
         {
-            "q": r.get("question", "")[:60],   # truncated question
+            "q": r.get("question", "")[:60],
             "outcome": r.get("outcome"),
             "status": r.get("status"),
             "amount": r.get("amount_usdc"),
         }
         for r in recent
     ]
+
+    # Category stats: win rates + open position counts
+    # Format as compact strings to save tokens: "crypto: 58% (12W/9L, 4 open)"
+    cat_stats = get_category_stats()
+    cat_summary = {}
+    for cat, s in cat_stats.items():
+        wr = f"{int(s['win_rate']*100)}%" if s["win_rate"] is not None else "n/a"
+        cat_summary[cat] = f"{wr} ({s['wins']}W/{s['losses']}L, {s['open']} open)"
 
     return {
         "bankroll_usdc": round(bankroll, 2),
@@ -327,6 +333,7 @@ def _get_larry_context() -> dict:
         "recent_bets": slim_recent,
         "min_bet_usdc": round(min_bet, 2),
         "max_bet_usdc": round(max_bet, 2),
+        "category_stats": cat_summary,  # historical performance + open counts per category
     }
 
 
@@ -380,70 +387,6 @@ def _get_recent_tweet_texts(limit: int = 3) -> list:
         return []
 
 
-# ─── WEB SEARCH FOR MARKET CONTEXT ───────────────────────────────────────────
-
-def _search_news(question: str) -> str:
-    """
-    Quick DuckDuckGo search for current context about a market.
-    No API key needed. Returns brief summary or empty string on failure.
-    """
-    try:
-        resp = requests.get(
-            "https://api.duckduckgo.com/",
-            params={
-                "q": question[:120],
-                "format": "json",
-                "no_html": "1",
-                "skip_disambig": "1",
-            },
-            timeout=4,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        data = resp.json()
-        # Try abstract first (Wikipedia summary), then answer, then related topics
-        text = data.get("AbstractText", "") or data.get("Answer", "")
-        if not text:
-            topics = data.get("RelatedTopics", [])
-            snippets = [t.get("Text", "") for t in topics[:2] if isinstance(t, dict)]
-            text = " | ".join(s for s in snippets if s)
-        return text[:400] if text else ""
-    except Exception:
-        return ""
-
-
-def _enrich_markets_with_news(markets: list) -> list:
-    """
-    Add real-world news context to entertainment/sports/culture markets in parallel.
-    Crypto and politics Claude already knows well — skip those to save time.
-    Falls back silently if search fails for any market.
-    """
-    cultural = {"entertainment", "sports", "weird"}
-    to_search = [(i, m) for i, m in enumerate(markets) if m.get("category") in cultural]
-    if not to_search:
-        return markets
-
-    enriched = [dict(m) for m in markets]  # shallow copy
-    try:
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {
-                executor.submit(_search_news, m["question"]): i
-                for i, m in to_search
-            }
-            for future in as_completed(futures, timeout=8):
-                idx = futures[future]
-                try:
-                    news = future.result()
-                    if news:
-                        enriched[idx]["news"] = news
-                except Exception:
-                    pass
-    except Exception:
-        pass  # if parallel search fails entirely, return markets as-is
-
-    found = sum(1 for m in enriched if "news" in m)
-    if found:
-        log.info(f"🔍 Enriched {found} markets with web search context")
-    return enriched
 
 
 # ─── PUBLIC FUNCTIONS ────────────────────────────────────────────────────────
@@ -452,22 +395,31 @@ def ask_larry_to_bet(markets: list) -> list:
     """Send markets to Claude via Tool Use, get back bet decisions with Kelly sizing."""
     context = _get_larry_context()
 
-    # Enrich cultural/entertainment markets with current web search context
-    # so Larry can reason about real-world narrative, not just price
-    markets = _enrich_markets_with_news(markets)
-
     # Compact JSON (no indent) — saves ~25% tokens with no quality loss
     user_message = (
-        f"Larry Status: {json.dumps(context, separators=(',',':'))}\n\n"
-        f"Markets (yes_price=cost to buy YES, 'news' = current web context if available):\n"
+        f"Larry's status: {json.dumps(context, separators=(',',':'))}\n\n"
+        f"Markets (yes_price=cost to buy YES):\n"
         f"{json.dumps(markets, separators=(',',':'))}\n\n"
-        f"Decide BET or PASS. Larry's default is BET — PASS only if you genuinely have zero read.\n"
-        f"- YES and NO both valid. Sometimes the edge is betting NO on an overpriced favorite.\n"
-        f"- Use 'news' field — reason about narrative, momentum, sentiment.\n"
-        f"- CONTRARIAN welcome: who's underpriced? Split vote risk? Frontrunner losing buzz?\n"
-        f"- Gut-feel bets are fine. Larry bets on vibes too. Min bet ${context['min_bet_usdc']}.\n"
-        f"- Aim for at least 3-5 BETs this cycle. If you're passing everything, you're too scared.\n"
-        f"Bet range: ${context['min_bet_usdc']}–${context['max_bet_usdc']}"
+        f"BETTING RULES:\n"
+        f"Default is PASS. The market price is the crowd's best guess — if you can't beat it, don't bet.\n"
+        f"Only BET when your probability_estimate differs from market price by at least 5 percentage points.\n"
+        f"- Example: market at 60¢ → only bet YES if you think p > 0.65, or NO if p < 0.55\n"
+        f"- Near-50/50 markets (48-52¢) need STRONG conviction — the edge after fees barely exists\n"
+        f"- High-volume markets (many smart bettors) need MORE conviction to bet\n"
+        f"- Low-volume / fresh markets → more likely to be mispriced, OK to bet with smaller edge\n"
+        f"\nBIASES TO EXPLOIT (crowd gets these wrong most often):\n"
+        f"- Recency bias: team just won 3 in a row → crowd OVERPAYS for next win → bet NO/against\n"
+        f"- Favorite-longshot bias: heavy favorites (>85¢) are UNDERPRICED → bet YES on them\n"
+        f"  Longshots (<15¢) are OVERPRICED → usually PASS or bet NO\n"
+        f"- Narrative lag: event already happened but market price hasn't moved → immediate edge\n"
+        f"- Round number anchoring: BTC/ETH at round price targets ($70k, $2000) → volatility plays\n"
+        f"- Availability bias: recent dramatic event → crowd OVERESTIMATES repeat probability\n"
+        f"\nCATEGORY PERFORMANCE (use this to calibrate confidence):\n"
+        f"{json.dumps(context.get('category_stats', {}), separators=(',',':'))}\n"
+        f"- If a category has low win_rate (<45%) → be more conservative, need stronger edge\n"
+        f"- If a category has many open positions → avoid adding more (correlation risk)\n"
+        f"\nBet range: ${context['min_bet_usdc']}–${context['max_bet_usdc']}. "
+        f"1-3 quality BETs is better than 5 weak ones. PASS is always valid."
     )
     try:
         result = _call_claude_with_tool(2000, [{"role": "user", "content": user_message}], BETTING_TOOL)
@@ -475,6 +427,8 @@ def ask_larry_to_bet(markets: list) -> list:
     except Exception:
         log.warning("Claude unavailable — skipping bet cycle")
         return []
+
+    MIN_EDGE = 0.04  # require at least 4pp edge after fees (~2% Polymarket fee)
 
     bankroll = context["bankroll_usdc"]
     for d in decisions:
@@ -485,10 +439,20 @@ def ask_larry_to_bet(markets: list) -> list:
 
             if market:
                 if market.get("neg_risk"):
-                    # neg-risk: yes_price IS the price of this specific outcome
                     market_price = market["yes_price"]
                 else:
                     market_price = market["yes_price"] if outcome == "YES" else round(1 - market["yes_price"], 4)
+
+                edge = prob - market_price
+                if edge < MIN_EDGE:
+                    log.info(
+                        f"⛔ Edge too small ({edge:+.3f}) — skipping {outcome} on "
+                        f"{d.get('market_id','?')[:16]}... "
+                        f"(p={prob:.2f} price={market_price:.2f})"
+                    )
+                    d["decision"] = "PASS"
+                    continue
+
                 pct = _kelly_fraction(prob, market_price)
             else:
                 pct = MIN_BET_PCT
