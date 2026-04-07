@@ -1066,8 +1066,11 @@ def place_bet(client: ClobClient, decision: dict) -> bool:
         log.error(f"TypeError placing bet: {te}")
         return False
     except Exception as e:
-        # PolyApiException message is safe (HTTP error details, no wallet data)
-        log.error(f"Exception placing bet ({type(e).__name__}): {e}")
+        err_str = str(e).lower()
+        if "not enough balance" in err_str or "allowance" in err_str:
+            log.info(f"💸 Insufficient balance — skipping bet on {condition_id[:16]}...")
+        else:
+            log.error(f"Exception placing bet ({type(e).__name__}): {e}")
         return False
 
 
