@@ -768,13 +768,13 @@ def fetch_active_markets() -> list:
       3. FRESH   — newest 100 by createdAt desc, offset=0
                    Brand-new markets often have mispriced odds (no one's bet on them yet).
 
-    Window: ONLY markets resolving within 24 hours — same-day resolution only.
-    Claude sees: 12 anchor + 8 scan + 5 fresh = 25 markets per cycle.
+    Window: CARNIVAL MODE — markets resolving within 2 hours (fallback: 6h → 24h).
+    Claude sees up to ~30 markets per cycle and bets aggressively on most of them.
     """
     global _scan_page
     now = _utcnow()
-    cutoff = now + timedelta(hours=24)   # TODAY only — must resolve within 24h
-    min_time = now + timedelta(minutes=30)  # skip markets resolving in under 30min (too late to fill)
+    cutoff = now + timedelta(hours=2)    # CARNIVAL: focus on markets resolving within 2h
+    min_time = now + timedelta(minutes=5)  # allow markets resolving in as little as 5min
 
     scan_offset = _scan_page * 500
     # Offset=0 duplicates anchor (which also uses offset=0) — dedup would kill all scan results.
@@ -798,13 +798,24 @@ def fetch_active_markets() -> list:
         raw_scan   = f_scan.result()
         raw_fresh  = f_fresh.result()
 
-    # 48h fallback — if 24h window is completely empty (Sunday morning gaps, overnight
-    # market resolution with no new day markets yet), expand to 48h so Larry still has
-    # something to bet on instead of spinning idle for hours.
+    # Fallback 1: 6h — if 2h window is empty, expand slightly
     if not raw_anchor and not raw_scan and not raw_fresh:
-        cutoff = now + timedelta(hours=48)
+        cutoff = now + timedelta(hours=6)
         end_max = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
-        log.info("⚠️  24h window returned 0 markets — expanding to 48h fallback")
+        log.info("⚠️  2h window returned 0 markets — expanding to 6h fallback")
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            f_anchor = ex.submit(_fetch_gamma_raw, "volume24hr", False, 500, 0,           end_min, end_max)
+            f_scan   = ex.submit(_fetch_gamma_raw, "volume24hr", False, 500, scan_offset, end_min, end_max)
+            f_fresh  = ex.submit(_fetch_gamma_raw, "createdAt",  False, 200, 0,           end_min, end_max)
+            raw_anchor = f_anchor.result()
+            raw_scan   = f_scan.result()
+            raw_fresh  = f_fresh.result()
+
+    # Fallback 2: 24h — overnight gaps or slow market hours
+    if not raw_anchor and not raw_scan and not raw_fresh:
+        cutoff = now + timedelta(hours=24)
+        end_max = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+        log.info("⚠️  6h window returned 0 markets — expanding to 24h fallback")
         with ThreadPoolExecutor(max_workers=3) as ex:
             f_anchor = ex.submit(_fetch_gamma_raw, "volume24hr", False, 500, 0,           end_min, end_max)
             f_scan   = ex.submit(_fetch_gamma_raw, "volume24hr", False, 500, scan_offset, end_min, end_max)
@@ -814,7 +825,7 @@ def fetch_active_markets() -> list:
             raw_fresh  = f_fresh.result()
 
     def parse_strict(raw):
-        """Parse with tighter time filter: resolves within 24h AND not in the next 30min."""
+        """Parse: resolves within 2h window AND not in the next 5min."""
         out = []
         for m in raw:
             # Try all known Gamma API field name variations for end date
@@ -829,7 +840,7 @@ def fetch_active_markets() -> list:
                 if end_date_naive <= min_time:
                     continue  # already resolved or resolves too soon
                 if end_date_naive > cutoff:
-                    continue  # further than 24h out
+                    continue  # outside current window
 
                 delta = end_date_naive - now
                 days_to_end  = delta.days

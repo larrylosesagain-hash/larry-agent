@@ -398,28 +398,27 @@ def ask_larry_to_bet(markets: list) -> list:
     # Compact JSON (no indent) — saves ~25% tokens with no quality loss
     user_message = (
         f"Larry's status: {json.dumps(context, separators=(',',':'))}\n\n"
-        f"Markets (yes_price=cost to buy YES):\n"
+        f"Markets (yes_price=cost to buy YES, hours_to_end=hours until resolution):\n"
         f"{json.dumps(markets, separators=(',',':'))}\n\n"
-        f"BETTING RULES:\n"
-        f"Default is PASS. The market price is the crowd's best guess — if you can't beat it, don't bet.\n"
-        f"Only BET when your probability_estimate differs from market price by at least 5 percentage points.\n"
-        f"- Example: market at 60¢ → only bet YES if you think p > 0.65, or NO if p < 0.55\n"
-        f"- Near-50/50 markets (48-52¢) need STRONG conviction — the edge after fees barely exists\n"
-        f"- High-volume markets (many smart bettors) need MORE conviction to bet\n"
-        f"- Low-volume / fresh markets → more likely to be mispriced, OK to bet with smaller edge\n"
-        f"\nBIASES TO EXPLOIT (crowd gets these wrong most often):\n"
-        f"- Recency bias: team just won 3 in a row → crowd OVERPAYS for next win → bet NO/against\n"
+        f"CARNIVAL MODE — these markets resolve within hours. BET AGGRESSIVELY.\n"
+        f"Default is BET. PASS only when something is genuinely wrong with a market.\n"
+        f"Target: BET on 70-90% of markets. 5-15 BETs per cycle is great.\n"
+        f"- Any edge ≥ 1pp is enough to BET — these resolve fast so small edges compound\n"
+        f"- Heavy favorites (>80¢): bet YES — they're usually right and pay out quickly\n"
+        f"- Heavy longshots (<20¢): bet NO — crowd overprices moonshots on short markets\n"
+        f"- Near-50/50 (40-60¢): bet whichever side you lean toward — flip-a-coin markets\n"
+        f"  are fine in carnival mode, just pick the side you believe in more\n"
+        f"- ONLY PASS if: market is clearly already decided, you have zero opinion,\n"
+        f"  or it's a category Larry is terrible at and truly can't pick a side\n"
+        f"\nSHORT-TERM EDGE PATTERNS:\n"
         f"- Favorite-longshot bias: heavy favorites (>85¢) are UNDERPRICED → bet YES on them\n"
-        f"  Longshots (<15¢) are OVERPRICED → usually PASS or bet NO\n"
-        f"- Narrative lag: event already happened but market price hasn't moved → immediate edge\n"
-        f"- Round number anchoring: BTC/ETH at round price targets ($70k, $2000) → volatility plays\n"
-        f"- Availability bias: recent dramatic event → crowd OVERESTIMATES repeat probability\n"
-        f"\nCATEGORY PERFORMANCE (use this to calibrate confidence):\n"
+        f"- Sports props (points O/U, player stats): lean toward the OVER on stars, UNDER on role players\n"
+        f"- Crypto hourly targets: if BTC/ETH is already near the target price → obvious direction\n"
+        f"- Game totals (both teams score etc): favor YES on high-scoring matchups, NO on defensive ones\n"
+        f"\nCATEGORY PERFORMANCE:\n"
         f"{json.dumps(context.get('category_stats', {}), separators=(',',':'))}\n"
-        f"- If a category has low win_rate (<45%) → be more conservative, need stronger edge\n"
-        f"- If a category has many open positions → avoid adding more (correlation risk)\n"
         f"\nBet range: ${context['min_bet_usdc']}–${context['max_bet_usdc']}. "
-        f"1-3 quality BETs is better than 5 weak ones. PASS is always valid."
+        f"Keep each bet at the minimum — spread wide across many markets. Volume is the strategy."
     )
     try:
         result = _call_claude_with_tool(2000, [{"role": "user", "content": user_message}], BETTING_TOOL)
@@ -428,7 +427,7 @@ def ask_larry_to_bet(markets: list) -> list:
         log.warning("Claude unavailable — skipping bet cycle")
         return []
 
-    MIN_EDGE = 0.04  # require at least 4pp edge after fees (~2% Polymarket fee)
+    MIN_EDGE = 0.01  # carnival mode: 1pp edge is enough — spread wide, resolve fast
 
     bankroll = context["bankroll_usdc"]
     for d in decisions:
