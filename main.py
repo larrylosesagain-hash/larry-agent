@@ -21,9 +21,17 @@ logging.basicConfig(
 from twitter_agent import run_twitter_agent, set_twitter_shutdown, is_twitter_shutdown
 from betting_agent import run_betting_agent, set_betting_shutdown, is_betting_shutdown
 from github_logger import install_log_handler
+import log_server
 log = logging.getLogger(__name__)
 
-install_log_handler()  # stream all logs to GitHub Issue #2 every 5 min
+# Attach rolling log buffer handler BEFORE starting the HTTP server
+# so every line emitted after this point is captured and served at GET /
+_buf_handler = log_server.LogBufferHandler()
+_buf_handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(message)s"))
+logging.getLogger().addHandler(_buf_handler)
+
+log_server.start()            # HTTP log viewer — Claude WebFetches this instead of GitHub MCP
+install_log_handler()         # also stream to GitHub Issue #2 every 5 min
 
 
 def _handle_sigterm(signum, frame):
