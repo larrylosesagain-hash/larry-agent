@@ -457,10 +457,6 @@ def ask_larry_to_bet(markets: list, crypto_prices: dict = None) -> list:
         markets = sorted(markets, key=lambda m: m.get("hours_to_end", 9999))[:MAX_MARKETS_PER_CALL]
         log.info(f"📦 Capped markets to {MAX_MARKETS_PER_CALL} (sorted by soonest resolution)")
 
-    # Enrich cultural/entertainment markets with current web search context
-    # so Larry can reason about real-world narrative, not just price
-    markets = _enrich_markets_with_news(markets)
-
     # ── Live crypto prices block ──────────────────────────────────────────────
     prices = crypto_prices or {}
     if prices.get("BTC") and prices.get("ETH"):
