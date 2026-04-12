@@ -418,10 +418,12 @@ def ask_larry_to_bet(markets: list) -> list:
         f"\nCATEGORY PERFORMANCE:\n"
         f"{json.dumps(context.get('category_stats', {}), separators=(',',':'))}\n"
         f"\nBet range: ${context['min_bet_usdc']}–${context['max_bet_usdc']}. "
-        f"Keep each bet at the minimum — spread wide across many markets. Volume is the strategy."
+        f"Keep each bet at the minimum — spread wide across many markets. Volume is the strategy.\n"
+        f"\nIMPORTANT: You MUST submit a decision (BET or PASS) for EVERY market shown. "
+        f"Returning zero decisions is not allowed — if unsure, PASS on those markets."
     )
     try:
-        result = _call_claude_with_tool(2000, [{"role": "user", "content": user_message}], BETTING_TOOL)
+        result = _call_claude_with_tool(4000, [{"role": "user", "content": user_message}], BETTING_TOOL)
         decisions = result.get("decisions", [])
     except Exception:
         log.warning("Claude unavailable — skipping bet cycle")
