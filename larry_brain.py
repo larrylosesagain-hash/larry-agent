@@ -446,9 +446,16 @@ def _apply_correlation_cap(decisions: list, markets: list) -> list:
     return decisions
 
 
+MAX_MARKETS_PER_CALL = 35  # cap per Claude call — keeps prompt focused, avoids blank responses
+
 def ask_larry_to_bet(markets: list, crypto_prices: dict = None) -> list:
     """Send markets to Claude via Tool Use, get back bet decisions with Kelly sizing."""
     context = _get_larry_context()
+
+    # Cap at MAX_MARKETS_PER_CALL — sort by hours_to_end ascending so freshest go first
+    if len(markets) > MAX_MARKETS_PER_CALL:
+        markets = sorted(markets, key=lambda m: m.get("hours_to_end", 9999))[:MAX_MARKETS_PER_CALL]
+        log.info(f"📦 Capped markets to {MAX_MARKETS_PER_CALL} (sorted by soonest resolution)")
 
     # Enrich cultural/entertainment markets with current web search context
     # so Larry can reason about real-world narrative, not just price
@@ -494,8 +501,8 @@ def ask_larry_to_bet(markets: list, crypto_prices: dict = None) -> list:
         f"{json.dumps(context.get('category_stats', {}), separators=(',',':'))}\n"
         f"\nBet range: ${context['min_bet_usdc']}–${context['max_bet_usdc']}. "
         f"Keep each bet at the minimum — spread wide across many markets.\n"
-        f"\nIMPORTANT: You MUST submit a decision (BET or PASS) for EVERY market shown. "
-        f"Returning zero decisions is not allowed — if unsure, default to BET."
+        f"\nYou are seeing {len(markets)} markets. You MUST return exactly {len(markets)} decisions — one per market. "
+        f"No market can be skipped. If you have no strong opinion, default to BET on the favorite side."
     )
     try:
         result = _call_claude_with_tool(16000, [{"role": "user", "content": user_message}], BETTING_TOOL)
@@ -503,6 +510,22 @@ def ask_larry_to_bet(markets: list, crypto_prices: dict = None) -> list:
     except Exception:
         log.warning("Claude unavailable — skipping bet cycle")
         return []
+
+    # If Claude returned 0 decisions (refused to decide), synthesize PASS for all markets
+    # so they get cached and we don't re-send the same markets next cycle.
+    if not decisions:
+        log.warning(f"Claude returned 0 decisions for {len(markets)} markets — synthesizing PASS for all to populate cache")
+        decisions = [
+            {
+                "market_id": m["condition_id"],
+                "decision": "PASS",
+                "outcome": "YES",
+                "probability_estimate": m.get("yes_price", 0.5),
+                "amount_usdc": 0,
+                "reasoning": "auto-PASS: Claude returned no decisions this cycle",
+            }
+            for m in markets
+        ]
 
     MIN_EDGE = 0.01  # carnival mode: 1pp edge is enough — spread wide, resolve fast
 
