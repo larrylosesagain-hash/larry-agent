@@ -447,10 +447,17 @@ def _apply_correlation_cap(decisions: list, markets: list) -> list:
 
 
 MAX_MARKETS_PER_CALL = 35  # cap per Claude call — keeps prompt focused, avoids blank responses
+POLYMARKET_MIN_BET   = 5.0  # Polymarket enforces $5 minimum order size
+BANKROLL_RESERVE     = 5.0  # always keep $5 in reserve
 
 def ask_larry_to_bet(markets: list, crypto_prices: dict = None) -> list:
     """Send markets to Claude via Tool Use, get back bet decisions with Kelly sizing."""
     context = _get_larry_context()
+
+    # How many $5 bets can we afford this cycle?
+    bettable = max(0.0, context["bankroll_usdc"] - BANKROLL_RESERVE)
+    max_bets_this_cycle = max(1, int(bettable / POLYMARKET_MIN_BET))
+    log.info(f"💰 Budget: ${context['bankroll_usdc']:.2f} bankroll → max {max_bets_this_cycle} bets this cycle")
 
     # Cap at MAX_MARKETS_PER_CALL — sort by hours_to_end ascending so freshest go first
     if len(markets) > MAX_MARKETS_PER_CALL:
@@ -477,9 +484,9 @@ def ask_larry_to_bet(markets: list, crypto_prices: dict = None) -> list:
         f"Markets (yes_price=cost to buy YES, hours_to_end=hours until resolution, 'news'=web context if available):\n"
         f"{json.dumps(markets, separators=(',',':'))}\n\n"
         + prices_line +
-        f"BET AGGRESSIVELY on ALL markets — short-term AND long-term. Volume is the strategy.\n"
-        f"Default is BET. PASS only when something is genuinely wrong with a market.\n"
-        f"Target: BET on 70-90% of markets shown. 5-15 BETs per cycle is great.\n"
+        f"BET SELECTIVELY — each bet costs ${POLYMARKET_MIN_BET:.0f} (Polymarket minimum).\n"
+        f"Bankroll available this cycle: ${context['bankroll_usdc']:.2f} — max {max_bets_this_cycle} BETs before reserve kicks in.\n"
+        f"Target: {max_bets_this_cycle} BETs max. Be choosy — only take markets with clear edge.\n"
         f"- hours_to_end can be 1h or 1000h — doesn't matter, bet on both\n"
         f"- Any edge ≥ 1pp is enough to BET — spread wide, let the portfolio do the work\n"
         f"- Heavy favorites (>80¢): bet YES — markets are usually right and they pay out\n"
