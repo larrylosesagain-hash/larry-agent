@@ -106,6 +106,17 @@ def init_db():
 
     conn.commit()
 
+    # ─── MIGRATIONS (add new columns if they don't exist) ────────────────────
+    for col_def in [
+        ("closing_price", "REAL"),   # CLV: final token price before resolution
+        ("clv",           "REAL"),   # CLV: closing_price - odds_at_bet (positive = good value)
+    ]:
+        try:
+            c.execute(f"ALTER TABLE bets ADD COLUMN {col_def[0]} {col_def[1]}")
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+
     # FIX: seed grandma wallet to $200 on first init so the injection mechanism
     # can actually trigger. Previously grandma_balance started at 0.0 and the
     # condition `grandma_balance >= GRANDMA_INJECT_AMOUNT (200)` was never met.
@@ -212,14 +223,25 @@ def save_bet(polymarket_id, question, outcome, amount, odds, potential_payout,
     return bet_id
 
 
-def resolve_bet(polymarket_id: str, won: bool, payout: float):
+def resolve_bet(polymarket_id: str, won: bool, payout: float, closing_price: float = None):
     status = "WON" if won else "LOST"
     conn = get_connection()
+    clv = None
+    if closing_price is not None:
+        row = conn.execute(
+            "SELECT odds_at_bet FROM bets WHERE polymarket_id = ?",
+            (polymarket_id,)
+        ).fetchone()
+        if row:
+            # CLV = how much the market moved in our favour after entry
+            # Positive = we bought cheap (found real edge); negative = we overpaid
+            clv = round(closing_price - float(row["odds_at_bet"]), 4)
     conn.execute("""
         UPDATE bets
-        SET status = ?, result_amount = ?, resolved_at = CURRENT_TIMESTAMP
+        SET status = ?, result_amount = ?, resolved_at = CURRENT_TIMESTAMP,
+            closing_price = ?, clv = ?
         WHERE polymarket_id = ?
-    """, (status, payout, polymarket_id))
+    """, (status, payout, closing_price, clv, polymarket_id))
     conn.commit()
     conn.close()
 

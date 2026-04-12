@@ -4,6 +4,7 @@ Sends market data → gets back bet decisions + tweet text via Tool Use (guarant
 """
 
 import json
+import re
 import time
 import logging
 import anthropic
@@ -391,39 +392,113 @@ def _get_recent_tweet_texts(limit: int = 3) -> list:
 
 # ─── PUBLIC FUNCTIONS ────────────────────────────────────────────────────────
 
-def ask_larry_to_bet(markets: list) -> list:
+def _apply_correlation_cap(decisions: list, markets: list) -> list:
+    """
+    Correlation cap: keep at most 1 BET per underlying crypto asset per cycle.
+    Multiple ETH price-target bets all win/lose together — they're not independent.
+    Keeps the highest-edge bet for each asset, cancels the rest.
+    """
+    ASSET_PATTERNS = {
+        "BTC":  r"\b(btc|bitcoin)\b",
+        "ETH":  r"\b(eth|ethereum)\b",
+        "SOL":  r"\b(sol|solana)\b",
+        "MATIC": r"\b(matic|polygon)\b",
+        "BNB":  r"\b(bnb|binance)\b",
+    }
+    market_by_id = {m["condition_id"]: m for m in markets}
+
+    # Collect (decision_index, edge, asset) for each BET
+    asset_bets: dict = {}  # asset -> [(idx, edge)]
+    for i, d in enumerate(decisions):
+        if d.get("decision") != "BET":
+            continue
+        mid = (d.get("market_id") or "").lower()
+        market = market_by_id.get(mid)
+        if not market:
+            continue
+        question = (market.get("question") or "").lower()
+        for asset, pattern in ASSET_PATTERNS.items():
+            if re.search(pattern, question, re.IGNORECASE):
+                outcome = d.get("outcome", "YES")
+                prob = float(d.get("probability_estimate", 0.5))
+                yes_price = market.get("yes_price", 0.5)
+                market_price = yes_price if outcome == "YES" else round(1 - yes_price, 4)
+                edge = prob - market_price
+                asset_bets.setdefault(asset, []).append((i, edge))
+                break
+
+    # For each asset with multiple bets, cancel all but the best edge
+    for asset, bets in asset_bets.items():
+        if len(bets) <= 1:
+            continue
+        bets.sort(key=lambda x: x[1], reverse=True)
+        kept_edge = bets[0][1]
+        for idx, edge in bets[1:]:
+            decisions[idx]["decision"] = "PASS"
+            decisions[idx]["reasoning"] = (
+                f"[corr-cap {asset}: kept {kept_edge:+.3f}-edge bet] "
+                + decisions[idx].get("reasoning", "")
+            )
+        log.info(
+            f"🔗 Correlation cap: {asset} — kept best ({kept_edge:+.3f}), "
+            f"cancelled {len(bets)-1} correlated bet(s)"
+        )
+    return decisions
+
+
+def ask_larry_to_bet(markets: list, crypto_prices: dict = None) -> list:
     """Send markets to Claude via Tool Use, get back bet decisions with Kelly sizing."""
     context = _get_larry_context()
+
+    # Enrich cultural/entertainment markets with current web search context
+    # so Larry can reason about real-world narrative, not just price
+    markets = _enrich_markets_with_news(markets)
+
+    # ── Live crypto prices block ──────────────────────────────────────────────
+    prices = crypto_prices or {}
+    if prices.get("BTC") and prices.get("ETH"):
+        prices_line = (
+            f"\nLIVE PRICES (fetched seconds ago): "
+            f"BTC=${prices['BTC']:,}  ETH=${prices['ETH']:,}"
+            + (f"  SOL=${prices['SOL']:,}" if prices.get("SOL") else "")
+            + "\n"
+            f"Use these for crypto price-target markets — it's ARITHMETIC not guessing.\n"
+            f"e.g. if BTC is at $84,200 and market asks 'BTC above $84,000 by 3pm?' → obvious YES\n"
+        )
+    else:
+        prices_line = ""
 
     # Compact JSON (no indent) — saves ~25% tokens with no quality loss
     user_message = (
         f"Larry's status: {json.dumps(context, separators=(',',':'))}\n\n"
-        f"Markets (yes_price=cost to buy YES, hours_to_end=hours until resolution):\n"
+        f"Markets (yes_price=cost to buy YES, hours_to_end=hours until resolution, 'news'=web context if available):\n"
         f"{json.dumps(markets, separators=(',',':'))}\n\n"
-        f"CARNIVAL MODE — these markets resolve within hours. BET AGGRESSIVELY.\n"
+        + prices_line +
+        f"BET AGGRESSIVELY on ALL markets — short-term AND long-term. Volume is the strategy.\n"
         f"Default is BET. PASS only when something is genuinely wrong with a market.\n"
-        f"Target: BET on 70-90% of markets. 5-15 BETs per cycle is great.\n"
-        f"- Any edge ≥ 1pp is enough to BET — these resolve fast so small edges compound\n"
-        f"- Heavy favorites (>80¢): bet YES — they're usually right and pay out quickly\n"
-        f"- Heavy longshots (<20¢): bet NO — crowd overprices moonshots on short markets\n"
-        f"- Near-50/50 (40-60¢): bet whichever side you lean toward — flip-a-coin markets\n"
-        f"  are fine in carnival mode, just pick the side you believe in more\n"
+        f"Target: BET on 70-90% of markets shown. 5-15 BETs per cycle is great.\n"
+        f"- hours_to_end can be 1h or 1000h — doesn't matter, bet on both\n"
+        f"- Any edge ≥ 1pp is enough to BET — spread wide, let the portfolio do the work\n"
+        f"- Heavy favorites (>80¢): bet YES — markets are usually right and they pay out\n"
+        f"- Heavy longshots (<20¢): bet NO — crowd overprices moonshots\n"
+        f"- Near-50/50 (40-60¢): pick the side you lean toward — flip-a-coin is fine\n"
         f"- ONLY PASS if: market is clearly already decided, you have zero opinion,\n"
         f"  or it's a category Larry is terrible at and truly can't pick a side\n"
-        f"\nSHORT-TERM EDGE PATTERNS:\n"
+        f"- Use 'news' field when available — narrative, momentum, and sentiment matter\n"
+        f"\nEDGE PATTERNS:\n"
         f"- Favorite-longshot bias: heavy favorites (>85¢) are UNDERPRICED → bet YES on them\n"
         f"- Sports props (points O/U, player stats): lean toward the OVER on stars, UNDER on role players\n"
-        f"- Crypto hourly targets: if BTC/ETH is already near the target price → obvious direction\n"
-        f"- Game totals (both teams score etc): favor YES on high-scoring matchups, NO on defensive ones\n"
+        f"- Crypto price targets: use LIVE PRICES above — if already past target → obvious direction\n"
+        f"- Game totals: favor YES on high-scoring matchups, NO on defensive ones\n"
         f"\nCATEGORY PERFORMANCE:\n"
         f"{json.dumps(context.get('category_stats', {}), separators=(',',':'))}\n"
         f"\nBet range: ${context['min_bet_usdc']}–${context['max_bet_usdc']}. "
-        f"Keep each bet at the minimum — spread wide across many markets. Volume is the strategy.\n"
+        f"Keep each bet at the minimum — spread wide across many markets.\n"
         f"\nIMPORTANT: You MUST submit a decision (BET or PASS) for EVERY market shown. "
-        f"Returning zero decisions is not allowed — if unsure, PASS on those markets."
+        f"Returning zero decisions is not allowed — if unsure, default to BET."
     )
     try:
-        result = _call_claude_with_tool(4000, [{"role": "user", "content": user_message}], BETTING_TOOL)
+        result = _call_claude_with_tool(16000, [{"role": "user", "content": user_message}], BETTING_TOOL)
         decisions = result.get("decisions", [])
     except Exception:
         log.warning("Claude unavailable — skipping bet cycle")
@@ -461,6 +536,9 @@ def ask_larry_to_bet(markets: list) -> list:
             amount = bankroll * pct
             amount = max(ABSOLUTE_MIN_BET, min(amount, ABSOLUTE_MAX_BET, bankroll * 0.9))
             d["amount_usdc"] = round(amount, 2)
+
+    # Apply correlation cap — max 1 BET per underlying crypto asset
+    decisions = _apply_correlation_cap(decisions, markets)
 
     return decisions if isinstance(decisions, list) else [decisions]
 
