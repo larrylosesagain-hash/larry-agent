@@ -531,31 +531,31 @@ def ask_larry_to_bet(markets: list, crypto_prices: dict = None) -> list:
         f"Markets (yes_price=cost to buy YES, hours_to_end=hours until resolution, 'news'=web context if available):\n"
         f"{json.dumps(markets, separators=(',',':'))}\n\n"
         + prices_line +
-        f"CARNIVAL MODE — these markets resolve within hours. BET AGGRESSIVELY.\n"
+        f"BET AGGRESSIVELY on ALL markets — short-term AND long-term. Volume is the strategy.\n"
         f"Default is BET. PASS only when something is genuinely wrong with a market.\n"
-        f"Target: BET on 70-90% of markets. 5-15 BETs per cycle is great.\n"
-        f"- Any edge ≥ 1pp is enough to BET — these resolve fast so small edges compound\n"
-        f"- Heavy favorites (>80¢): bet YES — they're usually right and pay out quickly\n"
-        f"- Heavy longshots (<20¢): bet NO — crowd overprices moonshots on short markets\n"
-        f"- Near-50/50 (40-60¢): bet whichever side you lean toward — flip-a-coin markets\n"
-        f"  are fine in carnival mode, just pick the side you believe in more\n"
+        f"Target: BET on 70-90% of markets shown. 5-15 BETs per cycle is great.\n"
+        f"- hours_to_end can be 1h or 1000h — doesn't matter, bet on both\n"
+        f"- Any edge ≥ 1pp is enough to BET — spread wide, let the portfolio do the work\n"
+        f"- Heavy favorites (>80¢): bet YES — markets are usually right and they pay out\n"
+        f"- Heavy longshots (<20¢): bet NO — crowd overprices moonshots\n"
+        f"- Near-50/50 (40-60¢): pick the side you lean toward — flip-a-coin is fine\n"
         f"- ONLY PASS if: market is clearly already decided, you have zero opinion,\n"
         f"  or it's a category Larry is terrible at and truly can't pick a side\n"
         f"- Use 'news' field when available — narrative, momentum, and sentiment matter\n"
-        f"\nSHORT-TERM EDGE PATTERNS:\n"
+        f"\nEDGE PATTERNS:\n"
         f"- Favorite-longshot bias: heavy favorites (>85¢) are UNDERPRICED → bet YES on them\n"
         f"- Sports props (points O/U, player stats): lean toward the OVER on stars, UNDER on role players\n"
-        f"- Crypto hourly targets: use LIVE PRICES above — if already past target → obvious direction\n"
-        f"- Game totals (both teams score etc): favor YES on high-scoring matchups, NO on defensive ones\n"
+        f"- Crypto price targets: use LIVE PRICES above — if already past target → obvious direction\n"
+        f"- Game totals: favor YES on high-scoring matchups, NO on defensive ones\n"
         f"\nCATEGORY PERFORMANCE:\n"
         f"{json.dumps(context.get('category_stats', {}), separators=(',',':'))}\n"
         f"\nBet range: ${context['min_bet_usdc']}–${context['max_bet_usdc']}. "
-        f"Keep each bet at the minimum — spread wide across many markets. Volume is the strategy.\n"
+        f"Keep each bet at the minimum — spread wide across many markets.\n"
         f"\nIMPORTANT: You MUST submit a decision (BET or PASS) for EVERY market shown. "
-        f"Returning zero decisions is not allowed — if unsure, PASS on those markets."
+        f"Returning zero decisions is not allowed — if unsure, default to BET."
     )
     try:
-        result = _call_claude_with_tool(4000, [{"role": "user", "content": user_message}], BETTING_TOOL)
+        result = _call_claude_with_tool(16000, [{"role": "user", "content": user_message}], BETTING_TOOL)
         decisions = result.get("decisions", [])
     except Exception:
         log.warning("Claude unavailable — skipping bet cycle")
