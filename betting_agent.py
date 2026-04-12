@@ -338,6 +338,140 @@ def get_positions_value() -> tuple[float, int]:
         return 0.0, 0
 
 
+def get_clob_condition_ids() -> set[str]:
+    """
+    Fetch condition IDs of all currently open CLOB positions via Data API.
+    Used to detect ghost bets: DB pending bets no longer in CLOB positions.
+    Returns empty set on any error so callers degrade gracefully.
+    """
+    try:
+        resp = requests.get(
+            f"{_POLYMARKET_DATA_API}/positions",
+            params={"user": POLYMARKET_FUNDER, "sizeThreshold": "0.01"},
+            timeout=10,
+        )
+        if not resp.ok:
+            return set()
+        positions = resp.json()
+        if not isinstance(positions, list):
+            return set()
+        ids: set[str] = set()
+        for p in positions:
+            # Polymarket Data API uses "conditionId" field
+            cid = p.get("conditionId") or p.get("condition_id") or p.get("market_id") or ""
+            if cid:
+                ids.add(cid.lower())
+        return ids
+    except Exception:
+        return set()
+
+
+def resolve_ghost_bets() -> int:
+    """
+    Find DB pending bets no longer present in CLOB positions and force-resolve them.
+    These are bets that resolved on-chain (and were swept by redeem_all) but whose
+    resolution wasn't detected by check_pending_bets due to CLOB API lag.
+
+    Resolution order:
+    1. _check_single_bet — uses CTF on-chain + CLOB market endpoint (most reliable)
+    2. _check_gamma_for_resolution — gamma API fallback
+    3. Skip — if outcome truly unknown, don't assume LOST (balance sync handles money)
+
+    Returns count of ghost bets resolved.
+    """
+    clob_ids = get_clob_condition_ids()
+    if not clob_ids:
+        return 0  # Can't determine — skip to avoid false positives
+
+    pending = get_pending_bets()
+    if not pending:
+        return 0
+
+    resolved_count = 0
+    for bet in pending:
+        cid = (bet.get("polymarket_id") or "").lower()
+        if not cid or cid in clob_ids:
+            continue
+
+        # Bet is in DB pending but no longer in CLOB positions — it resolved.
+        # Step 1: try _check_single_bet (CTF on-chain + CLOB market endpoint)
+        result = _check_single_bet(bet, ghost=True)
+        closing_price = None
+        if result:
+            won = result["won"]
+            payout = result["payout"]
+            closing_price = result.get("closing_price")
+        else:
+            # Step 2: try gamma API
+            gamma_result = _check_gamma_for_resolution(cid, bet)
+            if gamma_result:
+                won = gamma_result["won"]
+                payout = gamma_result["payout"]
+                closing_price = gamma_result.get("closing_price")
+            else:
+                # Step 3: check age — sports props resolve within hours.
+                # If bet is >12h old and still a ghost, mark as LOST and move on.
+                placed_at_str = bet.get("placed_at") or ""
+                try:
+                    from datetime import datetime, timezone as _tz
+                    placed_dt = datetime.fromisoformat(placed_at_str.replace("Z", "+00:00"))
+                    if placed_dt.tzinfo is None:
+                        placed_dt = placed_dt.replace(tzinfo=_tz.utc)
+                    age_hours = (datetime.now(_tz.utc) - placed_dt).total_seconds() / 3600
+                except Exception:
+                    age_hours = 0
+
+                if age_hours >= 6:
+                    won = False
+                    payout = 0.0
+                    log.info(f"👻 Ghost bet expired (>{age_hours:.0f}h old) — marking LOST: {bet.get('question','?')[:50]}")
+                else:
+                    log.info(f"👻 Ghost bet outcome unknown ({age_hours:.1f}h old) — skipping: {bet.get('question','?')[:50]}")
+                    continue
+
+        resolve_bet(cid, won, payout, closing_price=closing_price)
+        if won and payout > 0:
+            bankroll = get_bankroll()
+            new_balance = bankroll + payout
+            set_bankroll(new_balance, payout, "WIN")
+            log.info(f"👻 Ghost bet resolved as WON: {bet.get('question','?')[:50]} +${payout:.2f}")
+            gh_log.log_bet_won(bet.get("question","?"), bet.get("outcome","?"), payout, new_balance)
+        else:
+            log.info(f"👻 Ghost bet resolved as LOST: {bet.get('question','?')[:50]}")
+            gh_log.log_bet_lost(bet.get("question","?"), bet.get("outcome","?"), float(bet.get("amount_usdc",0)), get_bankroll())
+        resolved_count += 1
+
+    if resolved_count:
+        log.info(f"👻 Resolved {resolved_count} ghost bet(s) missing from CLOB positions")
+    return resolved_count
+
+
+def _fetch_crypto_prices() -> dict:
+    """
+    Fetch live BTC/ETH/SOL prices from CoinGecko (free tier, no API key required).
+    Returns empty dict on failure — caller treats missing prices gracefully.
+    """
+    try:
+        resp = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "bitcoin,ethereum,solana", "vs_currencies": "usd"},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        prices = {
+            "BTC": data.get("bitcoin", {}).get("usd"),
+            "ETH": data.get("ethereum", {}).get("usd"),
+            "SOL": data.get("solana", {}).get("usd"),
+        }
+        log.info(
+            f"💰 Live prices: BTC=${prices['BTC']:,}  "
+            f"ETH=${prices['ETH']:,}  SOL=${prices['SOL']}"
+        )
+        return prices
+    except Exception as e:
+        log.warning(f"CoinGecko price fetch failed: {e}")
+        return {}
 
 
 def _get_all_bet_market_ids() -> set:
@@ -1318,7 +1452,12 @@ def _resolve_from_tokens(tokens: list, outcome: str, bet: dict) -> dict | None:
             except (TypeError, ValueError):
                 price = 0.0
             won = price >= 0.99
-            return {"bet": bet, "won": won, "payout": bet["potential_payout"] if won else 0.0}
+            return {
+                "bet": bet,
+                "won": won,
+                "payout": bet["potential_payout"] if won else 0.0,
+                "closing_price": price,
+            }
     return None
 
 
@@ -1431,7 +1570,7 @@ def _check_single_bet(bet: dict) -> dict | None:
                         f"🔗 CTF resolved: {cid[:16]}... | "
                         f"bet={bet['outcome']} price={price:.3f} → {'WON' if won else 'LOST'}"
                     )
-                    return {"bet": bet, "won": won, "payout": bet["potential_payout"] if won else 0.0}
+                    return {"bet": bet, "won": won, "payout": bet["potential_payout"] if won else 0.0, "closing_price": price}
             # No token found for our outcome — fall through to other checks
             log.info(f"🔗 CTF resolved but no price data for {bet['outcome']} on {cid[:16]}...")
 
@@ -1451,8 +1590,25 @@ def _check_single_bet(bet: dict) -> dict | None:
                     price = 0.0
                 if price >= 0.99:
                     log.info(f"💡 Token price={price:.3f} → WIN (CLOB closed flag lagging): {cid[:16]}...")
-                    return {"bet": bet, "won": True, "payout": bet["potential_payout"]}
+                    return {"bet": bet, "won": True, "payout": bet["potential_payout"], "closing_price": price}
                 break
+
+        # ── QUATERNARY: Ghost mode — confirmed not in CLOB positions, use mid-price
+        # We know this bet resolved (position gone), so price > 0.5 = WIN.
+        # Handles daily crypto/sports markets where CLOB lags the closed flag.
+        if ghost and tokens:
+            for token in tokens:
+                if token.get("outcome", "").upper() == bet["outcome"].upper():
+                    try:
+                        price = float(token.get("price", 0.5))
+                    except (TypeError, ValueError):
+                        price = 0.5
+                    won = price > 0.5
+                    log.info(
+                        f"👻 Ghost mid-price: {bet['outcome']} price={price:.3f} "
+                        f"→ {'WON' if won else 'LOST'}: {cid[:16]}..."
+                    )
+                    return {"bet": bet, "won": won, "payout": bet["potential_payout"] if won else 0.0, "closing_price": price}
 
     except Exception as e:
         log.error(f"Error checking bet {cid}: {e}")
@@ -1498,6 +1654,7 @@ def check_pending_bets(client: ClobClient):
         bet = r["bet"]
         won = r["won"]
         payout = r["payout"]
+        closing_price = r.get("closing_price")  # may be None for older code paths
 
         if won:
             # Try on-chain claim (needs MATIC gas). If no MATIC — user claims manually on polymarket.com,
@@ -1510,7 +1667,7 @@ def check_pending_bets(client: ClobClient):
                 outcome=bet["outcome"],
                 payout=payout,
             )
-            resolve_bet(bet["polymarket_id"], True, payout)
+            resolve_bet(bet["polymarket_id"], True, payout, closing_price=closing_price)
             if claimed:
                 bankroll = get_bankroll()
                 new_balance = bankroll + payout
@@ -1521,7 +1678,7 @@ def check_pending_bets(client: ClobClient):
                 # polymarket.com → claim manually (gasless) → bankroll syncs on next restart.
                 log.info(f"🎉 WON ${payout:.2f} — claim on polymarket.com [{bet.get('question', '?')[:50]}] (bankroll syncs on next restart)")
         else:
-            resolve_bet(bet["polymarket_id"], False, 0.0)
+            resolve_bet(bet["polymarket_id"], False, 0.0, closing_price=closing_price)
             bankroll = get_bankroll()
             log.info(f"💀 LOST ${bet['amount_usdc']:.2f}. Bankroll: ${bankroll:.2f} [{bet.get('question', '?')[:50]}]")
 
@@ -1612,9 +1769,10 @@ def reconcile_pending_bets():
     # all threads call get_transaction_count() simultaneously, get the same nonce,
     # and every TX after the first fails with "replacement transaction underpriced".
     for result in resolved_results:
-        bet    = result["bet"]
-        won    = result["won"]
-        payout = result["payout"]
+        bet           = result["bet"]
+        won           = result["won"]
+        payout        = result["payout"]
+        closing_price = result.get("closing_price")
         if won:
             # Try to claim — wrap so a single failed claim doesn't abort all reconciliation
             try:
@@ -1630,7 +1788,7 @@ def reconcile_pending_bets():
                 )
         # Mark resolved in DB — bankroll NOT modified here (sync_bankroll runs after)
         try:
-            resolve_bet(bet["polymarket_id"], won, payout if won else 0.0)
+            resolve_bet(bet["polymarket_id"], won, payout if won else 0.0, closing_price=closing_price)
         except Exception as db_err:
             log.warning(f"⚠️  resolve_bet failed ({type(db_err).__name__}: {db_err}) — will retry next startup")
             continue
@@ -1782,8 +1940,11 @@ def run_betting_agent():
                     markets = fresh_markets
 
                 if markets:
-                    # 5. Ask Claude / Larry which ones to bet on
-                    decisions = ask_larry_to_bet(markets)
+                    # 5. Fetch live crypto prices for informed decisions
+                    crypto_prices = _fetch_crypto_prices()
+
+                    # 6. Ask Claude / Larry which ones to bet on
+                    decisions = ask_larry_to_bet(markets, crypto_prices=crypto_prices)
                     n_bets  = sum(1 for d in decisions if d.get("decision") == "BET")
                     n_pass  = len(decisions) - n_bets
                     log.info(f"Larry made {len(decisions)} decisions — {n_bets} BETs, {n_pass} PASSes")
