@@ -508,7 +508,7 @@ def ask_larry_to_bet(markets: list, crypto_prices: dict = None) -> list:
         f"No market can be skipped. If you have no strong opinion, default to BET on the favorite side."
     )
     try:
-        result = _call_claude_with_tool(16000, [{"role": "user", "content": user_message}], BETTING_TOOL)
+        result = _call_claude_with_tool(6000, [{"role": "user", "content": user_message}], BETTING_TOOL)
         decisions = result.get("decisions", [])
     except Exception:
         log.warning("Claude unavailable — skipping bet cycle")

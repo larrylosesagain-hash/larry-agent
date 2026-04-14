@@ -894,8 +894,6 @@ def fetch_active_markets() -> list:
                             out.append({
                                 "condition_id": cond_id,
                                 "question": m.get("question"),
-                                "end_date": end_date_str,
-                                "days_to_end": days_to_end,
                                 "hours_to_end": hours_to_end,
                                 "yes_price": round(t_price, 4),
                                 "outcome_name": t_name,
@@ -950,8 +948,6 @@ def fetch_active_markets() -> list:
                 out.append({
                     "condition_id": (m.get("conditionId") or m.get("condition_id") or "").lower(),
                     "question": m.get("question"),
-                    "end_date": end_date_str,
-                    "days_to_end": days_to_end,
                     "hours_to_end": hours_to_end,
                     "yes_price": round(yes_price, 4),
                     "volume_24h": float(m.get("volume24hr", 0)),
